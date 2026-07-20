@@ -1317,6 +1317,23 @@ def load_depends(current_file: str, requirements_file: str = 'requirements.txt')
 # ---------------------------------------------------------------------------
 
 
+def _overlay_index() -> int:
+    """Where the overlay goes on ``sys.path``: ahead of the base runtime, behind shims.
+
+    ``ai/node.py`` puts ``ROCKETRIDE_MOCK`` at ``sys.path[0]`` so node tests import stub
+    SDKs instead of the real ones. Inserting the overlay at 0 would put the real library
+    in front of every stub, and the node would then reach the live service with a mock
+    credential, so land immediately after that entry when it is present.
+    """
+    mock_path = os.environ.get('ROCKETRIDE_MOCK')
+    if mock_path:
+        target = os.path.normcase(os.path.abspath(mock_path))
+        for index, entry in enumerate(sys.path):
+            if entry and os.path.normcase(os.path.abspath(entry)) == target:
+                return index + 1
+    return 0
+
+
 def _compile_constraints_at(combined_path: str, constraints_path: str) -> None:
     """Compile ``combined_path`` -> ``constraints_path`` for one environment.
 
@@ -1447,7 +1464,7 @@ def ensure_env_scoped(
     def _overlay(site):
         global _active_overlay_site, _active_overlay_constraints
         if site not in sys.path:
-            sys.path.insert(0, site)  # ahead of base so the overlay's versions win
+            sys.path.insert(_overlay_index(), site)
         _active_overlay_site = site
         _active_overlay_constraints = venv_env.env_paths(os.path.dirname(site)).constraints
         import importlib

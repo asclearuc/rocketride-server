@@ -24,6 +24,26 @@ except ImportError:  # engLib is built into engine.exe
 pytestmark = pytest.mark.skipif(not _HAVE_ENGLIB, reason='depends needs engLib (engine interpreter)')
 
 
+def test_overlay_goes_behind_the_mock_shims(monkeypatch, tmp_path):
+    # ai/node.py front-loads ROCKETRIDE_MOCK with stub SDKs; the overlay carries the real
+    # ones, so landing at index 0 would send node tests to the live services.
+    mocks = str(tmp_path / 'mocks')
+    monkeypatch.setenv('ROCKETRIDE_MOCK', mocks)
+    monkeypatch.setattr(D.sys, 'path', [mocks, '/base/site-packages'])
+    assert D._overlay_index() == 1
+
+
+def test_overlay_index_is_front_without_mocks(monkeypatch):
+    monkeypatch.delenv('ROCKETRIDE_MOCK', raising=False)
+    assert D._overlay_index() == 0
+
+
+def test_overlay_index_tolerates_mock_path_not_on_sys_path(monkeypatch, tmp_path):
+    monkeypatch.setenv('ROCKETRIDE_MOCK', str(tmp_path / 'absent'))
+    monkeypatch.setattr(D.sys, 'path', ['/base/site-packages'])
+    assert D._overlay_index() == 0
+
+
 def _has_node_path(paths):
     root = os.path.abspath(os.path.join(D._get_executable_dir(), 'nodes'))
     return any(os.path.abspath(p).startswith(root + os.sep) for p in paths)
