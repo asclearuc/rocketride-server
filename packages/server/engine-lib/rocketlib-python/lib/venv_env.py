@@ -29,7 +29,8 @@ MAIN_ENV = 'main'
 # Used when there is no project_id (engtest, CLI, ad-hoc runs).
 DEFAULT_ID = 'default'
 
-_ID_MAX = 8  # chars kept from a long (GUID-like) id segment; short ids kept whole.
+_ID_MAX = 8  # readable prefix kept from a long id segment
+_HASH_LEN = 8  # hex chars of sha1 over the full id, appended whenever the prefix is lossy
 
 
 # ---------------------------------------------------------------------------
@@ -85,19 +86,25 @@ def scoping_enabled(mode: str, has_isolated_group: bool) -> bool:
 def short_id(identifier: Optional[str], length: int = _ID_MAX) -> str:
     """Shorten a stable id to a filesystem-safe, MAX_PATH-friendly segment.
 
-    Long (GUID-like) ids are truncated to ``length`` chars; short readable ids
-    (``main``, ``group_1``) are kept whole (minus separators). ``None`` / empty ->
-    :data:`DEFAULT_ID`.
+    An id that survives cleaning unchanged and fits in ``length`` (``main``) is returned
+    as-is. Everything else becomes ``<prefix>-<sha1[:8]>``, the digest taken over the
+    **full** id so that ids sharing a prefix stay distinct.
 
-    Collisions between two long ids sharing a prefix are the accepted MAX_PATH
-    trade-off; short group ids within one project stay distinct.
+    Truncating alone is only safe for high-entropy ids. Readable ones spend the whole
+    prefix on their common part — ``test-tool_daytona`` and ``test-tool_tavily`` both
+    truncate to ``testtool`` — and the two projects then share an overlay and overwrite
+    each other's ``constraints.txt``. ``None`` / empty -> :data:`DEFAULT_ID`.
     """
     if not identifier:
         return DEFAULT_ID
-    cleaned = re.sub(r'[^A-Za-z0-9]', '', str(identifier)).lower()
+    text = str(identifier)
+    cleaned = re.sub(r'[^A-Za-z0-9]', '', text).lower()
     if not cleaned:
         return DEFAULT_ID
-    return cleaned[:length] if len(cleaned) > length else cleaned
+    if len(cleaned) <= length and cleaned == text.lower():
+        return cleaned
+    digest = hashlib.sha1(text.encode('utf-8')).hexdigest()[:_HASH_LEN]
+    return f'{cleaned[:length]}-{digest}'
 
 
 def venv_root(exe_dir: str) -> str:

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 import venv_env as V
 
 
@@ -35,15 +37,43 @@ def test_short_id_rules():
     assert V.short_id(None) == V.DEFAULT_ID
     assert V.short_id('') == V.DEFAULT_ID
     assert V.short_id('----') == V.DEFAULT_ID
-    assert V.short_id('main') == 'main'
-    assert V.short_id('group_1') == 'group1'
-    assert V.short_id('0d4f3caa-1234-5678-9abc') == '0d4f3caa'  # long ids truncated for MAX_PATH
+    assert V.short_id('main') == 'main'  # lossless and short: kept as-is
+    assert V.short_id('group_1').startswith('group1-')  # separator dropped -> disambiguated
+    assert V.short_id('0d4f3caa-1234-5678-9abc').startswith('0d4f3caa-')
+
+
+def test_short_id_stays_within_max_path_budget():
+    assert len(V.short_id('0d4f3caa-1234-5678-9abc-0123456789ab')) == V._ID_MAX + 1 + V._HASH_LEN
+
+
+def test_short_id_is_stable():
+    assert V.short_id('test-tool_daytona') == V.short_id('test-tool_daytona')
+
+
+@pytest.mark.parametrize(
+    'a, b',
+    [
+        # Readable ids spend the whole prefix on their common part; truncation alone
+        # collided here and made two node tests share one overlay.
+        ('test-tool_daytona', 'test-tool_tavily'),
+        ('test-llm_openai_api', 'test-llm_openai_compatible'),
+        ('test-vectordb_postgres', 'test-vectordb_qdrant'),
+        # Cleaning drops separators, so these differ only in what cleaning removes.
+        ('group-1', 'group_1'),
+        # GUIDs sharing the leading block.
+        ('0d4f3caa-1111-2222', '0d4f3caa-3333-4444'),
+    ],
+)
+def test_short_id_distinguishes_ids_sharing_a_prefix(a, b):
+    assert V.short_id(a) != V.short_id(b)
 
 
 def test_env_dir_layout():
     exe = os.path.join('X:', 'engine')
-    d = V.env_dir(exe, '0d4f3caa-1111-2222', 'group_7')
-    assert d.replace('\\', '/').split('/')[-3:] == ['venvs', '0d4f3caa', 'group7']
+    d = V.env_dir(exe, '0d4f3caa-1111-2222', 'group_7').replace('\\', '/').split('/')
+    assert d[-3] == 'venvs'
+    assert d[-2] == V.short_id('0d4f3caa-1111-2222')
+    assert d[-1] == V.short_id('group_7')
     assert V.env_dir(exe, None, None).replace('\\', '/').endswith('venvs/default/main')
 
 
