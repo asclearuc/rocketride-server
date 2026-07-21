@@ -10,6 +10,10 @@ Every environment (``main`` or an isolated group) gets its own overlay under
 ``combined.txt`` / ``constraints.txt`` / ``requirements.hash`` and an install lock.
 Ids are shortened to stay under the Windows ``MAX_PATH`` limit.
 
+:class:`EnvContext` bundles those paths with the set of requirement files already
+installed into that environment, so switching environments is one act rather than four
+independent ones.
+
 Stdlib only — no engine, ``uv``, subprocess or ``sys.path`` mutation — so it is
 testable in isolation; ``depends.py`` layers the actual compile/install on top.
 The hash/combine helpers mirror ``depends.py`` to avoid importing it (that would
@@ -21,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 # env_id for the always-present base-of-the-pipeline environment.
@@ -146,6 +150,46 @@ def env_paths(directory: str) -> EnvPaths:
     )
 
 
+def base_paths(cache_dir: str, site_packages: str) -> EnvPaths:
+    """Return the same layout for the **base runtime**, whose files are not co-located.
+
+    An overlay keeps everything under one directory; the base keeps its metadata in
+    ``<exe>/cache`` but installs into ``<exe>/lib/site-packages``, so :func:`env_paths`
+    cannot express it and the two paths are passed separately.
+    """
+    return EnvPaths(
+        env_dir=cache_dir,
+        site_packages=site_packages,
+        combined=os.path.join(cache_dir, 'combined.txt'),
+        constraints=os.path.join(cache_dir, 'constraints.txt'),
+        hash_file=os.path.join(cache_dir, 'requirements.hash'),
+        lock_file=os.path.join(cache_dir, 'install.lock'),
+    )
+
+
+# env_dir of the base runtime context; overlays are keyed by their directory.
+BASE_KEY = 'base'
+
+
+@dataclass
+class EnvContext:
+    """Everything that must change together when the active environment changes.
+
+    The install lock, the constraints file, the ``uv --target`` destination and the
+    record of what is already installed are one decision, not four: applying an
+    environment means switching all of them, and holding them in separate module
+    globals is what made a second environment in one process unsafe.
+
+    ``processed`` is per environment on purpose — the same requirements file installed
+    into overlay A says nothing about overlay B.
+    """
+
+    key: str
+    paths: EnvPaths
+    is_overlay: bool
+    processed: set = field(default_factory=set)
+
+
 # ---------------------------------------------------------------------------
 # hash-drift planning (per-env; mirrors depends.py helpers)
 # ---------------------------------------------------------------------------
@@ -164,13 +208,95 @@ def requirements_hash(req_files: list[str]) -> str:
     return hasher.hexdigest()
 
 
+def _include_target(line: str) -> Optional[str]:
+    """The path a ``-r`` / ``--requirement`` line refers to, or ``None``.
+
+    (``-c`` / ``--constraint`` includes have the same relative-path problem but do not
+    occur in this tree; add them here if they ever do.)
+    """
+    text = line.strip()
+    for prefix in ('--requirement=', '--requirement ', '-r ', '-r'):
+        if text.startswith(prefix):
+            target = text[len(prefix) :].strip()
+            return target or None
+    return None
+
+
+def resolve_includes(req_files: list[str]) -> list[str]:
+    """Expand ``-r`` includes transitively: every file whose content ends up resolved.
+
+    A requirement file may pull in another with ``-r other.txt``. Those files shape the
+    resolution just as much as the listed ones, so they must be part of the drift hash —
+    otherwise editing an included file never triggers a rebuild.
+
+    Args:
+        req_files: The discovered requirement files.
+
+    Returns:
+        ``req_files`` plus every transitively included file, de-duplicated, in
+        first-seen order.
+
+    Raises:
+        FileNotFoundError: An include points at a file that does not exist. Better here,
+            naming the referring file, than later as a ``uv`` error naming ``combined.txt``.
+    """
+    seen: list[str] = []
+    known: set[str] = set()
+    queue = list(req_files)
+    while queue:
+        path = os.path.abspath(queue.pop(0))
+        if path in known:
+            continue
+        known.add(path)
+        seen.append(path)
+        for included in _includes_of(path):
+            queue.append(included)
+    return seen
+
+
+def _includes_of(path: str) -> list[str]:
+    """Absolute paths of the ``-r`` includes in ``path`` (resolved against its directory)."""
+    out: list[str] = []
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            lines = fh.readlines()
+    except OSError:
+        return out
+    base = os.path.dirname(os.path.abspath(path))
+    for line in lines:
+        target = _include_target(line)
+        if target is None:
+            continue
+        resolved = os.path.abspath(os.path.join(base, target))
+        if not os.path.isfile(resolved):
+            raise FileNotFoundError(f'{path}: included requirements file not found: {target}')
+        out.append(resolved)
+    return out
+
+
 def write_combined(req_files: list[str], combined_path: str) -> None:
-    """Concatenate ``req_files`` into ``combined_path`` (mirrors depends helper)."""
+    r"""Concatenate ``req_files`` into ``combined_path`` (mirrors depends helper).
+
+    ``-r`` includes are rewritten to absolute paths. ``uv`` resolves them relative to the
+    file holding the line, and this file holds the bytes of requirement files from
+    elsewhere in the tree — a relative include would be looked for next to
+    ``combined_path`` and the compile would fail there instead of at the node.
+
+    The rewritten path uses forward slashes even on Windows: a requirement file treats
+    ``\`` as an escape character, so ``-r C:\x\y.txt`` reaches uv as ``C:xy.txt``
+    (verified against the shipped uv). Forward slashes are accepted on every platform.
+    """
     with open(combined_path, 'w', encoding='utf-8') as out:
         for path in req_files:
             out.write(f'# Source: {path}\n')
+            source_dir = os.path.dirname(os.path.abspath(path))
             with open(path, 'r', encoding='utf-8') as inp:
-                out.write(inp.read())
+                for line in inp:
+                    target = _include_target(line)
+                    if target is not None:
+                        resolved = os.path.abspath(os.path.join(source_dir, target))
+                        line = f'-r {resolved.replace(os.sep, "/")}\n'
+                    out.write(line)
             out.write('\n')
 
 
@@ -210,7 +336,9 @@ def plan_install(
     if create:
         os.makedirs(paths.site_packages, exist_ok=True)
 
-    current = requirements_hash(req_files) if req_files else ''
+    # Hash over the includes too: a `-r`-referenced file shapes the resolution and must
+    # therefore be able to invalidate it.
+    current = requirements_hash(resolve_includes(req_files)) if req_files else ''
     stored = _read_text(paths.hash_file)
     needs = (current != stored) or not os.path.exists(paths.constraints)
 
@@ -235,15 +363,20 @@ def build_install_argv(
     uv_path: str,
     python_exe: str,
     requirements_path: str,
-    target_site: str,
+    target_site: Optional[str] = None,
     constraints_path: Optional[str] = None,
     excludes_path: Optional[str] = None,
 ) -> list[str]:
-    """Construct the ``uv pip install --target`` argv for a per-env overlay.
+    """Construct the ``uv pip install`` argv, optionally targeting an overlay.
 
-    Mirrors ``depends.py``'s install flags, adding ``--target`` so packages land
-    in the environment's overlay ``site-packages`` instead of the base runtime.
-    Pure (returns the list; the caller runs it) so it is unit-testable.
+    The single builder for both install paths: ``target_site=None`` installs into the
+    base runtime, a path installs into that environment's overlay. Keeping them one
+    function is the point — while there were two, a flag added to one silently diverged
+    from the other.
+
+    Pure (returns the list; the caller runs it) so it is unit-testable. ``uv`` splits
+    ``-c`` and ``--excludes`` values on whitespace, so pass those already relative to the
+    directory the command will run in.
     """
     argv = [
         uv_path,
@@ -251,14 +384,14 @@ def build_install_argv(
         'install',
         '--python',
         python_exe,
-        '--target',
-        target_site,
         '-r',
         requirements_path,
         '--index-strategy',
         'unsafe-best-match',
         '--no-build-isolation',
     ]
+    if target_site:
+        argv += ['--target', target_site]
     if constraints_path:
         argv += ['-c', constraints_path]
     if excludes_path:
@@ -287,8 +420,9 @@ def run_scoped_install(
 
     Control flow only — the side effects are injected, so this is testable without an
     engine or ``uv``: ``discover(providers)`` yields the env's requirement files,
-    ``compile_and_install(plan)`` runs uv, and the optional ``on_overlay(site)`` applies
-    the overlay.
+    ``compile_and_install(plan)`` runs uv, and the optional ``on_overlay(paths)`` applies
+    the overlay (it receives the whole :class:`EnvPaths`, not just the site-packages
+    directory, so the caller does not have to re-derive the constraints path from it).
 
     Installs only when the requirement set drifted. Returns ``None`` when scoping does
     not apply, leaving the caller on the base runtime.
@@ -307,7 +441,7 @@ def run_scoped_install(
         compile_and_install(plan)
         mark_installed(plan)
     if on_overlay is not None:
-        on_overlay(plan.paths.site_packages)
+        on_overlay(plan.paths)
     return plan.paths.site_packages
 
 

@@ -86,6 +86,24 @@ def test_env_paths_names():
     assert os.path.basename(p.lock_file) == 'install.lock'
 
 
+def test_base_paths_keeps_metadata_and_target_apart():
+    # The base runtime is the one env whose install target is not under its metadata dir.
+    cache = os.path.join('X:', 'e', 'cache')
+    site = os.path.join('X:', 'e', 'lib', 'site-packages')
+    p = V.base_paths(cache, site)
+    assert p.env_dir == cache
+    assert p.site_packages == site
+    assert p.constraints == os.path.join(cache, 'constraints.txt')
+    assert p.lock_file == os.path.join(cache, 'install.lock')
+
+
+def test_env_contexts_do_not_share_processed_sets():
+    a = V.EnvContext(key='a', paths=V.env_paths('a'), is_overlay=True)
+    b = V.EnvContext(key='b', paths=V.env_paths('b'), is_overlay=True)
+    a.processed.add('r.txt')
+    assert 'r.txt' not in b.processed
+
+
 # --- hash / combine ---------------------------------------------------------
 
 
@@ -112,6 +130,85 @@ def test_write_combined_concatenates_with_headers(tmp_path):
     text = (tmp_path / 'combined.txt').read_text(encoding='utf-8')
     assert 'tabulate==0.8.10' in text and 'six==1.16.0' in text
     assert text.count('# Source:') == 2
+
+
+# --- `-r` includes ----------------------------------------------------------
+
+
+def test_write_combined_absolutizes_relative_includes(tmp_path):
+    # uv resolves `-r` against the file holding the line; combined.txt sits elsewhere,
+    # so a relative include would be looked for next to it and the compile would fail.
+    (tmp_path / 'src').mkdir()
+    inner = _req(tmp_path / 'src', 'requirements.other.txt', 'idna==3.18\n')
+    outer = _req(tmp_path / 'src', 'requirements.txt', '-r requirements.other.txt\ntabulate==0.9.0\n')
+    out = str(tmp_path / 'cache' / 'combined.txt')
+    os.makedirs(os.path.dirname(out))
+
+    V.write_combined([outer], out)
+
+    text = open(out, encoding='utf-8').read()
+    assert '-r requirements.other.txt' not in text
+    assert f'-r {inner.replace(os.sep, "/")}' in text
+    assert 'tabulate==0.9.0' in text
+
+
+def test_write_combined_include_path_has_no_backslashes(tmp_path):
+    # A requirements file treats `\` as an escape, so uv reads `C:\x\y.txt` as `C:xy.txt`
+    # and reports a missing file. Forward slashes work on every platform.
+    (tmp_path / 'src').mkdir()
+    _req(tmp_path / 'src', 'other.txt', 'idna==3.18\n')
+    outer = _req(tmp_path / 'src', 'requirements.txt', '-r other.txt\n')
+    out = str(tmp_path / 'combined.txt')
+
+    V.write_combined([outer], out)
+
+    include_line = next(ln for ln in open(out, encoding='utf-8') if ln.startswith('-r '))
+    assert '\\' not in include_line
+
+
+def test_write_combined_normalizes_absolute_includes_too(tmp_path):
+    inner = _req(tmp_path, 'requirements.other.txt', 'idna==3.18\n')
+    outer = _req(tmp_path, 'requirements.txt', f'-r {inner}\n')
+    out = str(tmp_path / 'combined.txt')
+    V.write_combined([outer], out)
+    text = open(out, encoding='utf-8').read()
+    assert f'-r {inner.replace(os.sep, "/")}' in text
+
+
+@pytest.mark.parametrize('form', ['-r other.txt', '-rother.txt', '--requirement other.txt', '--requirement=other.txt'])
+def test_include_forms_are_all_recognized(tmp_path, form):
+    inner = _req(tmp_path, 'other.txt', 'idna==3.18\n')
+    outer = _req(tmp_path, 'requirements.txt', f'{form}\n')
+    assert V.resolve_includes([outer]) == [os.path.abspath(outer), inner]
+
+
+def test_resolve_includes_is_transitive_and_cycle_safe(tmp_path):
+    c = _req(tmp_path, 'c.txt', 'idna==3.18\n')
+    b = _req(tmp_path, 'b.txt', '-r c.txt\n')
+    a = _req(tmp_path, 'a.txt', '-r b.txt\n-r a.txt\n')  # self-reference must not loop
+    assert V.resolve_includes([a]) == [os.path.abspath(a), os.path.abspath(b), c]
+
+
+def test_resolve_includes_reports_a_missing_target(tmp_path):
+    outer = _req(tmp_path, 'requirements.txt', '-r absent.txt\n')
+    with pytest.raises(FileNotFoundError) as excinfo:
+        V.resolve_includes([outer])
+    # Name the referring file — a uv failure would only name combined.txt.
+    assert 'requirements.txt' in str(excinfo.value) and 'absent.txt' in str(excinfo.value)
+
+
+def test_included_file_participates_in_drift(tmp_path):
+    inner = _req(tmp_path, 'inner.txt', 'idna==3.18\n')
+    outer = _req(tmp_path, 'requirements.txt', '-r inner.txt\n')
+    exe = str(tmp_path)
+
+    plan = V.plan_install(exe, 'p', 'main', [outer])
+    V.mark_installed(plan)
+    open(plan.paths.constraints, 'w').close()
+    assert V.plan_install(exe, 'p', 'main', [outer]).needs_rebuild is False
+
+    open(inner, 'w', encoding='utf-8').write('idna==3.10\n')
+    assert V.plan_install(exe, 'p', 'main', [outer]).needs_rebuild is True
 
 
 # --- install planning -------------------------------------------------------
@@ -166,6 +263,15 @@ def test_build_install_argv_optional_flags_omitted():
     assert '-c' not in argv and '--excludes' not in argv
 
 
+def test_build_install_argv_without_target_is_the_base_install():
+    # One builder serves both paths: base is the overlay form minus --target, so a flag
+    # can no longer be added to one install path and forgotten in the other.
+    overlay = V.build_install_argv('uv', 'py', 'r.txt', '/site', 'c.txt', 'ex.txt')
+    base = V.build_install_argv('uv', 'py', 'r.txt', None, 'c.txt', 'ex.txt')
+    assert '--target' not in base
+    assert base == [a for a in overlay if a not in ('--target', '/site')]
+
+
 # --- run_scoped_install orchestration ---------------------------------------
 
 
@@ -212,7 +318,10 @@ def test_run_scoped_install_on_installs_and_overlays(tmp_path):
     assert site.endswith('site-packages')
     assert d.called_with == ['webhook', 'detect']
     assert installed == [site]
-    assert overlaid == [site]
+    # on_overlay receives the whole layout, so the caller need not re-derive the
+    # constraints path from the site-packages path.
+    assert [p.site_packages for p in overlaid] == [site]
+    assert overlaid[0].constraints == V.env_paths(os.path.dirname(site)).constraints
     assert os.path.isfile(V.env_paths(os.path.dirname(site)).hash_file)
 
 

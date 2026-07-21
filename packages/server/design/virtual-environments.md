@@ -291,6 +291,36 @@ into `ai.*` to find the `ai/common/models/<x>` submodules reached, and returns t
 pulls in `whisper`. This reconciles §4.7 (partitioner resolves the node set) with §9 (the AST walk
 lives in `depends.py`): **the partitioner passes paths; `depends.py` parses them.**
 
+**The single door for torch (VERIFIED) — this is what decides whether a node may pin its own.**
+`torch==2.10.0+cu128` lives in exactly one file, `ai/common/torch/requirements.txt`, and it enters
+an environment only through an import of `ai.common.torch` — which comes from
+`ai/common/models/base.py::_ensure_dependencies` (and therefore also via
+`gpu_guard.py` → `.base`). The `ai/common/models/` directory itself holds **no** `requirement*.txt`,
+so reaching the package costs nothing by itself; the weight comes from that one file plus the
+specific model family. Two consequences worth stating plainly:
+
+- a node that does **not** reach `ai.common.models` resolves its own torch freely — its env compiles
+  and installs that version into its overlay, and the overlay wins at import even when base holds a
+  different one (`uv --target` does not treat base as satisfying — VERIFIED against the shipped uv);
+- a node that **does** reach it inherits `ai`'s pin **legitimately**, so a version disagreement
+  there is a real conflict to surface, not a check to relax. The ways out are model-server mode
+  (the facades take the `ModelClient` branch and never import torch) or splitting the work across
+  environments — not loosening the resolution.
+
+Note also that `ai/node.py` reaches `gpu_guard`, but **no node imports `ai.node`** (verified across
+`nodes/src`), so the launcher does not leak the pin into every environment.
+
+**`-r` includes inside requirement files (IMPLEMENTED).** A requirement file may pull in another
+with `-r other.txt`, and `uv` resolves that path **relative to the file holding the line**. Combining
+moves those bytes into `combined.txt` in a different directory, so a relative include would be
+looked for next to the combined file and the compile would fail there instead of at the node
+(VERIFIED: `failed to read from file …cache\other.txt`). The combiner therefore rewrites include
+targets to absolute paths — with **forward slashes**, because a requirement file treats `\` as an
+escape and `-r C:\x\y.txt` reaches uv as `C:xy.txt` (also verified) — and `resolve_includes()` folds
+the referenced files into the environment's set so they reach the drift hash; editing an included
+file must be able to invalidate the resolution. A missing include is refused up front, naming the
+referring file.
+
 **Resolution rule (verified — NOT `nodes.<provider>`).** The entry module is **not**
 `nodes/src/nodes/<provider>/` by string; that naive rule holds for ~91 of ~133 providers and **breaks
 for ~42**. The authoritative mapping is: `provider` = the `logicalType` (protocol scheme with `://`
@@ -419,9 +449,22 @@ imports live **exclusively in the local (no-model-server) branch**. Implications
   → main lives at `venvs/<project_id>/main`. Each holds `site-packages/` + its own scoped `combined.txt`,
   `constraints.txt`, `requirements.hash`, lock. The path helpers
   `_get_combined_path`/`_get_constraints_path`/hash are parameterized by the env dir. **The refactor
-  surface is wider than the path helpers:** `depends.py`'s single-environment module state — the
-  `_processed` set, the `install.lock`, `_progress_path`, and the single-holder heartbeat — must
-  become **env-keyed** too, or concurrent envs collide.
+  surface is wider than the path helpers** — and by the code it is **three** problems, not one
+  (IMPLEMENTED):
+  - *Per environment:* the lock, the constraints file, the `uv --target` destination and the
+    `_processed` record must switch **together**. They are now one object, `venv_env.EnvContext`,
+    held in a process registry and applied through `depends.use_env(ctx)`, which restores the
+    previous environment on exit **including on exception**. Registry entries live for the process,
+    so re-activating an environment restores what it already installed.
+  - *Per install operation (NOT per environment):* the progress sidecar and the heartbeat belong to
+    one `uv` run, not to an environment — a nested install clearing them would take down the outer
+    run's heartbeat, which is what keeps the task-startup timeout alive during long silent `uv`
+    work. They are now an `_InstallProgress` instance per held lock, kept on a stack, and the
+    heartbeat thread is bound to **its own** instance rather than to the top of the stack.
+  - *Reentrancy:* per-env locks make `FileLock`'s non-reentrancy reachable. Byte-range locks are
+    per file description, so re-acquiring a path this process already holds is refused exactly like
+    a foreign holder, and the wait loop then polls forever against itself — a hang, not an error.
+    The lock now counts depth in-process; cross-process semantics are unchanged.
 - `<exe>/cache/models/<name>` — **shared** model weights via `model_cache_dir`, resolved relative to
   `sys.executable`. The venv child runs the **same `engine.exe`, unmoved**, so it resolves the same
   `cache/models` automatically. Models are weights, not packages → not isolated per venv.
@@ -456,9 +499,51 @@ biggest lever venvs pull is *not sharing one constraint resolution*.
   `depends()` installs via `uv --target <overlay>` and `-c <env constraints>` (not `-c cache/…`), so
   node model-loads and the AST-miss backstop land **in the overlay at the env-resolved versions** (no
   version churn), keeping base untouched.
-- **Residual (honest):** base *today* still receives `ai/**` at startup bootstrap (legacy behavior), so
-  it is not yet strictly runtime-only. Constraints are already fully per-env; physically stripping the
-  node/model deps out of base is the remaining Phase-2A-step-1 work (§4.7 blast radius).
+**Residual: base is not yet runtime-only — DEFERRED, with the reasoning recorded so the decision is
+re-openable rather than re-derived.** Constraints are already fully per-env; base *today* still
+receives `ai/**` at startup bootstrap. Two shrinks are possible and they cost very different things:
+
+- **Half shrink — rejected.** Drop the pins from the startup compile while base is still allowed to
+  *install* those packages (which is what happens whenever a model loads with no overlay active).
+  Findings 2 and 3 below are the price of exactly this state, and it is not worth paying.
+- **Full shrink — the goal.** Under `=1`, **nothing installs into base except the engine runtime
+  set, because every model install happens inside some environment.** The compile then shrinks as a
+  *consequence* rather than as a rule; findings 2 and 3 dissolve (base installs no torch, so it
+  needs neither its index URL nor its pin); and **no conflict check is relaxed** — a conflict inside
+  the real runtime set must still fail loudly, there is simply nothing left in that set to conflict.
+
+**Ordering, not the glob, is the work item:** the non-pipeline entry points must get environments
+**first** — the saas model server above all — or enabling the shrink lands the system in the
+half-shrink state. Two constraints on computing a base set, should someone reach for the AST walk:
+`nodes` has an authoritative `provider → path` manifest (`services*.json`) that makes the walk sound
+and **base has no equivalent** (its live entry points depend on argv: `eaas.py`, `--modelserver`,
+`engtest`, `depends.py` CLI, plus modules C++ loads by name), so the seed list would be
+hand-maintained — the thing the glob avoided; and `_FIRST_PARTY` is `('nodes', 'ai')`, so
+`extension.*` is invisible to the walk until the roots become configurable, making it a
+cross-repository change. In favour of the effort: **no** module of the OSS base process (`ai/web`,
+`ai/modules`, `ai/account`, `ai/eaas.py`) imports `ai.common.models`, `ai.common.torch` or the
+image/avi/opencv helpers (VERIFIED), so the true runtime set really is small.
+
+Findings behind the cost estimate, to re-verify when the question is reopened:
+
+1. **A local model server exists — in the saas repo** (`rocketride-saas/extension/src/extension/
+   model_server/`, deployed to `dist/server/extension/`). It is a base process (no pipeline, no
+   endpoint, no overlay) importing `ai.common.torch` at module level and `ai.common.models` in
+   `model_manager.py`, i.e. it loads the whole model stack into base — it is precisely the process
+   for which today's global union is the correct resolution. Its own requirements never enter the
+   startup compile at all: `REQUIREMENTS_GLOBS` has no `extension/**` entry, and saas installs them
+   with explicit `depends()` calls.
+2. **Half-shrink only:** dropping `ai/common/torch/**` also drops `--extra-index-url`. The
+   `https://download.pytorch.org/whl/cu128` line in `cache/constraints.txt` comes from that
+   requirements file; base installs constrained by the global file would stop seeing `+cu128`
+   wheels, and the `torch==2.10.0+cu128` pin that keeps a stray PyPI torch out of base goes with it.
+3. **Half-shrink only:** excluding from the compile does not exclude from installation. Files are
+   still installed by runtime `depends()`, merely unpinned by the union, which makes base installs
+   order-dependent (`uv --dry-run` reports the first-installed version as satisfied).
+4. Base loses early conflict detection: two conflicting model families fail loudly at startup today,
+   quietly and late afterwards.
+5. Checked and **not** an issue: `onnxruntime-gpu==1.20.1` is pinned **explicitly** in both
+   `requirements_whisper.txt` and `requirements_pose.txt`, not inherited from the union.
 
 **Key by stable IDs; name is metadata.**
 
@@ -502,10 +587,27 @@ biggest lever venvs pull is *not sharing one constraint resolution*.
 
 ### 4.11 Overlay mechanism (sys.path; never move the binary)
 The venv child runs the **original `engine.exe`, unmoved**; the bootstrap reads `ROCKETRIDE_VENV_SITE`
-and does **`sys.path.insert(0, venv_site)`** — the exact mirror of the existing
-`_ensure_site_packages` `append`, but `insert`-ahead-of-base for **overlay precedence** (venv `torch`
-wins; append would let base shadow it). **`PYTHONPATH` won't work** (isolated `PyConfig`); use the
+and puts `venv_site` **ahead of base** on `sys.path` for **overlay precedence** (venv `torch` wins;
+appending would let base shadow it). **`PYTHONPATH` won't work** (isolated `PyConfig`); use the
 runtime insert.
+
+**It is a swap, not an insert (IMPLEMENTED).** Inserting without removing means applying a second
+environment in one process leaves **both** overlays in front of base: the newer wins for packages
+they share, while everything unique to the older stays importable — the cross-environment leak
+overlays exist to prevent, arriving as a wrong version rather than as a missing import. Applying an
+environment therefore removes the previously inserted overlay first, then inserts, then invalidates
+the import caches for both paths. Base is never removed: it is the floor, not an overlay. The insert
+position stays behind an injected `ROCKETRIDE_MOCK` shim directory (test stubs must keep beating the
+real SDKs) and ahead of everything else.
+
+**Honest limit:** the swap governs **future** imports only. Whatever the process already imported
+from the previous overlay stays in `sys.modules`, so this does **not** make one interpreter safely
+multi-environment — which is exactly why each environment gets its own child process (§4.10).
+
+**Two doors, deliberately separate.** `depends.use_env(ctx)` switches *installation targeting* only
+— lock, constraints, `uv --target`, the installed record — and never touches `sys.path`.
+`ensure_env_scoped()` is the one entry point that does both. A caller that switches the first
+without the second resolves dependencies into one environment while importing from another.
 
 Because `sys.executable` is unchanged, `model_cache_dir`/`engine_cache_dir`/base `lib/site-packages`
 all resolve to the shared install dir — `cache/models` shared, base runtime preserved. **Do not copy
@@ -554,6 +656,16 @@ overlay no-ops → use base; `depends.py` tolerates a missing `project_id`/`env_
   rootDir` — our **no-move-binary overlay preserves this** (the rejected copy-binary approach would
   fail it → a free regression guard). Node modules import from `nodes/src` on `sys.path` (dev), so
   module-load needs no install; only third-party deps need the env.
+  **Why it creates no `venvs/default` under `=1` — RESOLVED, and structural rather than a bug.**
+  `engtest` *does* open service endpoints (`linkages.cpp` calls `getTargetEndpoint(...)` then
+  `beginEndpoint(OPEN_MODE::SCAN)`), so the hook in `endpoint.cpp` does fire — but its task fixture
+  is a **legacy filter-chain config** (`config.service.filters`) with **no `config.pipeline` at
+  all**. So `components()` is empty and `project_id` absent, the hook passes an empty provider list,
+  the AST walk finds no requirement files, and `run_scoped_install` takes its "nothing to scope"
+  early return without creating a directory. Graceful degradation is therefore **verified rather
+  than assumed** — and `engtest` **cannot guard scoping as written**: that would need a fixture
+  carrying `config.pipeline.components[]`, a deliberate choice to make, not a defect to fix. It
+  leaves `builder nodes:test` as the only regression guard for scoping.
 - **`builder nodes:test`** runs **many** nodes' tests in one env today (works only because all nodes are
   currently compatible). Once venvs allow incompatible nodes, a single pytest process (one
   `site-packages`) can't host `torch 2.0` and `torch 2.1` tests → **per-node-scoped test envs**, reusing
@@ -561,6 +673,20 @@ overlay no-ops → use base; `depends.py` tolerates a missing `project_id`/`env_
   pinned via `ROCKETRIDE_VENV_SITE` (composing with the planned pytest-xdist work). Declarative node
   tests are already mini-pipelines (`nodes/test/framework/pipeline.py`) → run them through the same
   partitioner. **Must land before the first incompatible node ships**, else the suite breaks.
+  **The env key must become stable, too (VERIFIED).** The harness builds `project_id` as
+  `f'test_{node_name}_{uuid4().hex[:8]}'` (`pipeline.py`), a fresh id per build, and `short_id`
+  hashes the *full* id — so under `=1` **every suite run keys a brand-new overlay set and installs
+  from scratch**, and nothing reclaims the old ones (a measured run added 41 directories to an
+  existing 41). Two consequences: per-node test environments need a stable key, not merely a scoped
+  install; and a "warm" timing measured on `nodes:test` is not warm at all — it is a cold install
+  with a warm `uv` download cache, which understates the reuse a real pipeline gets from its stable
+  `project_id`.
+- **The saas model server** (`extension/model_server`, saas repo) is a fourth non-pipeline entry
+  point and the one that matters most for §4.9's base shrink: no pipeline, no endpoint, no overlay,
+  and it imports `ai.common.torch` at module level, so it loads the whole model stack into base.
+  Its own requirements never enter the startup compile (`REQUIREMENTS_GLOBS` has no `extension/**`
+  entry); saas installs them with explicit `depends()` calls. Giving it an environment is the
+  prerequisite for base becoming runtime-only.
 
 ### 4.15 Compatibility & the venv master switch (`ROCKETRIDE_SERVER_USE_VENV`)
 The whole feature (venv runtime **and** per-environment scoping) is gated by one environment variable,
@@ -580,9 +706,14 @@ resolution it would govern and silently has no effect. Putting the switch there 
 today. Closing this properly means moving the engine's `load_dotenv` ahead of dependency resolution, not
 teaching `venv_env` to parse the file.
 
-- **Unset (default) = auto.** The partitioner inspects the *resolved* pipeline: an `isolated` group
-  present → venv runtime + per-env scoping; none present → today's single-process / global-glob
-  behavior. (This is already how §4.3/§4.13 behave — the default changes nothing for existing pipes.)
+- **Unset (default) = auto.** *Target state:* the partitioner inspects the *resolved* pipeline — an
+  `isolated` group present → venv runtime + per-env scoping; none present → today's single-process /
+  global-glob behavior. **Today `auto` is byte-equivalent to `=0` for every pipeline**, isolated
+  group or not: the only producer of the isolated-group signal is the partitioner, which arrives in
+  2B, and the engine hook calls `ensure_env_scoped(projectId, "main", providers)` with three
+  positional arguments, so `has_isolated_group` keeps its `False` default. **Only `=1` scopes
+  anything at all right now** — the §8.3 measurement (auto = 130 sources = exactly the legacy set)
+  follows from this, not merely from the test pipeline lacking a group.
 - **`=0` = force off (legacy mode).** Never partition: any `isolated` group is **demoted to a plain
   organizational group** (flattened into one process), and dependencies resolve via the **global-glob
   `constraints.txt` path**. Byte-for-byte today's behavior; **never an error**, even if the document
@@ -702,12 +833,16 @@ elsewhere that carry `environment`.
 
 **Phase 2A — Foundation: per-environment requirement scoping (no venvs yet; independently shippable).**
 *Behind a feature flag with fallback to today's global-glob path (blast radius = every pipeline).*
-1. `depends.py` parameterization — `ensure_constraints()`/install take an **explicit requirement-file
-   set + env dir** (no global glob); uniform per-env build (main included); `uv --target
-   <venvs/<project_id>/<env_id>/site-packages>`; per-env constraints/lock/`requirements.hash`; the
-   `sys.path.insert` overlay hook; base = engine runtime only; default-env fallback when no `project_id`;
-   **env-key the module-global install state** (`_processed`/lock/progress/heartbeat), not just the path
-   helpers.
+1. `depends.py` parameterization — **DONE except the base shrink.** `ensure_constraints()`/install take
+   an **explicit requirement-file set + env dir** (no global glob); uniform per-env build (main
+   included); `uv --target <venvs/<project_id>/<env_id>/site-packages>`; per-env
+   constraints/lock/`requirements.hash`; the overlay hook (a **swap**, §4.11); default-env fallback when
+   no `project_id`; the module-global install state resolved into `EnvContext` + `use_env()`, an
+   install-operation progress stack, and a reentrant `FileLock` (§4.9). One install-argv builder serves
+   both paths, and `-r` includes are handled when combining (§4.8).
+   *Still open:* **base = engine runtime only**, deferred with its reasoning in §4.9 — it needs the
+   non-pipeline entry points (saas model server first) to get environments, or it degrades into the
+   rejected half shrink.
 2. **AST `ai/**` discovery** — once per init, cached; config-driven-variant + dynamic-import handling;
    runtime `depends()` backstop with defined timing/failure.
 3. **Non-pipeline entry points** — `engtest` fallback; `builder nodes:test` per-node isolation (must
@@ -740,6 +875,14 @@ elsewhere that carry `environment`.
    teardown-with-run, response/failure merge-back, monitor/trace/SSE fan-in, **metric aggregation across
    child PIDs**, orphan-safe binding (OS process-tree: Windows Job Objects / Unix process groups),
    install reporting, purge/delete + GC.
+- **Prerequisites the 2A state uncovers rather than closes** — both cheap, both blocking the moment
+  two environments live in one interpreter:
+  - `BaseLoader._dependencies_loaded` (`ai/common/models/base.py`) is a **class-level bool**. With
+    `processed` now per environment it becomes the *binding* constraint: it short-circuits before
+    `depends()` is even called, so a model loader that ran in env A contributes nothing to env B's
+    overlay. Convert it to a set of env keys.
+  - Per-node test environments need a **stable** env key — today's harness id is regenerated per run
+    (§4.14).
 - **Tests (§8):** partitioner **unit tests**; the **two-venv conflict-coexists** acceptance
   (`vtest_alpha`/`vtest_beta` split across venvs); compat `=0` isolated-group **demotion**; purge /
   delete / GC **lifecycle** (blocked while a run is active).
@@ -764,7 +907,17 @@ Three layers; each test is tagged with the phase that first makes it runnable (*
   **barrel-`__init__` over-inclusion guard** (full-path import stays tight, barrel import is detected). [2A]
 - **`depends.py` per-env parameterization** — env-keyed paths / lock / `_processed` / progress;
   `requirements.hash` drift → reinstall; default-env fallback when no `project_id`; base =
-  engine-runtime-only. [2A]
+  engine-runtime-only. [2A] **Implemented cases (`test_depends_scoping.py`, engine interpreter;
+  `test_venv_env.py`, bare Python):** `use_env()` switches lock + constraints + `--target` +
+  `processed` together and restores on exception; `processed` is per environment (the same file
+  installs once *per env*, not once per process); an overlay never triggers the global compile;
+  `FileLock` is reentrant in-process (asserted under a timeout so a regression fails instead of
+  hanging) while different paths stay independent; a nested `_stop_heartbeat()` leaves the outer
+  heartbeat running and stacked operations do not share the download aggregation; progress outside
+  any lock writes no sidecar; the overlay is **swapped** (exactly one overlay entry on `sys.path`,
+  base untouched, idempotent for the same env) and lands behind an injected `ROCKETRIDE_MOCK` shim;
+  one argv builder serves base and overlay (base = overlay minus `--target`); `-r` includes are
+  absolutized without backslashes, reach the drift hash, and a missing target is refused by name.
 - **Compatibility switch** — `ROCKETRIDE_SERVER_USE_VENV` unset(auto) / `0`(force-off, isolated group
   demoted to a plain group, global-glob) / `1`(force-on). [2A scoping paths; 2B demotion path]
 - **Model-server pruning** — a proxied node contributes only wrapper/networking deps, not `ai/**` heavy
@@ -812,13 +965,39 @@ and the conflict is isolated to the venv-scoping mechanism — fast, determinist
   (`venv-detect`, objectId returned) with **no `venvs/` directory created**, every install carrying
   `-c cache/constraints.txt` and **no `--target`**. The switch is fully reversible, measured on the
   startup compile: `=1` → 29 sources, **0** of them node paths; `=0` and auto → **130** sources, **101**
-  of them node paths, i.e. exactly the pre-change set. Auto matches legacy because the pipeline has no
-  isolated group. Still owed for 2B: a pipeline that **does** contain an isolated group must run
-  single-process under `=0`, no error — the permanent opt-out (§4.15).
+  of them node paths, i.e. exactly the pre-change set. Auto matches legacy **for every pipeline**, not
+  merely for this one: nothing produces the isolated-group signal until the partitioner lands (§4.15).
+  Still owed for 2B: a pipeline that **does** contain an isolated group must run single-process under
+  `=0`, no error — the permanent opt-out (§4.15).
+- **A node's own pin beats the base — OWED (the headline promise, still unproven end-to-end).** The
+  cases above prove two nodes conflict *with each other*; none proves that a node gets its version
+  regardless of what base holds. Install the other pin into base (`tabulate==0.9.0`), run a
+  `vtest_alpha`-only pipeline under `=1`, and assert the overlay holds `0.8.10`, the node imports
+  `0.8.10`, and base still holds `0.9.0` afterwards. The mechanism is already verified at the tool
+  level (see below), so this test pins it against a uv upgrade. [2A]
 - **Lifecycle.** Purge, delete-with-nodes, and pipeline-delete reclaim the right `venvs/...` dirs and are
   **blocked while a run is active**. Image lanes cross a venv boundary (all-lane bridge). [2B]
-- **Embedding invariant.** `server:run-engtest` (`python::config` + `webhook`) and `builder nodes:test`
-  still pass — the no-move-binary overlay preserves `sys.prefix == exe dir == rootDir`. [2A]
+- **Embedding invariant — VERIFIED.** `server:run-engtest` passes (23 cases, 490 assertions,
+  including `python::config`): the no-move-binary overlay preserves
+  `sys.prefix == exe dir == rootDir`. Under `=1` the same run creates **no `venvs/default`**, which
+  is correct and now explained rather than open — its fixture carries no pipeline components, so the
+  hook fires with an empty provider set and scoping no-ops (§4.14).
+- **State refactor regression — VERIFIED.** `builder server:run-rocketlib-test` 71 passed under the
+  engine interpreter (the `EnvContext`/`use_env`, overlay-swap, `FileLock`-reentrancy,
+  progress-stack, argv-builder and `-r`-include cases above). `builder nodes:test` matches the
+  pre-change baseline in **both** modes: **1980 passed, 49 skipped, 0 failed** with
+  `ROCKETRIDE_SERVER_USE_VENV` unset (88.8 s) and with `=1` (636.9 s). The `=1` run created **41 new
+  overlay directories**, the unset run created none — the switch still decides everything, and the
+  per-environment state refactor changed no outcome. The ×7 wall-clock gap is **not** a warm-vs-cold
+  comparison: the harness mints a fresh `project_id` per build, so every `=1` run installs from
+  scratch (§4.14).
+- **`-r` include handling — VERIFIED against the shipped uv.** Compiling a combined file that
+  carried a relative include failed (`failed to read from file …cache\other.txt`); after the
+  rewrite the same input resolves both files. A Windows absolute path with backslashes also fails
+  (uv reads `C:\x\y.txt` as `C:xy.txt`), which is why the rewrite emits forward slashes.
+- **`--target` does not treat base as satisfying — VERIFIED.** `uv pip install --target <empty dir>
+  requests==2.32.3` plans the full tree although base holds 2.34.2. This is the mechanism behind
+  "a node's own pin wins over the base"; the pipeline-level acceptance for it is still owed. [2A]
 
 ## 9. Critical files (for implementation)
 - **Reuse foundation:** `nodes/src/nodes/remote/client/prepare_pipeline.py` (transform → share/generalize);

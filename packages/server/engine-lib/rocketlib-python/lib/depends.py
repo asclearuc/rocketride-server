@@ -40,6 +40,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from glob import glob
 from typing import Optional
 
@@ -99,82 +100,171 @@ def _tool_spec(name: str) -> str:
     return f'{name}=={version}' if version else name
 
 
-# Track processed requirements to avoid redundant installs in same session
-_processed: set[str] = set()
+# ---------------------------------------------------------------------------
+# Active environment
+# ---------------------------------------------------------------------------
 
-# Set while a per-environment overlay is active: runtime depends() then installs into the
-# overlay (uv --target) against the env's own constraints, leaving the base runtime alone.
-_active_overlay_site: Optional[str] = None
-_active_overlay_constraints: Optional[str] = None
+# Guards the registry, the active context and the reentrant-lock depths below. These are
+# process-wide by construction, not thread-local: they decide where `uv --target` writes,
+# and the overlay they correspond to lives on the process-wide sys.path.
+_state_lock = threading.RLock()
+
+# env key -> context. Entries live for the process, so re-activating an environment
+# restores what it already installed instead of reinstalling it.
+_registry: dict[str, venv_env.EnvContext] = {}
+
+# The environment installs currently go to; None means the base runtime.
+_active: Optional[venv_env.EnvContext] = None
+
+# The overlay currently on sys.path. At most one can be, which makes this process state
+# rather than a field on a context.
+_inserted_overlay: Optional[str] = None
+
+
+def _base_env() -> venv_env.EnvContext:
+    """The base runtime as a context: cache/ for metadata, lib/site-packages as target."""
+    with _state_lock:
+        ctx = _registry.get(venv_env.BASE_KEY)
+        if ctx is None:
+            ctx = venv_env.EnvContext(
+                key=venv_env.BASE_KEY,
+                paths=venv_env.base_paths(engine_cache_dir(), _get_site_packages()),
+                is_overlay=False,
+            )
+            _registry[venv_env.BASE_KEY] = ctx
+        return ctx
+
+
+def active_env() -> venv_env.EnvContext:
+    """The environment installs currently go to (the base runtime unless one is active)."""
+    with _state_lock:
+        return _active or _base_env()
+
+
+def register_env(directory: str) -> venv_env.EnvContext:
+    """Get (creating once) the context for the overlay in ``directory``."""
+    key = os.path.normcase(os.path.abspath(directory))
+    with _state_lock:
+        ctx = _registry.get(key)
+        if ctx is None:
+            ctx = venv_env.EnvContext(key=key, paths=venv_env.env_paths(directory), is_overlay=True)
+            _registry[key] = ctx
+        return ctx
+
+
+def activate_env(ctx: Optional[venv_env.EnvContext]) -> Optional[venv_env.EnvContext]:
+    """Make ``ctx`` the install target (``None`` = base); return the previous one."""
+    global _active
+    with _state_lock:
+        previous, _active = _active, ctx
+        return previous
+
+
+@contextmanager
+def use_env(ctx: Optional[venv_env.EnvContext]):
+    """Install into ``ctx`` for the duration of the block, then restore the previous one.
+
+    Switches the lock, the constraints file, the ``uv --target`` destination and the
+    already-installed record together — that is the whole point of the context object.
+
+    It deliberately does **not** touch ``sys.path``: applying an overlay is
+    :func:`ensure_env_scoped`'s job, because the insert has to respect the mock-shim
+    ordering and has to displace whatever overlay was there before. Activating an
+    environment while imports still resolve through another one's overlay resolves
+    dependencies into one place and imports them from another.
+    """
+    previous = activate_env(ctx)
+    try:
+        yield ctx
+    finally:
+        activate_env(previous)
 
 
 # ---------------------------------------------------------------------------
-# File Locking
+# Install progress (per operation, not per environment)
 # ---------------------------------------------------------------------------
 
 
-# Path to the progress sidecar file, set when the lock is acquired.
-# The lock holder writes status updates here so waiting processes can
-# display what is happening instead of a generic "Waiting..." message.
-_progress_path: Optional[str] = None
+class _InstallProgress:
+    """Sidecar + heartbeat state for one install operation.
 
-# Track packages currently being downloaded so we can show a combined
-# status like "Downloading torch (2.7GiB), transformers (11.4MiB)"
-# instead of only the last line uv emitted.
-# Each entry is (name, display) where display includes the size suffix.
-_downloading: list[tuple[str, str]] = []
+    One instance per held lock rather than one set of module globals, so a nested
+    install cannot clear the outer one's state — losing the heartbeat there would let
+    the task startup timeout fire in the middle of a long silent ``uv`` run.
+    """
 
-# Last message written to the sidecar, used by the heartbeat thread
-# to refresh the timestamp so waiting processes see it ticking.
-_last_sidecar_message: Optional[str] = None
+    def __init__(self, sidecar_path: Optional[str] = None):
+        """Create progress state; ``sidecar_path`` is ``None`` when no lock is held."""
+        self.sidecar_path = sidecar_path
+        self.start_time = time.time()
+        self.last_message: Optional[str] = None
+        # (name, display) — display carries the size suffix uv reports.
+        self.downloading: list[tuple[str, str]] = []
+        self._thread: Optional[threading.Thread] = None
+        self._stop: Optional[threading.Event] = None
+        self._depth = 0
 
-# Fixed start time written to the sidecar so waiters can compute
-# total elapsed time since the install began (not since last write).
-_sidecar_start_time: float = 0.0
-
-# Heartbeat thread that re-emits monitorStatus every 5 seconds to
-# keep the task startup timeout alive during long silent operations.
-_heartbeat_thread: Optional[threading.Thread] = None
-_heartbeat_stop: Optional[threading.Event] = None
-
-
-def _write_sidecar(message: str):
-    """Write a progress update to the sidecar file (if lock is held)."""
-    global _last_sidecar_message
-    _last_sidecar_message = message
-    if _progress_path:
+    def write(self, message: str):
+        """Record ``message`` and mirror it to the sidecar for waiting processes."""
+        self.last_message = message
+        if not self.sidecar_path:
+            return
         try:
-            with open(_progress_path, 'w', encoding='utf-8') as f:
-                f.write(f'{_sidecar_start_time}\n{message}\n')
+            with open(self.sidecar_path, 'w', encoding='utf-8') as f:
+                f.write(f'{self.start_time}\n{message}\n')
         except OSError:
             pass
 
+    def start_heartbeat(self):
+        """Start (or re-enter) the heartbeat that keeps the task startup timeout alive."""
+        self._depth += 1
+        if self._thread is not None:
+            return
+        self._stop = threading.Event()
+
+        def _loop(stop_event: threading.Event):
+            # Bound to this instance, not to whatever is on top of the stack: the
+            # operation that started the heartbeat is the one it should narrate.
+            while not stop_event.wait(5.0):
+                if self.last_message:
+                    monitorStatus(self.last_message)
+
+        self._thread = threading.Thread(target=_loop, args=(self._stop,), daemon=True)
+        self._thread.start()
+
+    def stop_heartbeat(self, force: bool = False):
+        """Stop the heartbeat once the outermost caller is done (or when ``force``)."""
+        if self._depth > 0:
+            self._depth -= 1
+        if not force and self._depth > 0:
+            return
+        self._depth = 0
+        if self._stop:
+            self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        self._thread = None
+        self._stop = None
+
+
+# Bottom of the stack: progress reported outside any lock still reaches the monitor, it
+# just has no sidecar to write to. Having it always present spares every caller a None check.
+_progress_stack: list[_InstallProgress] = [_InstallProgress()]
+
+
+def _progress() -> _InstallProgress:
+    """The progress state of the innermost install operation."""
+    return _progress_stack[-1]
+
 
 def _start_heartbeat():
-    """Start the background heartbeat thread."""
-    global _heartbeat_thread, _heartbeat_stop, _sidecar_start_time
-    _sidecar_start_time = time.time()
-    _heartbeat_stop = threading.Event()
-
-    def _heartbeat_loop(stop_event: threading.Event):
-        """Re-emit monitorStatus every 5 seconds to reset the task startup timeout."""
-        while not stop_event.wait(5.0):
-            if _last_sidecar_message:
-                monitorStatus(_last_sidecar_message)
-
-    _heartbeat_thread = threading.Thread(target=_heartbeat_loop, args=(_heartbeat_stop,), daemon=True)
-    _heartbeat_thread.start()
+    """Start the heartbeat of the current install operation."""
+    _progress().start_heartbeat()
 
 
 def _stop_heartbeat():
-    """Stop the background heartbeat thread."""
-    global _heartbeat_thread, _heartbeat_stop
-    if _heartbeat_stop:
-        _heartbeat_stop.set()
-    if _heartbeat_thread:
-        _heartbeat_thread.join(timeout=2.0)
-    _heartbeat_thread = None
-    _heartbeat_stop = None
+    """Stop the heartbeat of the current install operation (refcounted)."""
+    _progress().stop_heartbeat()
 
 
 def updateProgress(message: str):
@@ -184,21 +274,26 @@ def updateProgress(message: str):
     Tracks uv "Downloading <pkg>" / "Downloaded <pkg>" lines to build a
     combined status of all in-flight downloads, e.g. "Downloading torch,
     transformers".  Non-download lines are passed through as-is.
+
+    The in-flight set belongs to the innermost install operation, so two operations
+    holding different locks do not report each other's downloads.
     """
     debug(f'  [uv] {message}')
     stripped = message.strip()
+    progress = _progress()
+    downloading = progress.downloading
 
     # uv emits "Downloading <name> (<size>)" when a download starts
     if stripped.startswith('Downloading '):
         display = stripped[len('Downloading ') :]
         # Extract bare name for matching, e.g. "stripe (1.4MiB)" -> "stripe"
         name = display[: display.index(' (')] if ' (' in display else display
-        if name and not any(n == name for n, _ in _downloading):
-            _downloading.append((name, display))
+        if name and not any(n == name for n, _ in downloading):
+            downloading.append((name, display))
         # Emit combined status with sizes, e.g. "Downloading torch (2.7GiB), stripe (1.4MiB)"
-        combined = f'Downloading {", ".join(d for _, d in _downloading)}'
+        combined = f'Downloading {", ".join(d for _, d in downloading)}'
         monitorStatus(combined)
-        _write_sidecar(combined)
+        progress.write(combined)
         return
 
     # uv emits "Downloaded <name>" when a download finishes
@@ -206,21 +301,21 @@ def updateProgress(message: str):
         name = stripped[len('Downloaded ') :]
         if ' (' in name:
             name = name[: name.index(' (')]
-        _downloading[:] = [(n, d) for n, d in _downloading if n != name]
+        downloading[:] = [(n, d) for n, d in downloading if n != name]
         # If other downloads are still in flight, show them
-        if _downloading:
-            combined = f'Downloading {", ".join(d for _, d in _downloading)}'
+        if downloading:
+            combined = f'Downloading {", ".join(d for _, d in downloading)}'
             monitorStatus(combined)
-            _write_sidecar(combined)
+            progress.write(combined)
         else:
             monitorStatus(message)
-            _write_sidecar(message)
+            progress.write(message)
         return
 
     # Any non-download line clears the tracking (new phase)
-    _downloading.clear()
+    downloading.clear()
     monitorStatus(message)
-    _write_sidecar(message)
+    progress.write(message)
 
 
 def _read_progress(path: str) -> str:
@@ -238,6 +333,12 @@ def _read_progress(path: str) -> str:
         return ''
 
 
+# lock path -> how deep this process is inside it. Byte-range locks are per file
+# description, so a second open() of a path we already hold is refused exactly like a
+# foreign holder — and the wait loop below would then poll forever against ourselves.
+_lock_depth: dict[str, int] = {}
+
+
 class FileLock:
     """
     Simple cross-platform file lock using exclusive file access.
@@ -245,6 +346,10 @@ class FileLock:
     While the lock is held, callers use ``updateProgress()`` instead of
     ``monitorStatus()`` so that a sidecar file is kept up to date for
     waiting processes to read.
+
+    Reentrant **within this process**: re-acquiring a path we already hold just counts
+    up. Between processes nothing changes — a different process still waits and still
+    reads the sidecar to report what the holder is doing.
     """
 
     def __init__(self, lock_path: str, poll_interval: float = 1.0):
@@ -253,10 +358,17 @@ class FileLock:
         self.poll_interval = poll_interval
         self._file = None
         self._sidecar_path = lock_path.replace('.lock', '.progress')
+        self._key = os.path.normcase(os.path.abspath(lock_path))
+        self._reentered = False
 
     def __enter__(self):
         """Acquire the file lock, blocking until it is available."""
-        global _progress_path, _sidecar_start_time, _last_sidecar_message
+        with _state_lock:
+            if _lock_depth.get(self._key, 0) > 0:
+                _lock_depth[self._key] += 1
+                self._reentered = True
+                return self
+
         os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
 
         while True:
@@ -266,10 +378,10 @@ class FileLock:
                     msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
                 else:
                     fcntl.flock(self._file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                # Lock acquired — initialize sidecar state and enable writes
-                _progress_path = self._sidecar_path
-                _sidecar_start_time = time.time()
-                _last_sidecar_message = None
+                # Lock acquired — this operation owns the sidecar until it releases
+                with _state_lock:
+                    _lock_depth[self._key] = 1
+                _progress_stack.append(_InstallProgress(self._sidecar_path))
                 return self
             except (OSError, BlockingIOError):
                 if self._file:
@@ -285,8 +397,15 @@ class FileLock:
 
     def __exit__(self, *args):
         """Release the file lock and clean up progress sidecar."""
-        global _progress_path
-        _progress_path = None
+        if self._reentered:
+            with _state_lock:
+                _lock_depth[self._key] = max(0, _lock_depth.get(self._key, 1) - 1)
+            return
+
+        with _state_lock:
+            _lock_depth.pop(self._key, None)
+        if len(_progress_stack) > 1:
+            _progress_stack.pop().stop_heartbeat(force=True)
         try:
             os.remove(self._sidecar_path)
         except OSError:
@@ -341,12 +460,12 @@ def model_cache_dir(name: str, create: bool = True) -> str:
 
 def _get_combined_path() -> str:
     """Path to the concatenated requirements file (the constraints-compile input)."""
-    return os.path.join(engine_cache_dir(), 'combined.txt')
+    return _base_env().paths.combined
 
 
 def _get_constraints_path() -> str:
     """Path to the compiled constraints file applied (``-c``) to every install."""
-    return os.path.join(engine_cache_dir(), 'constraints.txt')
+    return _base_env().paths.constraints
 
 
 def _constraints_args(constraints_path: str, exe_dir: str) -> list[str]:
@@ -627,7 +746,8 @@ def _apply_pywin32_hack():
         pass
 
     debug('Applying pywin32 path hack...')
-    site_path = _get_site_packages()
+    # The active environment's target, so a pywin32 that landed in an overlay is found.
+    site_path = active_env().paths.site_packages
     pywin32_paths = ['win32', 'win32/lib', 'Pythonwin']
 
     for subpath in pywin32_paths:
@@ -740,13 +860,13 @@ def _save_hash(hash_file: str, hash_value: str):
 
 
 def _combine_requirements(file_paths: list[str], output_path: str):
-    """Concatenate all requirement files into one."""
-    with open(output_path, 'w', encoding='utf-8') as out:
-        for path in file_paths:
-            out.write(f'# Source: {path}\n')
-            with open(path, 'r', encoding='utf-8') as inp:
-                out.write(inp.read())
-            out.write('\n')
+    """Concatenate all requirement files into one (base and scoped share one combiner).
+
+    Delegates so both paths get the same ``-r`` handling: the combined file lives in a
+    different directory than its sources, and uv resolves an include relative to the file
+    holding the line.
+    """
+    venv_env.write_combined(file_paths, output_path)
 
 
 def _compile_constraints(constraints_path: str):
@@ -798,12 +918,12 @@ def ensure_constraints() -> str:
 
     Returns the path to the constraints file.
     """
-    cache_dir = engine_cache_dir()
-    os.makedirs(cache_dir, exist_ok=True)
+    paths = _base_env().paths
+    os.makedirs(paths.env_dir, exist_ok=True)
 
-    hash_file = os.path.join(cache_dir, 'requirements.hash')
-    combined_path = _get_combined_path()
-    constraints_path = _get_constraints_path()
+    hash_file = paths.hash_file
+    combined_path = paths.combined
+    constraints_path = paths.constraints
 
     # Find all requirement files
     req_files = _find_requirement_files()
@@ -812,8 +932,10 @@ def ensure_constraints() -> str:
         debug('No requirement files found')
         return constraints_path
 
-    # Compute current hash
-    current_hash = _compute_hash(req_files + override_files)
+    # Hash the includes too: a `-r`-referenced file shapes the resolution, so it has to
+    # be able to invalidate it. Overrides shape it exactly as much, so they go through the
+    # same walk rather than being appended beside it.
+    current_hash = _compute_hash(venv_env.resolve_includes(req_files + override_files))
     stored_hash = _load_stored_hash(hash_file)
 
     # Check if rebuild is needed. The derived overrides cache is part of the
@@ -1041,21 +1163,20 @@ def _save_verdict(requirements_path: str, constraints_path: str):
         debug(f'  Could not record the satisfied verdict ({e}); the next process will resolve again')
 
 
-def _target_args() -> list[str]:
-    """``uv --target <overlay>`` when scoping is active, else ``[]``.
+def _target_site() -> Optional[str]:
+    """The overlay ``uv --target`` should write to, or ``None`` for the base runtime.
 
     uv reads the target directory, so packages the scoped install already placed there
     are reported as satisfied instead of being reinstalled into the base runtime.
     """
-    return ['--target', _active_overlay_site] if _active_overlay_site else []
+    ctx = active_env()
+    return ctx.paths.site_packages if ctx.is_overlay else None
 
 
-def _effective_constraints(constraints_path: str) -> str:
-    """The env's constraints when scoping is active, else the given global one.
-
-    Keeps runtime installs pinned to the versions the scoped compile resolved.
-    """
-    return _active_overlay_constraints or constraints_path
+def _target_args() -> list[str]:
+    """``uv --target <overlay>`` when an overlay is active, else ``[]``."""
+    site = _target_site()
+    return ['--target', site] if site else []
 
 
 def _install_dry_run(requirements_path: str, constraints_path: str) -> list[str]:
@@ -1089,7 +1210,7 @@ def _install_dry_run(requirements_path: str, constraints_path: str) -> list[str]
     # See #1256.
     args.extend(['--excludes', os.path.relpath(_write_excludes_file(), exe_dir)])
 
-    args.extend(_constraints_args(_effective_constraints(constraints_path), exe_dir))
+    args.extend(_constraints_args(constraints_path, exe_dir))
     args.extend(_override_args(exe_dir))
     args.extend(_target_args())
 
@@ -1181,27 +1302,19 @@ def _install_requirements_inner(requirements_path: str, constraints_path: str):
         pkg_list = ', '.join(packages[:4]) + ', ...'
     updateProgress(f'Installing {pkg_list}')
 
-    # Build uv command
+    # Build uv command — same builder as the scoped install, so the two install paths
+    # cannot drift apart on flags. Relative --excludes/-c: uv splits them on whitespace
+    # (#1256).
     exe_dir = _get_executable_dir()
-    uv_args = [
-        _uv_abs_path(),
-        'pip',
-        'install',
-        '-r',
-        requirements_path,
-        '--python',
-        sys.executable,
-        '--index-strategy',
-        'unsafe-best-match',
-        '--no-build-isolation',  # Don't create temp venvs (engine.exe can't create venvs)
-    ]
-
-    # Relative to cwd (exe_dir) — see the --excludes note in _install_dry_run (#1256).
-    uv_args.extend(['--excludes', os.path.relpath(_write_excludes_file(), exe_dir)])
-
-    uv_args.extend(_constraints_args(_effective_constraints(constraints_path), exe_dir))
+    uv_args = venv_env.build_install_argv(
+        uv_path=_uv_abs_path(),
+        python_exe=sys.executable,
+        requirements_path=requirements_path,
+        target_site=_target_site(),
+        excludes_path=os.path.relpath(_write_excludes_file(), exe_dir),
+    )
+    uv_args.extend(_constraints_args(constraints_path, exe_dir))
     uv_args.extend(_override_args(exe_dir))
-    uv_args.extend(_target_args())
 
     # Run uv and stream output (heartbeat is already running from the caller)
     debug(f'Install: {uv_args}')
@@ -1234,7 +1347,7 @@ def _install_requirements_inner(requirements_path: str, constraints_path: str):
     importlib.invalidate_caches()
 
     # Clear the path importer cache for the install target to force a re-scan
-    sys.path_importer_cache.pop(_active_overlay_site or _get_site_packages(), None)
+    sys.path_importer_cache.pop(active_env().paths.site_packages, None)
 
     # The install changed the installed set: record the verdict against it.
     _save_verdict(requirements_path, constraints_path)
@@ -1256,11 +1369,16 @@ def depends(requirements: Optional[str] = None):
     2. Ensures constraints are up to date
     3. Installs the specified requirements with constraints
 
+    Everything comes from the **active environment** (:func:`active_env`): its lock, its
+    constraints, its install target, and its record of what is already installed. Under
+    an overlay the requirements land there rather than in the base runtime.
+
     Args:
         requirements: Path to a requirements.txt file. If None, only
                       ensures the environment and constraints are ready.
     """
     debug(f'depends({requirements})')
+    ctx = active_env()
 
     # Normalize path
     if requirements:
@@ -1269,26 +1387,27 @@ def depends(requirements: Optional[str] = None):
         if not os.path.exists(requirements):
             debug('  File not found, skipping')
             return
-        if requirements in _processed:
+        # Per environment: installed into overlay A says nothing about overlay B.
+        if requirements in ctx.processed:
             debug('  Already processed, skipping')
             return
 
-    cache_dir = engine_cache_dir()
-    lock_path = os.path.join(cache_dir, 'install.lock')
-
-    with FileLock(lock_path):
-        debug(f'  Lock acquired: {lock_path}')
+    with FileLock(ctx.paths.lock_file):
+        debug(f'  Lock acquired: {ctx.paths.lock_file}')
 
         # Phase 1: Bootstrap
         bootstrap()
 
-        # Phase 2: Ensure constraints
-        constraints_path = ensure_constraints()
+        # Phase 2: Constraints. An overlay's were compiled by ensure_env_scoped from its
+        # own requirement set; recompiling the global union here would be work whose
+        # result is then discarded, and it would reintroduce the very cross-environment
+        # coupling the overlay exists to remove.
+        constraints_path = ctx.paths.constraints if ctx.is_overlay else ensure_constraints()
 
         # Phase 3: Install if requirements provided
         if requirements:
             _install_requirements(requirements, constraints_path)
-            _processed.add(requirements)
+            ctx.processed.add(requirements)
             debug(f'  Completed: {os.path.basename(requirements)}')
 
         # Phase 4: Apply platform-specific hacks (after packages may have been installed)
@@ -1332,6 +1451,37 @@ def _overlay_index() -> int:
             if entry and os.path.normcase(os.path.abspath(entry)) == target:
                 return index + 1
     return 0
+
+
+def _apply_overlay_path(site: str) -> None:
+    """Put ``site`` on ``sys.path`` as **the** overlay, displacing any previous one.
+
+    A swap, not an insert: applying a second environment while the first is still on the
+    path leaves everything the first has and the second lacks importable, which is the
+    cross-environment leak overlays exist to prevent — and it arrives as a wrong version
+    rather than as a missing import.
+
+    The swap only governs **future** imports. Whatever the process already imported from
+    the previous overlay stays in ``sys.modules``, so this does not make one interpreter
+    safely multi-environment; that is why each environment gets its own child process
+    (design §4.10).
+    """
+    global _inserted_overlay
+    import importlib
+
+    with _state_lock:
+        previous = _inserted_overlay
+        if previous == site and site in sys.path:
+            return
+        if previous and previous != site:
+            while previous in sys.path:
+                sys.path.remove(previous)
+            sys.path_importer_cache.pop(previous, None)
+        if site not in sys.path:
+            sys.path.insert(_overlay_index(), site)
+        sys.path_importer_cache.pop(site, None)
+        _inserted_overlay = site
+    importlib.invalidate_caches()
 
 
 def _compile_constraints_at(combined_path: str, constraints_path: str) -> None:
@@ -1461,15 +1611,11 @@ def ensure_env_scoped(
             _compile_constraints_at(plan.paths.combined, plan.paths.constraints)
             _install_target(plan.paths.combined, plan.paths.constraints, plan.paths.site_packages)
 
-    def _overlay(site):
-        global _active_overlay_site, _active_overlay_constraints
-        if site not in sys.path:
-            sys.path.insert(_overlay_index(), site)
-        _active_overlay_site = site
-        _active_overlay_constraints = venv_env.env_paths(os.path.dirname(site)).constraints
-        import importlib
-
-        importlib.invalidate_caches()
+    def _overlay(paths):
+        # The one door that does both halves of a switch: where installs go, and where
+        # imports come from. use_env() deliberately does only the first.
+        activate_env(register_env(paths.env_dir))
+        _apply_overlay_path(paths.site_packages)
 
     return venv_env.run_scoped_install(
         exe_dir,
@@ -1497,11 +1643,12 @@ def main():
     After bootstrapping and ensuring constraints, passes all arguments
     through to 'uv pip'. Falls back to standard pip if uv can't build
     source distributions due to virtualenv creation issues.
-    """
-    cache_dir = engine_cache_dir()
-    lock_path = os.path.join(cache_dir, 'install.lock')
 
-    with FileLock(lock_path):
+    A CLI invocation has no pipeline, so the active environment here is the base runtime.
+    """
+    ctx = active_env()
+
+    with FileLock(ctx.paths.lock_file):
         # Bootstrap environment
         bootstrap()
 
@@ -1525,7 +1672,7 @@ def main():
 
             # For install/sync commands, add constraints file if available
             if sys.argv[1] in ('install', 'sync'):
-                uv_args.extend(_constraints_args(_get_constraints_path(), exe_dir))
+                uv_args.extend(_constraints_args(ctx.paths.constraints, exe_dir))
 
             # Run uv
             result = subprocess.run(uv_args, cwd=exe_dir)
