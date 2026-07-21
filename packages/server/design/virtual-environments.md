@@ -845,8 +845,15 @@ elsewhere that carry `environment`.
    rejected half shrink.
 2. **AST `ai/**` discovery** — once per init, cached; config-driven-variant + dynamic-import handling;
    runtime `depends()` backstop with defined timing/failure.
-3. **Non-pipeline entry points** — `engtest` fallback; `builder nodes:test` per-node isolation (must
-   precede any incompatible node).
+3. **Non-pipeline entry points** — `engtest` fallback (**done**: verified to no-op by construction,
+   §4.14); `builder nodes:test` per-node isolation (**open**).
+   **Trigger, not a reminder: the first node in this tree that is incompatible with another blocks
+   on this item.** Until such a node exists nothing breaks, because the suite runs in one
+   environment and all nodes are mutually satisfiable; the day one lands, `nodes:test` stops working
+   and the fix is per-node scoped test environments in separate worker processes pinned via
+   `ROCKETRIDE_VENV_SITE` (§4.14). Staging the `vtest_*` fixtures into `dist/server/nodes` belongs to
+   this item too — it is the same plumbing, and it is what unblocks the end-to-end acceptance in
+   §8.3. Do not build it standalone beforehand: the shape follows from the isolation work.
    *Payoff (opt-in, per §4.15):* when the scoped path is enabled (`ROCKETRIDE_SERVER_USE_VENV=1`, or
    auto with an isolated group present), the pipeline runs in a node-scoped "main" env → faster/smaller,
    no gliner/whisper bloat. **If no venv is needed** — the pipeline contains no isolated groups and the
