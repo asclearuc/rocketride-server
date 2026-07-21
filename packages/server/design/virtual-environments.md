@@ -937,6 +937,13 @@ choice — the SDK depends on it, so the pin would collide with runtime deps and
 and the conflict is isolated to the venv-scoping mechanism — fast, deterministic, no GPU/torch. These
 **replace `torch 2.0/2.1`** as the conflict fixture. [created 2A; used by 8.3]
 
+**Not staged by any build step (gap).** The fixtures are read straight from the source tree by the
+automated acceptance (`ProviderIndex` over `nodes/test/fixtures`), but nothing copies them into
+`dist/server/nodes`, so no *pipeline* can reference them without a manual copy and `nodes:test` does
+not exercise them at all. Staging them is the prerequisite for the end-to-end acceptance in §8.3;
+until then, `vtest_alpha` also has nothing to report — it forwards text unchanged, so the version it
+actually imported is not observable from outside the process.
+
 ### 8.3 Integration / acceptance
 
 - **Conflict → isolated to its environment (the core proof) — VERIFIED live.** A pipeline with **both**
@@ -969,12 +976,29 @@ and the conflict is isolated to the venv-scoping mechanism — fast, determinist
   merely for this one: nothing produces the isolated-group signal until the partitioner lands (§4.15).
   Still owed for 2B: a pipeline that **does** contain an isolated group must run single-process under
   `=0`, no error — the permanent opt-out (§4.15).
-- **A node's own pin beats the base — OWED (the headline promise, still unproven end-to-end).** The
-  cases above prove two nodes conflict *with each other*; none proves that a node gets its version
-  regardless of what base holds. Install the other pin into base (`tabulate==0.9.0`), run a
-  `vtest_alpha`-only pipeline under `=1`, and assert the overlay holds `0.8.10`, the node imports
-  `0.8.10`, and base still holds `0.9.0` afterwards. The mechanism is already verified at the tool
-  level (see below), so this test pins it against a uv upgrade. [2A]
+- **A node's own pin beats the base — AUTOMATED at two levels, end-to-end still owed.** The other
+  cases prove two nodes conflict *with each other*; this one proves a node gets **its** version
+  whatever base holds. `tests/test_scoping_acceptance.py` (engine interpreter, real `uv`; skips
+  rather than fails when the index is unreachable):
+  - *Mechanism* — `uv pip install --target <empty dir> requests==<version base does not have>`
+    plans the install instead of reporting the base copy as satisfying. This is the single property
+    everything rests on, and the one that would break silently on a uv upgrade.
+  - *Result* — the `vtest_alpha` fixture's requirement set is AST-discovered (exactly its own
+    `requirements.txt`, not a glob), compiled, and installed into an overlay under the engine's own
+    `venvs/`: the overlay ends up with `tabulate==0.8.10`, the base runtime's copy is unchanged, and
+    the applied overlay sits ahead of base on `sys.path`. The overlay is removed afterwards.
+  - Note the overlay must live beside the executable: the install passes `-c` **relative** to the
+    executable directory (uv splits the value on whitespace, #1256), which cannot be expressed
+    across drives — a `tmp_path` on another volume fails with `path is on mount 'C:'`.
+
+  **Still owed — the end-to-end level**, blocked on the `vtest_*` fixtures not being staged into
+  `dist/server/nodes` by any build step (and so not exercised by `nodes:test` either). Procedure
+  once staged: (1) run a `vtest_beta` pipeline under `=0`, which puts `tabulate==0.9.0` into base
+  *by legacy design* rather than by an ad-hoc `uv` call; (2) run a `vtest_alpha`-only pipeline under
+  `=1`; (3) assert the node reports `tabulate.__version__ == 0.8.10` and a `__file__` under
+  `venvs/<proj>/main/site-packages`, and that base still holds `0.9.0`. Step 3 needs the fixture to
+  emit the version and path it imported — today it forwards text unchanged, so nothing observable
+  crosses the boundary. [2A]
 - **Lifecycle.** Purge, delete-with-nodes, and pipeline-delete reclaim the right `venvs/...` dirs and are
   **blocked while a run is active**. Image lanes cross a venv boundary (all-lane bridge). [2B]
 - **Embedding invariant — VERIFIED.** `server:run-engtest` passes (23 cases, 490 assertions,
@@ -995,9 +1019,9 @@ and the conflict is isolated to the venv-scoping mechanism — fast, determinist
   carried a relative include failed (`failed to read from file …cache\other.txt`); after the
   rewrite the same input resolves both files. A Windows absolute path with backslashes also fails
   (uv reads `C:\x\y.txt` as `C:xy.txt`), which is why the rewrite emits forward slashes.
-- **`--target` does not treat base as satisfying — VERIFIED.** `uv pip install --target <empty dir>
-  requests==2.32.3` plans the full tree although base holds 2.34.2. This is the mechanism behind
-  "a node's own pin wins over the base"; the pipeline-level acceptance for it is still owed. [2A]
+- **`--target` does not treat base as satisfying — VERIFIED** and now pinned by a test (see the
+  pin-beats-base entry above): `uv pip install --target <empty dir> requests==2.32.3` plans the full
+  tree although base holds 2.34.2. [2A]
 
 ## 9. Critical files (for implementation)
 - **Reuse foundation:** `nodes/src/nodes/remote/client/prepare_pipeline.py` (transform → share/generalize);
