@@ -58,7 +58,8 @@ import { useFlowGraph } from '../../../context/FlowGraphContext';
 import type { FlowNode } from '../../../context/FlowGraphContext';
 import { useFlowProject } from '../../../context/FlowProjectContext';
 import { useFlowPreferences } from '../../../context/FlowPreferencesContext';
-import { IService, IServiceCatalog, IValidatePipelinePayload, PIPELINE_SCHEMA_VERSION } from '../../../types';
+import { INodeType, IService, IServiceCatalog, IValidatePipelinePayload, PIPELINE_SCHEMA_VERSION } from '../../../types';
+import type { IEnvironment } from '../../../types';
 import { getComponentFromNode } from '../../../util/graph';
 
 import { IAuthTokensRef, persistTokensFromFormData, mergeAuthTokensIntoFormData, persistOAuthTokensAndSave } from './authTokenHelpers';
@@ -113,6 +114,22 @@ const styles = {
 		...commonStyles.labelUppercase,
 		display: 'block',
 		marginBottom: 5,
+	} as CSSProperties,
+
+	// Explanatory line under a field, for what a value does rather than what it is.
+	fieldHint: {
+		marginTop: 5,
+		fontSize: 11,
+		lineHeight: 1.4,
+		opacity: 0.7,
+	} as CSSProperties,
+
+	// Checkbox with its label on one line — the label is the hit target.
+	checkboxRow: {
+		display: 'flex',
+		alignItems: 'center',
+		gap: 8,
+		cursor: 'pointer',
 	} as CSSProperties,
 
 	// Annotation content textarea (grows vertically only).
@@ -184,6 +201,11 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 	// --- Annotation detection -----------------------------------------------
 	const isAnnotation = node.data.provider === 'annotation';
 
+	// --- Virtual environment detection --------------------------------------
+	// Keyed on the canvas node type, not on a config field: the container is what it
+	// is regardless of whether its environment block is well-formed.
+	const isVirtualEnv = node.type === INodeType.VirtualEnv;
+
 	// --- Service lookup -----------------------------------------------------
 	const service: IService | undefined = (servicesJson as IServiceCatalog)?.[node.data.provider];
 
@@ -218,6 +240,12 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 	const [bgColor, setBgColor] = useState<string>((node.data.config?.bgColor as string) || 'var(--rr-annotation-bg-default)');
 	const [fgColor, setFgColor] = useState<string>((node.data.config?.fgColor as string) || 'var(--rr-text-primary)');
 
+	// --- Virtual-environment state ------------------------------------------
+	// Falls back to the component name so a container that carries only one of the two
+	// opens with it filled in rather than blank.
+	const [envName, setEnvName] = useState<string>(((node.data.config?.environment as IEnvironment | undefined)?.name || node.data.name || '') as string);
+	const [envIsolated, setEnvIsolated] = useState<boolean>((node.data.config?.environment as IEnvironment | undefined)?.isolated !== false);
+
 	// --- Secured field transforms -------------------------------------------
 	const securedFormData = getSecuredFormData(formValues);
 	const _schema = useMemo(() => removeRequired(schema?.schema, securedFormData), [schema?.schema, securedFormData]);
@@ -244,6 +272,14 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 			setAnnotationContent(raw.replace(/\\n/g, '\n'));
 			setBgColor((config.bgColor as string) || 'var(--rr-annotation-bg-default)');
 			setFgColor((config.fgColor as string) || 'var(--rr-text-primary)');
+		}
+
+		// Sync virtual-environment state — without this the panel keeps the previous
+		// container's name when the user opens a second one.
+		if (node.type === INodeType.VirtualEnv) {
+			const environment = config.environment as IEnvironment | undefined;
+			setEnvName(environment?.name || node.data.name || '');
+			setEnvIsolated(environment?.isolated !== false);
 		}
 
 		// If OAuth tokens are in the URL, persist to node and save immediately
@@ -354,6 +390,18 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 					fgColor,
 				},
 			});
+		} else if (isVirtualEnv) {
+			// One name, written to both places it is read from: `config.environment.name`
+			// is what the container and the partitioner use, `name` is the component name
+			// every generic listing shows. Letting them drift would put two different
+			// labels on one container.
+			updateNode(node.id, {
+				name: envName || undefined,
+				config: {
+					...node.data.config,
+					environment: { name: envName, isolated: envIsolated },
+				},
+			});
 		} else {
 			updateNode(node.id, {
 				name: name || undefined,
@@ -362,7 +410,7 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 		setIsDirty(false);
 		onContentUpdated();
 		onClose();
-	}, [node.id, node.data.config, name, isAnnotation, annotationContent, bgColor, fgColor, updateNode, onContentUpdated, onClose]);
+	}, [node.id, node.data.config, name, isAnnotation, isVirtualEnv, envName, envIsolated, annotationContent, bgColor, fgColor, updateNode, onContentUpdated, onClose]);
 
 	// --- Save: full form with server validation ----------------------------
 	const onSubmit = useCallback(
@@ -447,7 +495,7 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 
 	// --- Render -------------------------------------------------------------
 
-	const title = isAnnotation ? 'Note' : (service?.title ?? node.data.provider);
+	const title = isAnnotation ? 'Note' : isVirtualEnv ? 'Virtual Environment' : (service?.title ?? node.data.provider);
 	const saveDisabled = isSubmitting || isLocked;
 
 	return (
@@ -486,8 +534,9 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 					</div>
 				)}
 
-				{/* Node name field */}
-				{!isAnnotation && (
+				{/* Node name field. A container is named by its environment, so it gets one
+				    field rather than two that mean the same thing. */}
+				{!isAnnotation && !isVirtualEnv && (
 					<div style={styles.field}>
 						<label style={styles.fieldLabel} htmlFor="rr-node-name">
 							Node Name
@@ -504,6 +553,43 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 							data-rr-autofocus="true"
 						/>
 					</div>
+				)}
+
+				{/* Virtual-environment fields */}
+				{isVirtualEnv && (
+					<>
+						<div style={styles.field}>
+							<label style={styles.fieldLabel} htmlFor="rr-env-name">
+								Environment Name
+							</label>
+							<input
+								id="rr-env-name"
+								style={commonStyles.inputField}
+								value={envName}
+								placeholder="e.g. vision"
+								onChange={(e) => {
+									setEnvName(e.target.value);
+									setIsDirty(true);
+								}}
+								data-rr-autofocus="true"
+							/>
+							<div style={styles.fieldHint}>Display name only — the environment is keyed by the container&apos;s id, so renaming keeps its installed packages.</div>
+						</div>
+						<div style={styles.field}>
+							<label style={styles.checkboxRow} htmlFor="rr-env-isolated">
+								<input
+									id="rr-env-isolated"
+									type="checkbox"
+									checked={envIsolated}
+									onChange={(e) => {
+										setEnvIsolated(e.target.checked);
+										setIsDirty(true);
+									}}
+								/>
+								Isolated dependencies
+							</label>
+						</div>
+					</>
 				)}
 
 				{/* Annotation-specific fields */}

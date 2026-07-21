@@ -37,7 +37,7 @@ import { Node, Edge, useReactFlow } from '@xyflow/react';
 import ELK from 'elkjs/lib/elk.bundled';
 import type { ElkNode } from 'elkjs';
 
-import { INodeType } from '../types';
+import { isContainerType } from '../types';
 import type { INodeData } from '../types';
 
 /** ReactFlow Node with strongly-typed data. Matches FlowGraphContext's FlowNode. */
@@ -112,7 +112,7 @@ export function useAutoLayout(nodes: FlowNode[], edges: Edge[], setNodes: React.
 					children: [],
 					// Carry layout options for groups
 					layoutOptions:
-						node.type === INodeType.Group
+						isContainerType(node.type)
 							? {
 									'elk.padding': `[top=${GROUP_PADDING},left=${GROUP_PADDING},bottom=${GROUP_PADDING},right=${GROUP_PADDING}]`,
 									'elk.algorithm': 'layered',

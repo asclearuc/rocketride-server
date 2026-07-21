@@ -45,6 +45,48 @@ export interface PipelineControlConnection {
 }
 
 /**
+ * Virtual environment carried by a container component.
+ *
+ * An isolated container's members resolve and install their dependencies into their
+ * own environment instead of sharing one with the rest of the pipeline, which is what
+ * lets components with incompatible requirements coexist in one document. The name is
+ * display metadata: the environment is keyed by the container's `id`, so renaming it
+ * does not move the installed environment.
+ */
+export interface PipelineEnvironment {
+	/** Display name for the environment (metadata only — never an identifier) */
+	name: string;
+
+	/** Whether members run with their own isolated dependencies */
+	isolated: boolean;
+}
+
+/**
+ * Components nested inside a container component.
+ *
+ * A container stores its members here rather than at the top level; they are lifted
+ * back out before execution.
+ */
+export interface NestedPipeline {
+	/** Components belonging to the container */
+	components: PipelineComponent[];
+}
+
+/**
+ * Component-specific configuration.
+ *
+ * Open by design — each provider defines its own parameters — with the two
+ * structural keys named so a container's shape is not a matter of convention.
+ */
+export type PipelineComponentConfig = Record<string, unknown> & {
+	/** Present on a container component that declares a virtual environment */
+	environment?: PipelineEnvironment;
+
+	/** Present on a container component that has members */
+	pipeline?: NestedPipeline;
+};
+
+/**
  * Pipeline component that processes data.
  *
  * Each component has a unique ID, a provider type that determines its behavior,
@@ -65,7 +107,7 @@ export interface PipelineComponent {
 	description?: string;
 
 	/** Component-specific configuration parameters */
-	config: Record<string, unknown>;
+	config: PipelineComponentConfig;
 
 	/** UI-specific configuration for visual editors */
 	ui?: Record<string, unknown>;

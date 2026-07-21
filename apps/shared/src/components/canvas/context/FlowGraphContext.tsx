@@ -50,7 +50,7 @@ import { createContext, ReactElement, ReactNode, useCallback, useContext, useEff
 
 import { Connection, Edge, EdgeChange, Node, NodeChange, useEdgesState, useNodesState, useReactFlow, getConnectedEdges, useUpdateNodeInternals } from '@xyflow/react';
 
-import { INode, INodeData, IProject, IProjectLayout, INodeType, PIPELINE_SCHEMA_VERSION } from '../types';
+import { INode, INodeData, IProject, IProjectLayout, INodeType, isContainerType, PIPELINE_SCHEMA_VERSION } from '../types';
 
 /** ReactFlow Node with strongly-typed data. Used throughout the canvas. */
 export type FlowNode = Node<INodeData>;
@@ -389,7 +389,7 @@ export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactE
 		patchToolchainState({ isUpdated: true, isSaved: false });
 
 		if (!onContentChanged || isLoadingRef.current) {
-				return;
+			return;
 		}
 
 		setTimeout(() => {
@@ -485,7 +485,12 @@ export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactE
 				const updated = nds.map((n) => {
 					if (!draggedIds.has(n.id)) return n;
 
-					const intersecting = getIntersectingNodes(n).filter((candidate) => candidate.type === INodeType.Group && candidate.id !== n.id && !isDescendant(n.id, candidate.id));
+					// A virtual environment may hold anything except another one: nesting
+					// isolated environments is rejected (design §4.13), and refusing the
+					// drop says so before the document can express it.
+					const acceptsDragged = (candidate: FlowNode) => !(candidate.type === INodeType.VirtualEnv && n.type === INodeType.VirtualEnv);
+
+					const intersecting = getIntersectingNodes(n).filter((candidate) => isContainerType(candidate.type) && candidate.id !== n.id && !isDescendant(n.id, candidate.id) && acceptsDragged(candidate as FlowNode));
 
 					const targetGroup =
 						intersecting.length > 0
@@ -618,9 +623,7 @@ export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactE
 
 			// Derive edge ID and lane/classType from handle IDs
 			const isInvoke = sourceHandle?.startsWith('invoke-source');
-			const laneOrClass = isInvoke
-				? (sourceHandle?.split('.').at(1) ?? '')
-				: (sourceHandle?.split('-')?.at(1) ?? '');
+			const laneOrClass = isInvoke ? (sourceHandle?.split('.').at(1) ?? '') : (sourceHandle?.split('-')?.at(1) ?? '');
 			const edgeId = `${source}::${target}::${laneOrClass}`;
 
 			// Add edge directly — ReactFlow owns edges at runtime
@@ -796,7 +799,6 @@ export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactE
 				deletable: true,
 				selectable: true,
 			};
-
 
 			// Append node — ReactFlow owns nodes and edges; no edge rebuild needed
 			setNodes((nds) => [...nds, node]);
@@ -1037,9 +1039,7 @@ export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactE
 		lastLoadedProjectId.current = incomingProjectId;
 		const unconfigured = loadData(currentProject);
 		if (unconfigured > 0) {
-			setConfigSnackbar(unconfigured === 1
-				? '1 node needs configuration — look for the red gear'
-				: `${unconfigured} nodes need configuration — look for the red gear`);
+			setConfigSnackbar(unconfigured === 1 ? '1 node needs configuration — look for the red gear' : `${unconfigured} nodes need configuration — look for the red gear`);
 		}
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [incomingVersion, incomingProjectId]);
@@ -1048,7 +1048,6 @@ export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactE
 	useEffect(() => {
 		if (!servicesJson || Object.keys(servicesJson).length === 0) return;
 		if (nodes.length === 0) return;
-
 
 		let unconfigured = 0;
 		let changed = false;
@@ -1087,9 +1086,7 @@ export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactE
 		}
 
 		if (unconfigured > 0) {
-			setConfigSnackbar(unconfigured === 1
-				? '1 node needs configuration — look for the red gear'
-				: `${unconfigured} nodes need configuration — look for the red gear`);
+			setConfigSnackbar(unconfigured === 1 ? '1 node needs configuration — look for the red gear' : `${unconfigured} nodes need configuration — look for the red gear`);
 		}
 
 		// Force handle re-registration — invoke-target handles depend on
@@ -1168,45 +1165,41 @@ export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactE
 	// Context value
 	// =====================================================================
 
-	const value: IFlowGraphContext = useMemo(() => ({
-		canvasRef,
-		nodes,
-		edges,
-		nodeMap,
-		setNodes,
-		setEdges,
-		onNodesChange,
-		onEdgesChange,
-		onEdgeConnect,
-		isValidConnection,
-		onDragOver,
-		onDrop,
-		onNodeDragStop,
-		addNode,
-		updateNode,
-		deleteNode,
-		onNodesDelete,
-		tempNode,
-		setTempNode,
-		focusOnNode,
-		editingNodeId,
-		setEditingNodeId,
-		onContentUpdated,
-		loadData,
-		loadCanvas,
-		isFlowReady,
-		quickAddState,
-		setQuickAddState,
-		configSnackbar,
-		setConfigSnackbar,
-	}), [
-		nodes, edges, nodeMap, setNodes, setEdges,
-		onNodesChange, onEdgesChange, onEdgeConnect, isValidConnection,
-		onDragOver, onDrop, onNodeDragStop, addNode, updateNode, deleteNode,
-		onNodesDelete, tempNode, focusOnNode, editingNodeId,
-		onContentUpdated, loadData, loadCanvas, isFlowReady,
-		quickAddState, configSnackbar,
-	]);
+	const value: IFlowGraphContext = useMemo(
+		() => ({
+			canvasRef,
+			nodes,
+			edges,
+			nodeMap,
+			setNodes,
+			setEdges,
+			onNodesChange,
+			onEdgesChange,
+			onEdgeConnect,
+			isValidConnection,
+			onDragOver,
+			onDrop,
+			onNodeDragStop,
+			addNode,
+			updateNode,
+			deleteNode,
+			onNodesDelete,
+			tempNode,
+			setTempNode,
+			focusOnNode,
+			editingNodeId,
+			setEditingNodeId,
+			onContentUpdated,
+			loadData,
+			loadCanvas,
+			isFlowReady,
+			quickAddState,
+			setQuickAddState,
+			configSnackbar,
+			setConfigSnackbar,
+		}),
+		[nodes, edges, nodeMap, setNodes, setEdges, onNodesChange, onEdgesChange, onEdgeConnect, isValidConnection, onDragOver, onDrop, onNodeDragStop, addNode, updateNode, deleteNode, onNodesDelete, tempNode, focusOnNode, editingNodeId, onContentUpdated, loadData, loadCanvas, isFlowReady, quickAddState, configSnackbar]
+	);
 
 	return <FlowGraphContext.Provider value={value}>{children}</FlowGraphContext.Provider>;
 }

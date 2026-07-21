@@ -40,12 +40,20 @@
 	outline: none !important;
 }
 
-/* Group nodes: same border ring as default nodes */
-.react-flow__node-group {
+/* Group and virtual-environment containers: same border ring as default nodes */
+.react-flow__node-group,
+.react-flow__node-virtualenv {
 	box-shadow: var(--rr-shadow-idle);
 	border-radius: 4px !important;
 	background-color: transparent !important;
 	padding: 0 !important;
+}
+
+/* Virtual environment: dashed accent boundary so isolation reads at a glance,
+   without depending on the badge being visible at small zoom levels. */
+.react-flow__node-virtualenv {
+	outline: 1px dashed var(--rr-accent);
+	outline-offset: 2px;
 }
 
 /* Strip any border that MUI might add to direct children inside a node */
