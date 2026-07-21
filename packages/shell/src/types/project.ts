@@ -36,6 +36,7 @@ import type { PipelineComponent, PipelineConfig } from 'rocketride';
 export { TASK_STATE as ITaskState } from 'rocketride';
 export type { PipelineInputConnection as IInputConnection } from 'rocketride';
 export type { PipelineControlConnection as IControlConnection } from 'rocketride';
+export type { PipelineEnvironment as IEnvironment } from 'rocketride';
 export type { TASK_STATUS as ITaskStatus } from 'rocketride';
 export type { TASK_STATUS_FLOW as IFlowData } from 'rocketride';
 

@@ -37,7 +37,7 @@
 import { Edge } from '@xyflow/react';
 
 // uuid import removed — edge IDs are now deterministic (source::target::lane)
-import { INodeType } from '../types';
+import { INodeType, isContainerType } from '../types';
 
 import type { PipelineComponent } from 'shell';
 
@@ -61,6 +61,9 @@ type INodeLike = Pick<INode, 'id' | 'data'> & {
 type ISerializableNode = INodeLike & {
 	position: IPosition;
 	measured?: Partial<IDimensions>;
+	/** Explicit dimensions — set on resizable containers, absent on ordinary nodes. */
+	width?: number;
+	height?: number;
 };
 
 // ============================================================================
@@ -111,6 +114,25 @@ export const generateNodeId = (existingNodes: { id: string }[] = [], provider: s
 // ============================================================================
 // Project → Nodes
 // ============================================================================
+
+/**
+ * Resolves the canvas node type for a serialised component.
+ *
+ * The virtual environment is a canvas type only: on disk it is a `group` carrying
+ * `config.environment`, so a document written here stays readable by an editor that
+ * does not know the container — it renders as a plain group and, crucially, still
+ * nests its members on save instead of scattering them to the top level.
+ *
+ * @param component - The serialised component to classify.
+ * @returns The node type to render this component with.
+ */
+const nodeTypeFromComponent = (component: IProjectComponent): string => {
+	const nodeType = component.ui?.nodeType || INodeType.Default;
+	if (nodeType === INodeType.Group && component.config?.environment) {
+		return INodeType.VirtualEnv;
+	}
+	return nodeType;
+};
 
 /**
  * Converts a serialised IProject into an array of INode objects.
@@ -191,12 +213,19 @@ export const getNodesFromProject = (project: IProject): INode[] => {
 			// 5. Build the INode with position, dimensions, and type from
 			//    the component's UI metadata.
 			// -----------------------------------------------------------------
+			const type = nodeTypeFromComponent(component);
+
 			const node: INode = {
 				id,
-				type: component.ui.nodeType || INodeType.Default,
+				type,
 				position: component.ui.position,
 				data,
 				measured: component.ui.measured,
+				// A container is sized by the user, so its dimensions have to be restored
+				// explicitly: `measured` is what ReactFlow measured, not what it renders
+				// with. Without this a saved container reopens collapsed to header height
+				// and its members sit outside its bounds.
+				...(isContainerType(type) && component.ui.measured ? { width: component.ui.measured.width, height: component.ui.measured.height } : {}),
 				parentId: component.ui.parentId,
 				deletable: true,
 				selectable: true,
@@ -314,13 +343,15 @@ export const getEdgesFromNodes = (nodes: INodeLike[]): Edge[] => {
 export const getComponentFromNode = (node: ISerializableNode, edges?: Edge[]): IProjectComponent => {
 	const { data } = node;
 
-	// Persist the node's measured dimensions; fall back to the default node
-	// size when ReactFlow has not (fully) measured the node yet — ReactFlow
-	// reports per-axis optional values before layout completes.
-	const measured: IDimensions =
-		node.measured?.width != null && node.measured?.height != null
-			? { width: node.measured.width, height: node.measured.height }
-			: { width: 150, height: 36 };
+	// Persist the node's dimensions, per axis and in priority order:
+	//   1. explicit width/height — a container the user just resized carries them
+	//      before ReactFlow re-measures it, and they are what the loader restores;
+	//   2. ReactFlow's measurement, which is per-axis optional before layout completes;
+	//   3. the default node size.
+	const measured: IDimensions = {
+		width: node.width ?? node.measured?.width ?? 150,
+		height: node.height ?? node.measured?.height ?? 36,
+	};
 
 	// Build the base component with UI metadata
 	const component: IProjectComponent = {
@@ -332,7 +363,10 @@ export const getComponentFromNode = (node: ISerializableNode, edges?: Edge[]): I
 		ui: {
 			position: { x: node.position.x, y: node.position.y },
 			measured,
-			nodeType: (node.type as INodeType) ?? INodeType.Default,
+			// A virtual environment is written as a group carrying config.environment
+			// (see nodeTypeFromComponent): the canvas type is ours, the document type
+			// is the one every editor already understands.
+			nodeType: node.type === INodeType.VirtualEnv ? INodeType.Group : ((node.type as INodeType) ?? INodeType.Default),
 			formDataValid: data.formDataValid !== false,
 			parentId: node.parentId,
 		},
@@ -405,7 +439,9 @@ export const getProjectComponents = (allNodes: ISerializableNode[], edges?: Edge
 	const buildLevel = (parentId?: string): IProjectComponent[] => {
 		const components = getChildComponents(allNodes, parentId, edges);
 
-		// For each group node, recurse into its children
+		// For each group node, recurse into its children. Comparing against Group alone
+		// is right here and must stay: getComponentFromNode has already written the
+		// document type, and a virtual environment is a group in the document.
 		for (const component of components) {
 			if (component.ui?.nodeType === INodeType.Group) {
 				const children = buildLevel(component.id);

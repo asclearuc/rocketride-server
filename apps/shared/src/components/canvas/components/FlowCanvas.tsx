@@ -45,6 +45,7 @@ import './reactflow-overrides.css';
 import { NodeComponent } from './node/node-component';
 import { default as NodeAnnotation } from './node/node-annotation';
 import { default as NodeGroup } from './node/node-group';
+import { default as NodeVirtualEnv } from './node/node-virtualenv';
 
 // Flow edge component
 import { FlowEdge } from './edge';
@@ -81,6 +82,7 @@ import { useTemplateInstantiator } from '../hooks/useTemplateInstantiator';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const nodeTypes: Record<string, any> = {
 	[INodeType.Group]: NodeGroup,
+	[INodeType.VirtualEnv]: NodeVirtualEnv,
 	[INodeType.Annotation]: NodeAnnotation,
 	[INodeType.Default]: NodeComponent,
 };

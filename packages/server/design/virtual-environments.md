@@ -130,11 +130,34 @@ Three pillars:
 ## 4. Detailed design
 
 ### 4.1 The Virtual Environment container (UI)
-The **only new visible/placeable** canvas element is a first-class **Virtual Environment** container
-(its own palette/creation entry). It reuses group *mechanics* (`parentId` nesting, children →
-`config.pipeline.components`, `onNodeDragStop` drop-into) but is distinct from a plain organizational
-group: it carries `config.environment = { name, isolated: true }` and an "isolated" visual treatment
-(badge/border). A **cog** exposes a **Purge environment** action (§4.10).
+The **only new visible/placeable** canvas element is a first-class **Virtual Environment** container.
+It reuses group *mechanics* (`parentId` nesting, children → `config.pipeline.components`,
+`onNodeDragStop` drop-into) but is distinct from a plain organizational group: it carries
+`config.environment = { name, isolated: true }` and an "isolated" visual treatment (badge/border).
+
+**Split representation (IMPLEMENTED).** It is a distinct node type **on the canvas**
+(`INodeType.VirtualEnv`) and a `group` **in the document** — `getComponentFromNode` writes
+`ui.nodeType: 'group'`, and the loader promotes a `group` carrying `config.environment` back to the
+container. That buys both halves: the container gets its own component, its own
+`.react-flow__node-virtualenv` treatment and type-level validation, while the document stays exactly
+the shape in §4.2, so an editor that predates the container still renders it — and, crucially, still
+**nests its members on save** instead of scattering them to the top level. Containment is asked via
+`isContainerType()` rather than compared against a single type, because it is checked in three
+separate places (drop-into, serialization, auto-layout) and two-out-of-three is the classic failure.
+
+**Naming.** "Environment" is already taken in the extension by the server-connection page
+(`EnvironmentProvider`/`EnvironmentView`: development/deployment slots, SaaS vs OSS). The container
+keeps the full words **Virtual Environment** in the UI and a `VirtualEnv` prefix in code so the two
+do not read as one concept.
+
+**No creation entry yet (deliberate).** The container's members are nested into
+`config.pipeline.components`, which the engine ignores until the partitioner lands (§4.3, §5.3). A
+creation button before that would let a user build a pipeline whose members silently vanish at run
+time, so the mechanics ship first and the entry point opens with the partitioner. Placing one today
+is possible only by authoring the document directly — which is what the acceptance fixtures do.
+
+A **cog** will expose a **Purge environment** action (§4.10) once the engine command exists; a menu
+item that cannot do anything is worse than its absence.
 
 The **bridge/`remote`/`venv` nodes stay internal** — synthesized/inserted by the partitioner, **never
 in the node palette**, never user-placed. (Like the `remote` nodes today, which are not canvas-exposed.)
@@ -148,7 +171,11 @@ VS Code host wiring (`apps/vscode/.../ProjectWebview.tsx`) follows the extension
 **Authoring format** (what the canvas saves into `.pipe`): a venv is the existing group node with the
 **only additive change** `config.environment = { name, isolated: true }`. Member nodes keep their
 `input`/`control`; a member's `input.from` may reference a node *outside* the group (lane edges cross
-groups today) — those are the boundary edges.
+groups today) — those are the boundary edges. The canvas renders it as its own node type but writes
+this shape (§4.1), so the document is additive and readable both ways. The two structural keys are
+now named in the SDK schema — `PipelineEnvironment` and `NestedPipeline` on
+`PipelineComponentConfig` (`packages/client-typescript/src/client/types/pipeline.ts`) — so a
+container's shape is no longer a matter of convention.
 
 **Runtime format** (what each `engine.exe` receives): the engine reads only **top-level**
 `components[]` and ignores `config.pipeline`. The **partitioner** (Python, pre-launch, modeled on
@@ -869,8 +896,16 @@ elsewhere that carry `environment`.
   **only-needed-installed (no-whisper)** acceptance tests; embedding-invariant regression.
 
 **Phase 2B — Venv runtime (the isolation feature), on top of 2A.**
-4. **Schema + UI:** the placeable Virtual Environment container + `config.environment`; validation
-   (source-in-group via `resolve_implied_source`, env-cycle, nested/overlap). Bridge nodes internal.
+4. **Schema + UI — DONE except the creation entry.** The Virtual Environment container as a canvas
+   node type stored as a `group` + `config.environment` (§4.1), `PipelineEnvironment` /
+   `NestedPipeline` / `PipelineComponentConfig` in the SDK schema, `isContainerType()` across the
+   three containment checks, the isolated treatment, the name/isolated config form, and the
+   canvas-side rejection of a container dropped into a container. Round-trip tests
+   (`canvas/util/graph.test.tsx`) pin the document mapping. Bridge nodes stay internal.
+   *Deferred to step 5, deliberately:* the **creation entry** (a container that cannot execute yet
+   would only produce pipelines that lose members), the **source-in-venv** guard, which belongs where
+   `resolve_implied_source` runs, and **env-cycle** detection, which needs the quotient graph the
+   partitioner builds.
 5. **Partitioner:** generalize `prepare_pipeline.py` (flatten non-isolated; cut isolated; insert bridge
    nodes; routing table; full-document node set).
 6. **Bridge: extract shared base + new `venv` node** (all 15 lanes; `image`/`video`/`audio`); network-

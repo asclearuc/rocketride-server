@@ -37,7 +37,7 @@
 import type { PipelineInputConnection, INodeConfig, IControlConnection, IPosition, IDimensions } from 'shell';
 
 // Re-export all general types so flow consumers can import from one place
-export type { IProject, IProjectComponent, IComponentUI, IControlConnection, IInputConnection, IPosition, IDimensions, IService, IServiceCatalog, INodeConfig, IValidateResponse, IComponentValidatePayload, IValidatePipelinePayload, IServiceSchema, IToolchainExport, IToolchainState, IForm, IFormData, ITaskStatus, IFlowData } from 'shell';
+export type { IProject, IProjectComponent, IComponentUI, IControlConnection, IInputConnection, IPosition, IDimensions, IEnvironment, IService, IServiceCatalog, INodeConfig, IValidateResponse, IComponentValidatePayload, IValidatePipelinePayload, IServiceSchema, IToolchainExport, IToolchainState, IForm, IFormData, ITaskStatus, IFlowData } from 'shell';
 
 export { IServiceCapabilities, ITaskState, DEFAULT_TOOLCHAIN_STATE } from 'shell';
 
@@ -59,7 +59,22 @@ export enum INodeType {
 	Annotation = 'annotation',
 	/** Group boundary for nested child components. */
 	Group = 'group',
+	/**
+	 * Virtual environment: a group whose members resolve their dependencies in
+	 * isolation. Canvas-only — it is written to the document as a `group` carrying
+	 * `config.environment`, so a document stays readable by editors that predate it.
+	 */
+	VirtualEnv = 'virtualenv',
 }
+
+/**
+ * Whether a node type contains other nodes.
+ *
+ * Containment is spread across drag-drop, serialization and auto-layout; asking here
+ * rather than comparing against a single type in each is what stops a new container
+ * from being handled in two places out of three.
+ */
+export const isContainerType = (type?: string): boolean => type === INodeType.Group || type === INodeType.VirtualEnv;
 
 // ============================================================================
 // Node Layout & Lane Types
@@ -141,7 +156,15 @@ export interface INode {
 	position: IPosition;
 	data: INodeData;
 	parentId?: string;
+	/** ReactFlow's own measurement of the rendered node. Output, never an input. */
 	measured?: IDimensions;
+	/**
+	 * Explicit dimensions. Resizable containers need these: without them ReactFlow
+	 * sizes the node to its content, so a container reloaded from a document collapses
+	 * to header height and its members land outside its bounds.
+	 */
+	width?: number;
+	height?: number;
 	selected?: boolean;
 	dragging?: boolean;
 	deletable?: boolean;
