@@ -194,15 +194,42 @@ container's shape is no longer a matter of convention.
 ```
 
 ### 4.3 Partitioner
-A Python transform pass in the task-start path (`task_engine.py`, after `_check_pipeline`, before
-`_build_task`), run **automatically whenever any group is `isolated`** (no isolated groups → no-op).
-Modeled on / generalizing `prepare_pipeline.py`:
+A pure Python transform (`pipeline.partition_pipeline`, sibling of `resolve_pipeline_env`) called from
+the task-start path in `task_engine.py`. Modeled on / generalizing `prepare_pipeline.py`:
 
 - **Non-isolated** groups → **flattened** (children lifted to top level, like `prepareLocalPipeline`).
 - **Isolated** groups → a separate flat sub-pipeline per venv; each boundary **data-lane** edge gets a
   bridge-node pair + a `channelId` recorded in a routing table.
 - Builds the **env-quotient graph** to detect cross-env cycles.
 - Reads the **full `components[]`**, not the executing source's reachable subgraph (see §4.13).
+
+**Placement — corrected against the code: BEFORE `_check_pipeline`, not after.** That check looks for
+the run's source among **top-level** components only, so a source inside a plain group is not found
+until the members have been lifted. Partitioning first also means every later step sees the document
+the engine will actually run.
+
+**Increment 1 — flattening + validation (IMPLEMENTED).** Container members are lifted to the top level
+and the container itself disappears; nesting collapses to one level and an empty container simply goes
+away. Membership carries no runtime meaning by itself — members keep their ids and connections, so an
+edge that crossed the boundary needs no rewriting. A pipeline with no containers is returned unchanged,
+by identity.
+
+This alone fixes the standing bug in §5.3: until now **every** grouped component was silently dropped
+from the run, and the pipeline still reported success. Verified on a document the editor actually
+wrote: `[dropper, parse, venv_vision, venv_audio, response_outside]` →
+`[dropper, parse, response_1, response_outside]`.
+
+**Isolated containers are flattened the same way for now.** Running their members in their own process
+is what the bridge nodes (§4.4) and the orchestrator add; until then an isolated container behaves as
+an organizational one — which is also exactly what the permanent compatibility mode
+(`ROCKETRIDE_SERVER_USE_VENV=0`, §4.15) must keep doing.
+
+**Validations, enforced now** (structural errors the editor should have prevented, failed with a named
+cause rather than silently normalised): a virtual environment nested inside another; the source inside
+a virtual environment (a plain group is fine — a group is layout, not an execution boundary); an
+invoke/control edge crossing an environment boundary, in either direction and between two
+environments; and a lane edge that takes input from a container, which produces no data. Env-cycle
+detection waits for the quotient graph, which needs the cut.
 
 Covered cases: lane fan-out across envs, multiple lanes per env-pair, A→B→main chains, source/sink
 placement (§4.11). **Invoke/control edges never cross a boundary** (the editor's `isValidConnection`
@@ -908,6 +935,14 @@ elsewhere that carry `environment`.
    partitioner builds.
 5. **Partitioner:** generalize `prepare_pipeline.py` (flatten non-isolated; cut isolated; insert bridge
    nodes; routing table; full-document node set).
+   *Increment 1 — **DONE**:* flattening and the structural validations (§4.3), hooked into
+   `task_engine` before `_check_pipeline`, with 19 unit tests. This closes the §5.3 bug on its own:
+   grouped components reach the engine instead of being dropped. It also unblocks the **creation
+   entry** deferred from step 4 — a container now executes as an organizational group rather than
+   losing its members.
+   *Increment 2 — open:* the cut. Per-env sub-documents, bridge-node pairs at each boundary lane edge,
+   the routing table, and env-cycle detection over the quotient graph. Needs the bridge nodes (step 6),
+   so the two land together.
 6. **Bridge: extract shared base + new `venv` node** (all 15 lanes; `image`/`video`/`audio`); network-
    remote untouched.
 7. **Local spawn + transport (v1 = WS-over-loopback unchanged):** spawn the venv child (its overlay) and

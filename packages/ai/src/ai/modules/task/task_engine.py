@@ -67,7 +67,7 @@ from rocketride import (
 )
 from .dbg_debugpy import DbgDebugpy
 from .dbg_stdio import DbgStdio
-from .pipeline import resolve_pipeline_env
+from .pipeline import partition_pipeline, resolve_pipeline_env
 from .types import LAUNCH_TYPE, TaskError
 from .task_conn import TaskConn
 from .task_metrics import TaskMetrics
@@ -2053,6 +2053,13 @@ class Task(DAPBase):
             # Resolve ${...} placeholders into a local variable — never stored on self
             # so secrets are not retained in memory beyond the temp file write.
             resolved = self._resolve_pipeline(self._pipeline)
+
+            # Lift container members to the top level. Before _check_pipeline, not
+            # after: that check looks for the source among top-level components only,
+            # so a source inside a group would not be found yet. Everything downstream
+            # then sees the document the engine will actually run. Throws on a
+            # container the engine cannot execute as written.
+            resolved = partition_pipeline(resolved, source=self.source)
 
             # Check it - throws on error
             self._check_pipeline(resolved)
