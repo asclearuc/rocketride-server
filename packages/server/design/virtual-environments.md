@@ -999,9 +999,13 @@ Three layers; each test is tagged with the phase that first makes it runnable (*
   demoted to a plain group, global-glob) / `1`(force-on). [2A scoping paths; 2B demotion path]
 - **Model-server pruning** — a proxied node contributes only wrapper/networking deps, not `ai/**` heavy
   files (§4.8). [2A]
-- **Partitioner** (`pipeline.py`) — flatten non-isolated groups; cut isolated → per-venv sub-doc +
-  bridge pair + routing table; env-cycle detection; **reject** cross-boundary invoke/control edges,
-  nested isolated groups, source-in-venv. Golden-file: authoring doc → expected N flat sub-docs. [2B]
+- **Partitioner** (`pipeline.py`) — **increment 1 DONE (19 tests, `test_partition.py`):** flatten
+  containers to one level, drop the container node, empty container disappears, no-container pipeline
+  returned by identity, members keep their connections; and the validations — nested environments,
+  source-in-venv (a plain group is fine), invoke edge across an environment boundary, lane edge into a
+  container. *Increment 2 (with the bridge nodes):* cut isolated → per-venv sub-doc + bridge pair +
+  routing table; env-cycle detection over the quotient graph. Golden-file authoring→sub-docs lands
+  there. [2B]
 
 ### 8.2 Test-fixture nodes (purpose-built, lightweight, decoupled from `ai/**`)
 Add a pair of **trivial pure-Python nodes** under the node-test tree (e.g.
@@ -1078,6 +1082,16 @@ actually imported is not observable from outside the process.
   crosses the boundary. [2A]
 - **Lifecycle.** Purge, delete-with-nodes, and pipeline-delete reclaim the right `venvs/...` dirs and are
   **blocked while a run is active**. Image lanes cross a venv boundary (all-lane bridge). [2B]
+- **Partitioner — VERIFIED on a live engine, not just in unit tests.** A container document driven
+  through the SDK (`client.use` + `pipe`, the harness path) produced a task file whose top-level
+  components were `[dropper_1, parse_1, response_1, response_outside]` with both containers gone —
+  `response_1`, the nested member that used to vanish silently, reached the engine. The
+  nested-environment document was rejected **over the wire** with its exact message (`Virtual
+  environment "venv_audio" is nested inside "venv_vision"; nested environments are not supported`),
+  not a generic failure, so an early validation's cause survives to the client. Two incidental notes:
+  the CLI `start` command is unsuitable for an unbound run (its wrapper needs a token for the event
+  subscription — use the SDK), and the editor does not write a top-level `source` field the engine
+  requires. [2B]
 - **Embedding invariant — VERIFIED.** `server:run-engtest` passes (23 cases, 490 assertions,
   including `python::config`): the no-move-binary overlay preserves
   `sys.prefix == exe dir == rootDir`. Under `=1` the same run creates **no `venvs/default`**, which
