@@ -1,7 +1,10 @@
 """Pipeline utility functions for source resolution, substitution and partitioning."""
 
+import copy
 import json
 import re
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Dict, Any, Iterator, List, Optional, Tuple
 
 # Only environment variables with this prefix are permitted to resolve in pipelines.
@@ -90,43 +93,106 @@ def walk_components(
 # Partitioning
 # ---------------------------------------------------------------------------
 
+# The base environment: components that are not inside any isolated group run here.
+MAIN_ENV = 'main'
+
+# Data lanes the venv bridge cannot carry. Kept in sync by hand with the single
+# source of truth, ``nodes/src/nodes/venv/base/lanes.py`` (``LaneNotBridgeable``);
+# the ``ai`` package cannot import ``nodes.*`` under a bare pytest run, so a boundary
+# edge on one of these is rejected at cut time rather than at runtime.
+NON_BRIDGEABLE_LANES = frozenset({'words'})
+
+# The synthesized source of every venv sub-document. Not a real registered node —
+# it exists only to make the ingress bridge nodes reachable from the child's source,
+# exactly like ``remote``'s ``remote_source_stub``. Real data arrives over the wire.
+VENV_SOURCE_STUB_PROVIDER = 'venv_source_stub'
+VENV_SOURCE_STUB_ID = 'venv_source_stub'
+
+
+@dataclass
+class PartitionResult:
+    """The output of the cut: one flat sub-document per environment plus routing.
+
+    ``environments`` maps an env id to a runnable engine document (``'main'`` first,
+    then each isolated group in document order). ``routing`` lists one entry per
+    boundary channel (keyed by ``channelId``) so the step-8 orchestrator can byte-route
+    frames between children through main. ``groups`` carries each venv's original
+    ``config.environment`` block (its display name; the container node itself is
+    stripped from the documents) for step-7/8 logging and metrics.
+    """
+
+    environments: 'OrderedDict[str, Dict[str, Any]]'
+    routing: List[Dict[str, Any]]
+    groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+
+def has_isolated_group(pipeline: Dict[str, Any]) -> bool:
+    """Whether the pipeline contains at least one isolated (venv) container."""
+    return any(is_isolated(component) for component, _ in walk_components(pipeline.get('components', [])))
+
+
+def _env_of(components: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Map every component id to the environment it runs in.
+
+    A component's environment is its **nearest isolated-container ancestor**, or
+    :data:`MAIN_ENV` when it has none — transitive, not just the immediate parent, so a
+    member of a plain group nested inside a venv is correctly attributed to that venv.
+    A container is recorded under the environment it *sits in*; only leaves are read in
+    practice.
+    """
+    env_of: Dict[str, str] = {}
+
+    def walk(items: List[Dict[str, Any]], env: str) -> None:
+        for component in items:
+            env_of[component.get('id')] = env
+            child_env = component.get('id') if is_isolated(component) else env
+            walk(_members(component), child_env)
+
+    walk(components, MAIN_ENV)
+    return env_of
+
 
 def _validate_containers(pipeline: Dict[str, Any], source: Optional[str]) -> None:
     """Reject documents whose containers cannot be executed as written.
 
     These are structural errors the editor should have prevented, so they fail the
     run with a named cause rather than being silently normalised into something the
-    author did not write.
+    author did not write. Enforced on both the legacy flatten path and the cut.
     """
     components = pipeline.get('components', [])
-    env_of: Dict[str, Optional[str]] = {}
+    env_of = _env_of(components)
     container_ids = set()
 
-    for component, container in walk_components(components):
-        component_id = component.get('id')
+    for component, _ in walk_components(components):
         if is_container(component):
-            container_ids.add(component_id)
-            if is_isolated(component) and container is not None and is_isolated(container):
-                raise ValueError(
-                    f'Virtual environment "{component_id}" is nested inside "{container.get("id")}"; nested environments are not supported'
-                )
-        # The environment a component runs in: itself if isolated, else its container's.
-        env_of[component_id] = container.get('id') if container is not None and is_isolated(container) else None
+            container_ids.add(component.get('id'))
+        # An isolated group whose environment is not ``main`` sits inside another venv
+        # (directly or through a plain group) — nested environments are not supported.
+        if is_isolated(component) and env_of.get(component.get('id'), MAIN_ENV) != MAIN_ENV:
+            raise ValueError(
+                f'Virtual environment "{component.get("id")}" is nested inside "{env_of[component.get("id")]}"; nested environments are not supported'
+            )
 
-    if source is not None and env_of.get(source) is not None:
+    if source is not None and env_of.get(source, MAIN_ENV) != MAIN_ENV:
         raise ValueError(
             f'Source component "{source}" is inside virtual environment "{env_of[source]}"; the source must stay outside'
         )
 
     for component, _ in walk_components(components):
-        target_env = env_of.get(component.get('id'))
+        target_env = env_of.get(component.get('id'), MAIN_ENV)
         # Invoke/control edges cannot cross an environment boundary: the callee runs
         # in another process, and the call is synchronous with no lane to carry it.
         for control in component.get('control', []) or []:
-            source_env = env_of.get(control.get('from'))
-            if source_env != target_env:
+            source_ref = control.get('from')
+            # A container has no lanes/behaviour, so nothing can invoke through one; it
+            # dangles the moment the container is flattened away.
+            if source_ref in container_ids:
                 raise ValueError(
-                    f'Invoke connection from "{control.get("from")}" to "{component.get("id")}" crosses a virtual environment boundary'
+                    f'Invoke connection from container "{source_ref}" to "{component.get("id")}", which produces no data'
+                )
+            if env_of.get(source_ref, MAIN_ENV) != target_env:
+                raise ValueError(
+                    f'Invoke connection from "{source_ref}" to "{component.get("id")}" crosses a virtual environment boundary'
                 )
         # A container has no lanes, so nothing can connect to one.
         for lane in component.get('input', []) or []:
@@ -136,54 +202,391 @@ def _validate_containers(pipeline: Dict[str, Any], source: Optional[str]) -> Non
                 )
 
 
-def partition_pipeline(pipeline: Dict[str, Any], source: Optional[str] = None) -> Dict[str, Any]:
-    """Flatten container members to the top level so the engine can see them.
+def _flatten_members(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Lift every container's members to the top level, keeping author order."""
+    flat: List[Dict[str, Any]] = []
+    for component in items:
+        if not is_container(component):
+            flat.append(component)
+            continue
+        # Members take the container's place; the container itself has no runtime
+        # behaviour and disappears with it.
+        flat.extend(_flatten_members(_members(component)))
+    return flat
 
-    The canvas nests a container's members under ``config.pipeline.components``,
-    but the engine reads **only** the top-level ``components`` list and ignores
-    nested ones — so without this pass every grouped component is silently dropped
-    from the run. Membership carries no runtime meaning by itself: members keep
-    their own ids and connections, so lifting them changes nothing else.
 
-    Virtual environments are flattened the same way for now. Running their members
-    in a separate process is what the bridge nodes and the orchestrator add later;
-    until then an isolated container behaves as an organizational one, which is
-    also exactly what the compatibility mode (``ROCKETRIDE_SERVER_USE_VENV=0``)
-    must keep doing permanently.
+def _sanitize_id_part(text: Any) -> str:
+    """Reduce an id fragment to a component-id-safe token (no ``->``/``/``/``:``)."""
+    return re.sub(r'[^0-9A-Za-z_]', '_', str(text))
+
+
+def _unique_id(base: str, taken: set) -> str:
+    """A deterministic id derived from ``base`` that is unique within ``taken``."""
+    candidate = base
+    suffix = 2
+    while candidate in taken:
+        candidate = f'{base}-{suffix}'
+        suffix += 1
+    taken.add(candidate)
+    return candidate
+
+
+def _detect_cycle(adjacency: Dict[str, List[str]]) -> Optional[List[str]]:
+    """Return one directed cycle in ``adjacency`` (as a node path), or ``None``."""
+    WHITE, GREY, BLACK = 0, 1, 2
+    colour: Dict[str, int] = {node: WHITE for node in adjacency}
+    stack: List[str] = []
+
+    def visit(node: str) -> Optional[List[str]]:
+        colour[node] = GREY
+        stack.append(node)
+        for nxt in adjacency.get(node, []):
+            if colour.get(nxt, WHITE) == GREY:
+                return stack[stack.index(nxt) :] + [nxt]
+            if colour.get(nxt, WHITE) == WHITE:
+                found = visit(nxt)
+                if found is not None:
+                    return found
+        stack.pop()
+        colour[node] = BLACK
+        return None
+
+    for node in adjacency:
+        if colour[node] == WHITE:
+            found = visit(node)
+            if found is not None:
+                return found
+    return None
+
+
+def _isolated_env_blocks(components: List[Dict[str, Any]]) -> 'OrderedDict[str, Dict[str, Any]]':
+    """Each isolated group's ``config.environment`` block, keyed by id, in document order."""
+    blocks: 'OrderedDict[str, Dict[str, Any]]' = OrderedDict()
+    for component, _ in walk_components(components):
+        if is_isolated(component):
+            blocks[component.get('id')] = _environment(component)
+    return blocks
+
+
+def _bucket_leaves_by_env(
+    components: List[Dict[str, Any]], env_of: Dict[str, str]
+) -> 'OrderedDict[str, List[Dict[str, Any]]]':
+    """Group every leaf under its environment, in document order; containers dissolve.
+
+    This single rule subsumes non-isolated flattening (§4.3): a plain group inside a venv
+    lands its leaves in that venv, and a venv nested in a plain group becomes its own bucket.
+    """
+    buckets: 'OrderedDict[str, List[Dict[str, Any]]]' = OrderedDict()
+    for component, _ in walk_components(components):
+        if is_container(component):
+            continue
+        buckets.setdefault(env_of.get(component.get('id'), MAIN_ENV), []).append(component)
+    return buckets
+
+
+def _validate_source_placement(
+    components: List[Dict[str, Any]],
+    env_of: Dict[str, str],
+    source_field: Optional[str],
+    buckets: 'OrderedDict[str, List[Dict[str, Any]]]',
+) -> None:
+    """The run's source/root must stay in main, and main must not be left empty.
+
+    Guards the implied source (a ``Source``-mode component) and the document's ``source``
+    field — the explicit ``source`` param is already checked in ``_validate_containers`` —
+    and rejects a base environment emptied out while an isolated group exists.
+    """
+    for component, _ in walk_components(components):
+        if is_container(component):
+            continue
+        if (
+            component.get('config', {}).get('mode') == 'Source'
+            and env_of.get(component.get('id'), MAIN_ENV) != MAIN_ENV
+        ):
+            raise ValueError(
+                f'Source component "{component.get("id")}" is inside virtual environment "{env_of[component.get("id")]}"; the source must stay outside'
+            )
+    if source_field is not None and env_of.get(source_field, MAIN_ENV) != MAIN_ENV:
+        raise ValueError(
+            f'Source component "{source_field}" is inside virtual environment "{env_of[source_field]}"; the source must stay outside'
+        )
+    if any(env != MAIN_ENV for env in buckets) and MAIN_ENV not in buckets:
+        raise ValueError('The pipeline has no components in the base environment; the source/root must stay in main')
+
+
+def _collect_channels(
+    components: List[Dict[str, Any]], env_of: Dict[str, str]
+) -> Tuple['OrderedDict[Tuple[str, str, str], Dict[str, Any]]', List[Tuple[Dict[str, Any], Tuple[str, str, str]]]]:
+    """Classify boundary edges into channels, deduped per ``(producer, lane, targetEnv)``.
+
+    Returns the channels in first-encounter order and the ``(edge, key)`` pairs to repoint
+    once ingress ids exist. An unknown ``from`` stays a dangling edge (as today); a boundary
+    edge on a non-bridgeable lane is rejected.
+    """
+    channels: 'OrderedDict[Tuple[str, str, str], Dict[str, Any]]' = OrderedDict()
+    edge_rewrites: List[Tuple[Dict[str, Any], Tuple[str, str, str]]] = []
+    for component, _ in walk_components(components):
+        if is_container(component):
+            continue
+        consumer_id = component.get('id')
+        target_env = env_of.get(consumer_id, MAIN_ENV)
+        for edge in component.get('input', []) or []:
+            producer = edge.get('from')
+            if producer not in env_of:
+                continue  # unknown reference — leave the dangling edge as today
+            source_env = env_of[producer]
+            if source_env == target_env:
+                continue  # not a boundary
+            lane = edge.get('lane')
+            if lane in NON_BRIDGEABLE_LANES:
+                raise ValueError(
+                    f'Boundary edge on lane "{lane}" from "{producer}" to "{consumer_id}" crosses a virtual environment boundary, but "{lane}" is not bridgeable'
+                )
+            key = (producer, lane, target_env)
+            channel = channels.get(key)
+            if channel is None:
+                channel = {
+                    'lane': lane,
+                    'sourceEnv': source_env,
+                    'targetEnv': target_env,
+                    'producer': producer,
+                    'consumers': [],
+                }
+                channels[key] = channel
+            if consumer_id not in channel['consumers']:
+                channel['consumers'].append(consumer_id)
+            edge_rewrites.append((edge, key))
+    return channels, edge_rewrites
+
+
+def _reject_env_cycles(channels: 'OrderedDict[Tuple[str, str, str], Dict[str, Any]]') -> None:
+    """Reject a directed cycle in the venv-only env-quotient graph.
+
+    Main is excluded: routing through main is transparent, so only venv↔venv dependency
+    cycles can deadlock, while main-terminated chains (``main→V1→V2→main``) stay legal.
+    """
+    quotient: Dict[str, List[str]] = {}
+    for channel in channels.values():
+        src, dst = channel['sourceEnv'], channel['targetEnv']
+        if src == MAIN_ENV or dst == MAIN_ENV:
+            continue
+        quotient.setdefault(src, [])
+        quotient.setdefault(dst, [])
+        if dst not in quotient[src]:
+            quotient[src].append(dst)
+    cycle = _detect_cycle(quotient)
+    if cycle is not None:
+        raise ValueError('Cross-environment cycle between virtual environments: ' + ' -> '.join(cycle))
+
+
+def _assign_channel_ids(
+    channels: 'OrderedDict[Tuple[str, str, str], Dict[str, Any]]',
+    buckets: 'OrderedDict[str, List[Dict[str, Any]]]',
+    venv_envs: List[str],
+) -> Dict[str, str]:
+    """Assign each channel its ``channelId`` and bridge node ids; return per-child stub ids.
+
+    Node ids are unique **within their own document** (main and each child are separate
+    docs); ``channelId`` is the global routing key and must not collide.
+    """
+    taken: Dict[str, set] = {env: {leaf.get('id') for leaf in leaves} for env, leaves in buckets.items()}
+    stub_ids = {env: _unique_id(VENV_SOURCE_STUB_ID, taken[env]) for env in venv_envs}
+
+    seen_channel_ids: set = set()
+    for (producer, lane, target_env), channel in channels.items():
+        source_env = channel['sourceEnv']
+        channel_id = f'{source_env}->{target_env}/{lane}/{producer}'
+        if channel_id in seen_channel_ids:
+            raise ValueError(f'Duplicate channelId "{channel_id}"; component ids must not contain "->" or "/"')
+        seen_channel_ids.add(channel_id)
+        channel['channelId'] = channel_id
+        parts = '--'.join(_sanitize_id_part(p) for p in (source_env, target_env, lane, producer))
+        channel['egressNode'] = _unique_id(f'venv_egress--{parts}', taken[source_env])
+        channel['ingressNode'] = _unique_id(f'venv_ingress--{parts}', taken[target_env])
+    return stub_ids
+
+
+def _bridge_config(channel: Dict[str, Any]) -> Dict[str, Any]:
+    """The bridge node's config; child URL/token are filled at spawn (step 7)."""
+    return {
+        'channelId': channel['channelId'],
+        'lane': channel['lane'],
+        'sourceEnv': channel['sourceEnv'],
+        'targetEnv': channel['targetEnv'],
+    }
+
+
+def _synthesize_bridges(
+    channels: 'OrderedDict[Tuple[str, str, str], Dict[str, Any]]',
+    buckets: 'OrderedDict[str, List[Dict[str, Any]]]',
+    stub_ids: Dict[str, str],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Build each channel's bridge pair, grouped by the env whose document holds them.
+
+    Egress sits in the source env (subscribed to the producer), ingress in the target env.
+    A node is a ``venv`` client in main and a ``venv_server`` in a child, since main dials
+    and children listen — the base is bidirectional, so a server also egresses. A child
+    ingress links to the stub for reachability; a main ingress has no input (data arrives
+    over the wire).
+    """
+    bridge_nodes: Dict[str, List[Dict[str, Any]]] = {env: [] for env in buckets}
+    for channel in channels.values():
+        src, dst = channel['sourceEnv'], channel['targetEnv']
+        bridge_nodes[src].append(
+            {
+                'id': channel['egressNode'],
+                'provider': 'venv' if src == MAIN_ENV else 'venv_server',
+                'input': [{'lane': channel['lane'], 'from': channel['producer']}],
+                'config': _bridge_config(channel),
+            }
+        )
+        ingress_input = [] if dst == MAIN_ENV else [{'lane': channel['lane'], 'from': stub_ids[dst]}]
+        bridge_nodes[dst].append(
+            {
+                'id': channel['ingressNode'],
+                'provider': 'venv' if dst == MAIN_ENV else 'venv_server',
+                'input': ingress_input,
+                'config': _bridge_config(channel),
+            }
+        )
+    return bridge_nodes
+
+
+def _assemble_documents(
+    work: Dict[str, Any],
+    buckets: 'OrderedDict[str, List[Dict[str, Any]]]',
+    bridge_nodes: Dict[str, List[Dict[str, Any]]],
+    env_blocks: 'OrderedDict[str, Dict[str, Any]]',
+    stub_ids: Dict[str, str],
+) -> 'OrderedDict[str, Dict[str, Any]]':
+    """Assemble one flat sub-document per environment: main first, then each venv.
+
+    Non-component top-level fields carry over (§4.9 keying needs ``project_id``); main keeps
+    its original ``source`` field, each child's source is its synthesized stub.
+    """
+
+    def base_fields(reference: Dict[str, Any]) -> Dict[str, Any]:
+        return {key: copy.deepcopy(value) for key, value in reference.items() if key != 'components'}
+
+    environments: 'OrderedDict[str, Dict[str, Any]]' = OrderedDict()
+    main_doc = base_fields(work)
+    main_doc['components'] = list(buckets.get(MAIN_ENV, [])) + bridge_nodes[MAIN_ENV]
+    environments[MAIN_ENV] = main_doc
+
+    for env in env_blocks:
+        if env not in buckets:
+            continue  # an empty venv contributes no document
+        stub = {'id': stub_ids[env], 'provider': VENV_SOURCE_STUB_PROVIDER, 'config': {}}
+        child_doc = base_fields(work)
+        child_doc['source'] = stub_ids[env]
+        child_doc['components'] = [stub] + bridge_nodes[env] + list(buckets[env])
+        environments[env] = child_doc
+    return environments
+
+
+def _routing_table(channels: 'OrderedDict[Tuple[str, str, str], Dict[str, Any]]') -> List[Dict[str, Any]]:
+    """One routing entry per channel, keyed by ``channelId`` for the step-8 byte router."""
+    return [
+        {
+            'channelId': channel['channelId'],
+            'lane': channel['lane'],
+            'sourceEnv': channel['sourceEnv'],
+            'targetEnv': channel['targetEnv'],
+            'producer': channel['producer'],
+            'consumers': list(channel['consumers']),
+            'egressNode': channel['egressNode'],
+            'ingressNode': channel['ingressNode'],
+        }
+        for channel in channels.values()
+    ]
+
+
+def _cut_pipeline(pipeline: Dict[str, Any], source: Optional[str]) -> PartitionResult:
+    """Cut isolated groups into per-venv sub-documents wired by bridge nodes.
+
+    See ``packages/server/design/virtual-environments.md`` §4.3/§4.6. Non-isolated groups
+    still flatten; each isolated group becomes its own flat sub-document, and every boundary
+    data-lane edge gets a ``venv``/``venv_server`` bridge pair plus a ``channelId`` recorded
+    in the routing table. The input document is not modified. The body is a sequence of pure
+    steps over a single deep copy — one ``_*`` helper above per step.
+    """
+    _validate_containers(pipeline, source)
+
+    work = copy.deepcopy(pipeline)
+    components = work.get('components', [])
+    env_of = _env_of(components)
+
+    env_blocks = _isolated_env_blocks(components)
+    if MAIN_ENV in env_blocks:
+        raise ValueError(
+            f'A virtual environment cannot be named "{MAIN_ENV}"; that id is reserved for the base environment'
+        )
+
+    buckets = _bucket_leaves_by_env(components, env_of)
+    _validate_source_placement(components, env_of, work.get('source'), buckets)
+
+    channels, edge_rewrites = _collect_channels(components, env_of)
+    _reject_env_cycles(channels)
+
+    venv_envs = [env for env in buckets if env != MAIN_ENV]
+    stub_ids = _assign_channel_ids(channels, buckets, venv_envs)
+
+    # Repoint each boundary consumer edge to read from its channel's ingress node.
+    for edge, key in edge_rewrites:
+        edge['from'] = channels[key]['ingressNode']
+
+    bridge_nodes = _synthesize_bridges(channels, buckets, stub_ids)
+    environments = _assemble_documents(work, buckets, bridge_nodes, env_blocks, stub_ids)
+    groups = {env: env_blocks[env] for env in venv_envs}
+    return PartitionResult(environments=environments, routing=_routing_table(channels), groups=groups)
+
+
+def partition_pipeline(pipeline: Dict[str, Any], source: Optional[str] = None, scoped: bool = False):
+    """Prepare a pipeline for the engine, flattening containers or cutting venvs.
+
+    The canvas nests a container's members under ``config.pipeline.components``, but the
+    engine reads **only** the top-level ``components`` list and ignores nested ones — so
+    without this pass every grouped component is silently dropped from the run.
+
+    ``scoped=False`` (default, and the permanent ``ROCKETRIDE_SERVER_USE_VENV=0`` mode):
+    flatten every container to the top level and return a single document, exactly as
+    increment 1 did. Membership carries no runtime meaning by itself — members keep their
+    ids and connections, so an edge that crossed the boundary needs no rewriting. A
+    pipeline with no containers is returned unchanged, by identity.
+
+    ``scoped=True`` (venv scoping on): isolated groups become a separate flat
+    sub-document per venv, wired by ``venv``/``venv_server`` bridge pairs at each boundary
+    data-lane edge, and the return value is a :class:`PartitionResult`. Non-isolated
+    groups still flatten. The call site in ``task_engine.py`` uses the default and is
+    unchanged; the scoped gate is flipped by the orchestrator in step 8.
 
     Args:
         pipeline: Resolved pipeline configuration.
-        source: The run's source component id, validated against the containers
-            when given.
+        source: The run's source component id, validated against the containers when
+            given.
+        scoped: Whether venv scoping is enabled for this run.
 
     Returns:
-        A new pipeline whose ``components`` are flat. The input is not modified.
+        ``scoped=False`` → a new flat pipeline dict (input not modified).
+        ``scoped=True`` → a :class:`PartitionResult` (input not modified).
 
     Raises:
-        ValueError: A container nests an environment inside another, holds the
-            source, is connected to as if it produced data, or an invoke edge
-            crosses an environment boundary.
+        ValueError: A container nests an environment inside another, holds the source, is
+            connected to as if it produced data, an invoke edge crosses an environment
+            boundary; or, when scoped, a boundary edge on a non-bridgeable lane, a
+            cross-env cycle between venvs, or a base environment left without the source.
     """
+    if scoped:
+        return _cut_pipeline(pipeline, source)
+
     components = pipeline.get('components', [])
     if not any(is_container(component) for component, _ in walk_components(components)):
         return pipeline
 
     _validate_containers(pipeline, source)
 
-    def flatten(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        flat: List[Dict[str, Any]] = []
-        for component in items:
-            members = _members(component)
-            if not is_container(component):
-                flat.append(component)
-                continue
-            # Members take the container's place, keeping author order; the
-            # container itself has no runtime behaviour and disappears with it.
-            flat.extend(flatten(members))
-        return flat
-
     partitioned = dict(pipeline)
-    partitioned['components'] = flatten(components)
+    partitioned['components'] = _flatten_members(components)
     return partitioned
 
 

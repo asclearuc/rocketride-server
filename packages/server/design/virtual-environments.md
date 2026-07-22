@@ -219,17 +219,56 @@ from the run, and the pipeline still reported success. Verified on a document th
 wrote: `[dropper, parse, venv_vision, venv_audio, response_outside]` →
 `[dropper, parse, response_1, response_outside]`.
 
-**Isolated containers are flattened the same way for now.** Running their members in their own process
-is what the bridge nodes (§4.4) and the orchestrator add; until then an isolated container behaves as
-an organizational one — which is also exactly what the permanent compatibility mode
-(`ROCKETRIDE_SERVER_USE_VENV=0`, §4.15) must keep doing.
+**Isolated containers flatten the same way on the legacy path.** Under `scoped=False` (the permanent
+compatibility mode `ROCKETRIDE_SERVER_USE_VENV=0`, §4.15, and today's default call site) an isolated
+container behaves as an organizational one — flattened into one process. The cut below only runs on the
+`scoped=True` path, which the orchestrator flips in step 8.
+
+**Increment 2 — the cut (IMPLEMENTED).** `partition_pipeline(pipeline, source=None, scoped=True)` returns
+a `PartitionResult` (`pipeline.py`): `environments` (an `OrderedDict` of one flat sub-document per env,
+`'main'` first then each isolated group in document order), `routing` (one entry per boundary channel),
+and `groups` (each venv's `config.environment` block, for step-7/8 logging). The transform:
+
+- **Leaf-bucketing by transitive env.** `_env_of` maps each component to its **nearest isolated-container
+  ancestor** (else `'main'`); every leaf is bucketed by that env and every container dissolves. This one
+  rule subsumes non-isolated flattening (no separate phase) and handles every nesting — a plain group
+  inside a venv, or a venv nested inside a plain group (which becomes a top-level env), fall out of it.
+  The transitive map also fixes two latent increment-1 bugs for a member of a plain group nested in a
+  venv (a cross-boundary invoke into it was missed; an intra-venv invoke into it was wrongly rejected).
+- **Boundary channels, deduplicated per `(producer, lane, targetEnv)`.** Consumers in one target env
+  share a single ingress; distinct target envs get distinct channels. Each channel gets a
+  `venv`/`venv_server` bridge pair and a `channelId = '{srcEnv}->{dstEnv}/{lane}/{producer}'` (1:1 with
+  the dedup key, so unique by construction; asserted, since it is the routing key). Node ids are the
+  role-based, sanitized `venv_egress--…` / `venv_ingress--…` (unique **per document**; the type prefix
+  would collide for venv→venv, where both ends are `venv_server`).
+- **Bridge placement (verified against the node code).** The `venv` client dials, `venv_server` listens,
+  so the child always holds `venv_server` and a `venv` client appears in main only when main is a genuine
+  endpoint. `main→venv`: client(main, from producer) + server(child, from stub); consumers repoint to the
+  server. `venv→main`: server(child, from producer) + client(main, input `[]`); main consumers repoint to
+  the client. `venv→venv`: `venv_server` in **both** children, **no node in main** — main byte-routes the
+  opaque frames (§4.6) and needs no codecs. Each child sub-document is seeded with a synthesized
+  `venv_source_stub` source (like `remote_source_stub`) that the ingress servers link to for reachability.
+  Unlike `remote`, child docs are NOT nested under the client config — they are separate `environments[]`
+  entries the orchestrator (step 7) spawns from.
+- **Env-cycle detection over the quotient graph, main excluded.** Edges are `env_of(producer) →
+  env_of(consumer)`, so venv→venv is a direct edge and routing through main is invisible; dropping main
+  accepts main-terminated chains (`main→V1→V2→main`) while still catching venv↔venv deadlocks. Rejected
+  with a named cause, like the other validations.
+- **Extra scoped rejections:** a boundary edge on the non-bridgeable `words` lane; an implied
+  (`Source`-mode) source or the document `source` field inside a venv; a base environment left with no
+  components while a venv exists; a group whose id is literally `main`. The `scoped=False` path and the 19
+  increment-1 tests are unchanged; the cut adds `test_partition_cut.py` (31 tests). Deferred: §4.13's
+  "all nodes in ONE venv → collapse" (a runnable all-in-one-venv doc cannot exist while source-in-venv is
+  rejected, and honoring it only when scoped would make `=1` accept what `=0` rejects). The bridge nodes'
+  live child URL/token are written at spawn (step 7).
 
 **Validations, enforced now** (structural errors the editor should have prevented, failed with a named
 cause rather than silently normalised): a virtual environment nested inside another; the source inside
 a virtual environment (a plain group is fine — a group is layout, not an execution boundary); an
 invoke/control edge crossing an environment boundary, in either direction and between two
-environments; and a lane edge that takes input from a container, which produces no data. Env-cycle
-detection waits for the quotient graph, which needs the cut.
+environments; and a lane edge that takes input from a container, which produces no data. Increment 1
+also rejects a control edge whose source is a container (it dangles once the container flattens away).
+Env-cycle detection is now implemented on the `scoped=True` cut (see Increment 2 above).
 
 Covered cases: lane fan-out across envs, multiple lanes per env-pair, A→B→main chains, source/sink
 placement (§4.11). **Invoke/control edges never cross a boundary** (the editor's `isValidConnection`
@@ -1001,6 +1040,22 @@ elsewhere that carry `environment`.
    venv *runtime* is primarily for **internal / no-model-server mode**, where conflicting nodes share one
    in-process interpreter. This sharpens sequencing: ship 2A broadly, prioritize 2B for internal-mode
    users.
+**2A-4 — OCR opencv de-conflict (investigated; DEFERRED, sequenced after 2B).** Full written
+analysis + verified fact base + change list + verification plan live in
+`packages/server/design/INVESTIGATE-opencv-ocr-venv.md` (bilingual; entry prompt for the work chat:
+`NEXT-STEP-2A-ocr-opencv-prompt.md`). Scope: split the `ocr` node into per-services components
+(standard EasyOCR+DocTR+tables in `services.json`, Surya in `services.surya.json`, TrOCR
+proxied-only), demote the `ai.common.opencv` shim to a pure re-export, pin engines honestly, and
+add `--overrides` (+ a =1 contrib-last ordered opencv install) so each engine resolves its true
+OpenCV instead of the silent shim-forced downgrade. **Why it can wait:** it is NOT on the critical
+path — under =1 an OCR env still COMPILES today (unpinned engines backtrack silently, opencv stays
+4.13, the shim `depends()` is a no-op), so the venv runtime runs OCR on the existing shim hack with
+no crash. It is an independently-shippable Phase 2A quality/correctness item; the silent
+surya→0.16.1 downgrade is a dormant issue (surya/trocr are `contract-check: disable`, and OCR is
+proxied in model-server deployments). **Trigger to pull it forward:** a near-term product need for
+local Surya/TrOCR usability, or evidence the silent downgrade is actually biting a local load.
+Do 2B (partitioner cut → spawn → orchestrator) first.
+
 - **Tests (§8.1–8.3):** AST-walk / resolution-rule / `depends`-parameterization / model-server-pruning
   **unit tests**; the `vtest_alpha`/`vtest_beta` **fixture nodes**; the **no-venv-conflict-fails** and
   **only-needed-installed (no-whisper)** acceptance tests; embedding-invariant regression.
@@ -1023,9 +1078,17 @@ elsewhere that carry `environment`.
    grouped components reach the engine instead of being dropped. It also unblocks the **creation
    entry** deferred from step 4 — a container now executes as an organizational group rather than
    losing its members.
-   *Increment 2 — open:* the cut. Per-env sub-documents, bridge-node pairs at each boundary lane edge,
-   the routing table, and env-cycle detection over the quotient graph. Needs the bridge nodes (step 6),
-   so the two land together.
+   *Increment 2 — **DONE**:* the cut (`scoped=True` → `PartitionResult`). Per-env sub-documents
+   (leaf-bucketing by transitive env), `venv`/`venv_server` bridge pairs at each boundary lane edge with
+   `channelId`-keyed routing table, hub-through-main placement (no main node for venv→venv), and
+   venv-only env-cycle detection over the quotient graph, plus the source-in-venv guard on the implied
+   source. 31 unit tests in `test_partition_cut.py`; the 19 increment-1 tests are unchanged. The cut is
+   pure Python and NOT yet wired at the call site — `task_engine.py` still calls `partition_pipeline`
+   with the default `scoped=False`; the orchestrator flips the gate in step 8 via
+   `scoping_enabled(use_venv_mode(), has_isolated_group(doc))` (helper exported from `pipeline.py`).
+   Two step-7 flags recorded: a return-only (`venv→main`) client has `input: []` (does the engine
+   instantiate an input-less filter?), and `venv_source_stub` is registered nowhere / not special-cased
+   in C++ (child-engine acceptance is open — stub creation is isolated in one helper for an easy revision).
 6. **Bridge: extract shared base + new `venv` node** (all 15 lanes; `image`/`video`/`audio`); network-
    remote untouched.
 7. **Local spawn + transport (v1 = WS-over-loopback unchanged):** spawn the venv child (its overlay) and
@@ -1089,9 +1152,12 @@ Three layers; each test is tagged with the phase that first makes it runnable (*
   containers to one level, drop the container node, empty container disappears, no-container pipeline
   returned by identity, members keep their connections; and the validations — nested environments,
   source-in-venv (a plain group is fine), invoke edge across an environment boundary, lane edge into a
-  container. *Increment 2 (with the bridge nodes):* cut isolated → per-venv sub-doc + bridge pair +
-  routing table; env-cycle detection over the quotient graph. Golden-file authoring→sub-docs lands
-  there. [2B]
+  container, and a control edge whose source is a container. *Increment 2 **DONE** (31 tests,
+  `test_partition_cut.py`):* `scoped=True` cuts isolated groups → per-venv sub-doc + `venv`/`venv_server`
+  bridge pair + `channelId`-keyed routing table; hub-through-main placement (no main node for venv→venv);
+  venv-only env-cycle detection over the quotient graph; the scoped-path rejections (non-bridgeable
+  `words`, implied/field source in a venv, empty base env, a group named `main`); id-collision suffixing;
+  determinism; and the §4.6 golden authoring→sub-docs example. [2B]
 
 ### 8.2 Test-fixture nodes (purpose-built, lightweight, decoupled from `ai/**`)
 Add a pair of **trivial pure-Python nodes** under the node-test tree (e.g.
