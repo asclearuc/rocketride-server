@@ -256,6 +256,89 @@ This **reuses the fiddly logic** (shared base) while **decoupling** venv work fr
 feature — no regression risk to network-remote, and its `words` gap stays its own problem. It is *not*
 the rejected `venvEgress`/`venvIngress` reinvention; it is a sibling of `remote` over one base.
 
+**Step-6 decisions (verified against the code, resolving the §4.4 forks).**
+
+- **Lane count is 13, not 12 — the list above dropped `json`.** `binder.hpp::MethodNames` (16 total)
+  is `open, tags, text, table, words, json, audio, video, questions, answers, image, classifications,
+  classificationContext, documents, closing, close`. Minus the three framing lanes that leaves **13**
+  data lanes, and `json` is a real one (there is an `instance.writeJson(IJson)` and a `data_conn._write`
+  handler). Omitting it is exactly the silent gap this section warns against, so the `venv` table
+  **includes `json`**.
+- **`words` is not bridgeable and is recorded as such, not silently skipped.** There is **no
+  `writeWords` on the `rocketlib` instance/pipe surface at all** (verified in `filters.py`/`__init__.pyi`);
+  `remote/client` *sends* it but nothing can land it — that is the latent `remote` bug. The `venv` table
+  therefore carries `words` as an **explicit "not bridgeable" entry that raises a clear error**, so the
+  gap is loud (a bump), not a quiet drop. The one-table/`binder.hpp` cross-check test asserts coverage of
+  every `MethodNames` entry, `words` included as the explicit-unsupported case.
+- **Seam = `venv`-only base; `remote` is left byte-for-byte untouched (chose A2 over A1).** The shared
+  bridge base (WS `_send`/`_recv`/`connect`/`disconnect` + the generic `callRemote` loop + `listChunks` +
+  the table-driven `callLocal`) is introduced **under `venv` only**; `remote/base` is not moved onto it.
+  This costs a little transport duplication but removes all regression risk to network-remote. The true
+  DRY refactor — moving `remote/base` onto the shared base with its current 3-lane `callLocal` preserved
+  byte-identically (**A1**) — is **deferred to 2C**, alongside the transport seam that §4.5 already
+  defers there.
+- **AV multi-arg framing = metadata in the header, body is raw bytes (B1).** `image`/`audio`/`video`
+  carry `(action:int, mime:str, buffer:bytes)`, which the single-scalar `_send` cannot express. The
+  `venv` transport puts `action`/`mime` on the already-sent JSON header and ships the buffer as **raw
+  bytes** (no base64), so multi-MB frames keep their throughput — base64-in-JSON (**B2**) was rejected
+  for the ~33% inflation §4.5 warns about. The bridge does **not** synthesize `_begin`/`_end` framing for
+  AV: the engine already calls the egress node's `writeImage(action, …)` with the action embedded, so
+  egress forwards it verbatim and ingress replays it — the reused `data_conn` vocabulary is the
+  **type serialization** (Question/Answer/Doc/classifications/`IJson`), not the framing.
+- **Bridge nodes are `internal`, not merely `nosaas` (verified — the two are different bits).**
+  `INTERNAL` (`PROTOCOL_CAPS` BIT 6, `Url.hpp`) means *not returned in `services.json` at all* — the
+  UI never sees the node, so it can't be shown, placed, or referenced. `nosaas` (BIT 13) is weaker: the
+  node **is** in `services.json` but the UI Add-Node inventory/quick-add filter it out
+  (`shared-ui/.../helpers.tsx`, `QuickAddPopup.tsx`) — and nothing in the C++ engine or the Python
+  server gates *execution* on `nosaas` (it is only parsed into `def.capabilities` at
+  `services.cpp:1779`; there is no engine "saas mode"). That is why `remote_server` carries
+  `["internal", "nosaas"]` while the user-placeable `remote` client carries only `["nosaas"]`. Both
+  `venv` and `venv_server` are **synthesized by the partitioner and never user-placed**, so **both take
+  `internal`** (mirroring `remote_server`, not the `remote` client); `nosaas` on top is redundant but
+  harmless for symmetry.
+- **`data_conn.py` reuse = mirror the vocabulary in the `venv` table, do not import (D2).** `data_conn`
+  covers ~11 of the 13 lanes (it lacks `table`, `classificationContext`, and — like everything — `words`),
+  and its `_write`/`_begin`/`_end` are methods bound to a `DataConn`/`pipe`, not standalone. For step 6 the
+  `venv` table mirrors the serialization vocabulary with `data_conn` as the reference, adding `table`/
+  `classificationContext` itself. Extracting a shared `write_lane` dispatch in `packages/ai` that both
+  `data_conn` and `venv_server` call (**D1**) is the real-DRY move and is **deferred to 2C together with
+  the A1 base unification** — both are behavior-preserving refactors best done under the green test
+  baseline rather than mixed into the feature.
+- **The 12 data `write*` egress overrides live in the shared base, inherited by BOTH nodes (verified).**
+  `remote/server/IInstance` *also* overrides `writeText`/`writeDocuments` → `callRemote(...)`: that is the
+  **return path** (data produced inside the venv flows back through the server node to main). So the egress
+  surface is symmetric — the client sends the forward stream, the server the return stream, the same 12
+  methods over the same table — and both are placed **once in the base**, not duplicated per node as
+  `remote` does. Client and server subclasses then carry only their lifecycle: the client adds `connect`
+  plus the framing overrides (`open`/`closing`/`close`), the server adds the `handleWebSocket` accept-loop.
+- **`callLocal` is bidirectional.** `venv_server` uses it for the forward path (main→venv); the egress
+  client's `callRemote` receive-loop uses it for return lanes (venv→main). That is precisely why the
+  full-lane table belongs in the shared base rather than only in `venv_server`.
+- **AV wire framing (concrete B1).** `image`/`audio`/`video` put `action`/`mime` on the JSON header and
+  ship the buffer as **raw bytes** (no base64). The buffer is **optional** — the stream is
+  `write*(BEGIN, mime)` → `write*(WRITE, mime, buffer)` → `write*(END, mime)`, and `data_conn` calls the
+  2-arg form for BEGIN/END — so a bufferless frame crosses as a `none` payload and the far side replays
+  the 2-arg call. The bridge is a transparent pass-through of already-framed calls; it does **not**
+  synthesize `_begin`/`_end`. Raising the ~1 MB WS ceiling for large AV buffers stays a step-7 item.
+- **Bridge nodes get no per-node pipeline transform.** C++ invokes the remote transform by a **hard-coded**
+  `py::module::import("nodes.remote.client")` + `.attr("preparePipeline")` (`pipeline_config.cpp`), so it
+  is remote-specific — nothing would call a `venv`-side `preparePipeline` even if one existed. venv graph
+  rewriting is the partitioner's job (§4.3 increment 2); `venv/client/__init__.py` re-exports only
+  `IGlobal`/`IInstance`.
+- **`services.*.json` follow the minimal `remote_server` template** (no `preconfig`/`shape`/`fields`):
+  both bridge nodes are `internal` + synthesized, so there is no editor config form — the partitioner
+  writes their `config` (child URL/token, step 7) directly. And `internal` (BIT 6) hides a node from the
+  **client catalog** but does **not** un-register the provider — the engine keeps it in its ProviderIndex,
+  so a synthesized `provider: venv`/`venv_server` still instantiates, exactly as `remote_server` does.
+- **Bridge (de)serialization is per-type, not uniform (reuses the `data_conn` vocabulary, D2).** All
+  VERIFIED against the shipped `rocketlib`: `Doc` → `toDict()`/`fromDict()`; `Question`/`Answer` are
+  pydantic → **`model_dump(mode='json')`** (plain `model_dump()` leaves enums like `QuestionType` on the
+  wire, which are not JSON-serializable) / `model_validate()`; `IJson` egress is **`json.loads(str(ijson))`**
+  (the `writeJson` arg is an `IJson` *instance*, and `IJson.toDict` is a staticmethod that only accepts a
+  plain dict, not an instance) and ingress is `IJson(dict)`; `TAG` egress is `tag.asBytes` and ingress is
+  `instance.writeTag(bytes)` — the bridge never reconstructs a `TAG` (there is no runtime `TAG.fromBytes`,
+  despite the `.pyi` stub).
+
 ### 4.5 IPC transport & security
 **v1 reuses the existing WebSocket lane bridge bound to loopback, unchanged** — it already carries a
 Bearer token. Bind to `127.0.0.1`; reject unauthenticated connections; deliver the token via inherited
@@ -965,8 +1048,11 @@ elsewhere that carry `environment`.
   delete / GC **lifecycle** (blocked while a run is active).
 
 **Phase 2C — Polish & scale.** Multi-process debug/observability across the cut; deploy-time pre-warm;
-the local-IPC transport seam (UDS/named-pipe/shared-mem, §4.5); v2 optimizations (direct venv↔venv mesh,
-shared-memory for AV).
+the local-IPC transport seam (UDS/named-pipe/shared-mem, §4.5); the **bridge-base + `write_lane`
+unification** (move `remote/base` onto the shared bridge base = **A1**, and extract a shared lane-write
+dispatch in `packages/ai` used by both `data_conn` and `venv_server` = **D1**, §4.4 Step-6 decisions) —
+both behavior-preserving refactors deferred out of 2B to run under the green test baseline; v2
+optimizations (direct venv↔venv mesh, shared-memory for AV).
 
 ---
 
