@@ -99,6 +99,7 @@ class TestAllowedModules:
         expected = {
             'chat',
             'clients',
+            'venv',
             'data',
             'dropper',
             'mcp',

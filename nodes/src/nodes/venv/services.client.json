@@ -51,8 +51,24 @@
 	"prefix": "Venv",
 	//
 	//	Optional:
-	//		As a pipe component, define what this pipe component takes
-	//		and what it produces
+	//		Passthrough lane map (each bridgeable lane maps to itself). The main-side
+	//		round-trip node reads a lane from its producer AND emits a lane to its return
+	//		consumer, so it has both an input and an output and must pass the task-file
+	//		validator's input/output lane-linking (which consults this map). Every bridgeable
+	//		lane is declared (all except non-bridgeable `words`); it is a transparent bridge.
 	//
-	"lanes": {}
+	"lanes": {
+		"tags": ["tags"],
+		"text": ["text"],
+		"table": ["table"],
+		"json": ["json"],
+		"audio": ["audio"],
+		"video": ["video"],
+		"image": ["image"],
+		"questions": ["questions"],
+		"answers": ["answers"],
+		"classifications": ["classifications"],
+		"classificationContext": ["classificationContext"],
+		"documents": ["documents"]
+	}
 }

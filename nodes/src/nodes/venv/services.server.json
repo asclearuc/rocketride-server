@@ -51,8 +51,25 @@
 	"prefix": "Venv Server",
 	//
 	//	Optional:
-	//		As a pipe component, define what this pipe component takes
-	//		and what it produces
+	//		Passthrough lane map (each bridgeable lane maps to itself). Required so a
+	//		child forward-ingress -- which reads a lane from the child source stub AND
+	//		emits the same lane to a group node -- passes the task-file validator's
+	//		input/output lane-linking (which consults this map). The node is a transparent
+	//		bridge, so it declares every bridgeable lane (all except non-bridgeable
+	//		`words`). The `venv` client's round-trip node carries the same map.
 	//
-	"lanes": {}
+	"lanes": {
+		"tags": ["tags"],
+		"text": ["text"],
+		"table": ["table"],
+		"json": ["json"],
+		"audio": ["audio"],
+		"video": ["video"],
+		"image": ["image"],
+		"questions": ["questions"],
+		"answers": ["answers"],
+		"classifications": ["classifications"],
+		"classificationContext": ["classificationContext"],
+		"documents": ["documents"]
+	}
 }

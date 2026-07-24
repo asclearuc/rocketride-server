@@ -149,7 +149,7 @@ def test_main_to_venv_inserts_client_in_main_and_server_in_child():
     assert result.groups == {'vision': {'name': 'v', 'isolated': True}}
 
 
-def test_venv_to_main_puts_server_in_child_and_input_less_client_in_main():
+def test_venv_to_main_delivers_the_return_through_the_round_trip_node():
     seed = _node('seed')
     gen = _node('gen', input=[{'lane': 'text', 'from': 'seed'}])
     out = _node('out', input=[{'lane': 'text', 'from': 'gen'}])
@@ -162,19 +162,43 @@ def test_venv_to_main_puts_server_in_child_and_input_less_client_in_main():
     assert 'w->main/text/gen' in routes
 
     ret = routes['w->main/text/gen']
+    fwd = routes['main->w/text/seed']
+
+    # main holds ONE round-trip node: it reads the forward producer, and both sends forward
+    # and delivers the return -- so there is no separate input-less ingress node.
     main = result.environments['main']
-    client = next(c for c in main['components'] if c['id'] == ret['ingressNode'])
-    assert client['provider'] == 'venv' and client['input'] == []
+    clients = [c for c in main['components'] if c['provider'] == 'venv']
+    assert len(clients) == 1
+    node = clients[0]
+    assert node['id'] == fwd['egressNode']
+    assert node['input'] == [{'lane': 'text', 'from': 'seed'}]
+    assert node['config'] == {
+        'channelId': 'main->w/text/seed',
+        'lane': 'text',
+        'sourceEnv': 'main',
+        'targetEnv': 'w',
+        'returnChannelId': 'w->main/text/gen',
+        'returnLane': 'text',
+    }
+    # The return consumer reads from that same round-trip node (the return's deliverNode),
+    # and the return routing entry points its ingress there.
     out_out = next(c for c in main['components'] if c['id'] == 'out')
-    assert out_out['input'] == [{'lane': 'text', 'from': ret['ingressNode']}]
+    assert out_out['input'] == [{'lane': 'text', 'from': fwd['egressNode']}]
+    assert ret['ingressNode'] == fwd['egressNode']
 
+    # The child holds both the forward ingress (from the stub) and the return egress (from gen).
     child = result.environments['w']
+    servers = [c for c in child['components'] if c['provider'] == 'venv_server']
+    assert len(servers) == 2
     egress = next(c for c in child['components'] if c['id'] == ret['egressNode'])
-    assert egress['provider'] == 'venv_server'
     assert egress['input'] == [{'lane': 'text', 'from': 'gen'}]
+    ingress = next(c for c in child['components'] if c['id'] == fwd['ingressNode'])
+    assert ingress['input'] == [{'lane': 'text', 'from': 'venv_source_stub'}]
 
 
-def test_venv_to_venv_routes_through_main_with_no_main_node():
+def test_venv_to_venv_is_rejected():
+    # The round-trip model (v1) splices one linear main->venv->main boundary; a direct
+    # venv->venv edge needs the step-8 byte-router and is rejected with a named cause.
     seed = _node('seed')
     parse = _node('parse', input=[{'lane': 'text', 'from': 'seed'}])
     detect = _node('detect', input=[{'lane': 'image', 'from': 'parse'}])
@@ -183,21 +207,8 @@ def test_venv_to_venv_routes_through_main_with_no_main_node():
         'components': [seed, _venv('v1', [parse], name='v1'), _venv('v2', [detect], name='v2')],
     }
 
-    result = partition_pipeline(pipeline, scoped=True)
-    channel = _routes(result)['v1->v2/image/parse']
-
-    main_ids = _ids(result.environments['main'])
-    assert channel['egressNode'] not in main_ids
-    assert channel['ingressNode'] not in main_ids
-
-    v1 = result.environments['v1']
-    v2 = result.environments['v2']
-    egress = next(c for c in v1['components'] if c['id'] == channel['egressNode'])
-    ingress = next(c for c in v2['components'] if c['id'] == channel['ingressNode'])
-    assert egress['provider'] == 'venv_server'
-    assert egress['input'] == [{'lane': 'image', 'from': 'parse'}]
-    assert ingress['provider'] == 'venv_server'
-    assert ingress['input'] == [{'lane': 'image', 'from': 'venv_source_stub'}]
+    with pytest.raises(ValueError, match='venv-to-venv'):
+        partition_pipeline(pipeline, scoped=True)
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +256,8 @@ def test_fan_in_within_one_env_shares_a_single_channel():
     assert sorted(channels[0]['consumers']) == ['a', 'b']
 
 
-def test_multiple_lanes_per_env_pair_make_distinct_channels():
+def test_multiple_lanes_into_one_venv_is_rejected():
+    # Two forward lanes into one venv is multi-lane fan-in (step-8); v1 supports one lane.
     pipeline = {
         'source': 'parse',
         'components': [
@@ -254,9 +266,41 @@ def test_multiple_lanes_per_env_pair_make_distinct_channels():
         ],
     }
 
-    result = partition_pipeline(pipeline, scoped=True)
+    with pytest.raises(ValueError, match='fan-in'):
+        partition_pipeline(pipeline, scoped=True)
 
-    assert sorted(entry['lane'] for entry in result.routing) == ['image', 'text']
+
+def test_two_independent_round_trips_each_get_their_own_node():
+    # Two separate linear main->venv->main splices: each venv has its own round-trip node.
+    pipeline = {
+        'source': 'src',
+        'components': [
+            _node('src'),
+            _venv('v1', [_node('a', input=[{'lane': 'text', 'from': 'src'}])], name='v1'),
+            _node('mid', input=[{'lane': 'text', 'from': 'a'}]),
+            _venv('v2', [_node('b', input=[{'lane': 'text', 'from': 'mid'}])], name='v2'),
+            _node('out', input=[{'lane': 'text', 'from': 'b'}]),
+        ],
+    }
+
+    result = partition_pipeline(pipeline, scoped=True)
+    routes = _routes(result)
+    assert set(routes) == {
+        'main->v1/text/src',
+        'v1->main/text/a',
+        'main->v2/text/mid',
+        'v2->main/text/b',
+    }
+    # Two round-trip nodes in main, one per venv; each carries its own return channel.
+    main = result.environments['main']
+    clients = [c for c in main['components'] if c['provider'] == 'venv']
+    assert len(clients) == 2
+    assert {c['config']['returnChannelId'] for c in clients} == {'v1->main/text/a', 'v2->main/text/b'}
+    # mid consumes v1's return through v1's round-trip node; out consumes v2's the same way.
+    mid_out = next(c for c in main['components'] if c['id'] == 'mid')
+    assert mid_out['input'] == [{'lane': 'text', 'from': routes['main->v1/text/src']['egressNode']}]
+    out_out = next(c for c in main['components'] if c['id'] == 'out')
+    assert out_out['input'] == [{'lane': 'text', 'from': routes['main->v2/text/mid']['egressNode']}]
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +308,8 @@ def test_multiple_lanes_per_env_pair_make_distinct_channels():
 # ---------------------------------------------------------------------------
 
 
-def test_a_to_b_to_main_chain_is_accepted():
+def test_a_to_b_to_main_chain_is_rejected():
+    # A main->v1->v2->main chain contains a v1->v2 edge (venv-to-venv), rejected in v1.
     pipeline = {
         'source': 'dropper',
         'components': [
@@ -275,13 +320,8 @@ def test_a_to_b_to_main_chain_is_accepted():
         ],
     }
 
-    result = partition_pipeline(pipeline, scoped=True)
-
-    assert {entry['channelId'] for entry in result.routing} == {
-        'main->v1/text/dropper',
-        'v1->v2/image/parse',
-        'v2->main/image/detect',
-    }
+    with pytest.raises(ValueError, match='venv-to-venv'):
+        partition_pipeline(pipeline, scoped=True)
 
 
 def test_venv_to_venv_cycle_is_rejected():
@@ -469,8 +509,7 @@ def test_the_cut_is_deterministic():
         'components': [
             _node('dropper'),
             _venv('v1', [_node('parse', input=[{'lane': 'text', 'from': 'dropper'}])], name='v1'),
-            _venv('v2', [_node('detect', input=[{'lane': 'image', 'from': 'parse'}])], name='v2'),
-            _node('ret', input=[{'lane': 'image', 'from': 'detect'}]),
+            _node('ret', input=[{'lane': 'text', 'from': 'parse'}]),
         ],
     }
 
@@ -505,47 +544,47 @@ def test_main_document_preserves_the_original_source_field():
 
 
 # ---------------------------------------------------------------------------
-# Golden: the §4.6 example, end to end
+# Golden: a linear main -> venv -> main round-trip, end to end
 # ---------------------------------------------------------------------------
 
 
-def test_golden_dropper_parse_detect_return():
+def test_golden_linear_round_trip():
     pipeline = {
         'project_id': 'golden',
         'source': 'dropper',
         'components': [
             _node('dropper'),
-            _venv('v1', [_node('parse', input=[{'lane': 'text', 'from': 'dropper'}])], name='v1'),
-            _venv('v2', [_node('detect', input=[{'lane': 'image', 'from': 'parse'}])], name='v2'),
-            _node('ret', input=[{'lane': 'image', 'from': 'detect'}]),
+            _venv('v1', [_node('work', input=[{'lane': 'text', 'from': 'dropper'}])], name='v1'),
+            _node('response', input=[{'lane': 'text', 'from': 'work'}]),
         ],
     }
 
     result = partition_pipeline(pipeline, scoped=True)
 
-    assert list(result.environments) == ['main', 'v1', 'v2']
+    assert list(result.environments) == ['main', 'v1']
     routes = _routes(result)
-    assert set(routes) == {'main->v1/text/dropper', 'v1->v2/image/parse', 'v2->main/image/detect'}
+    assert set(routes) == {'main->v1/text/dropper', 'v1->main/text/work'}
+    fwd = routes['main->v1/text/dropper']
+    ret = routes['v1->main/text/work']
 
-    # main: dropper + ret + the two main-side clients (dropper's egress, ret's ingress).
+    # main: dropper + response + ONE round-trip node (the forward egress that also delivers
+    # the return). response reads that node; the return routing entry delivers through it.
     main = result.environments['main']
-    assert {'dropper', 'ret'}.issubset(set(_ids(main)))
+    assert {'dropper', 'response'}.issubset(set(_ids(main)))
     main_clients = [c for c in main['components'] if c['provider'] == 'venv']
-    assert len(main_clients) == 2
+    assert len(main_clients) == 1
+    node = main_clients[0]
+    assert node['id'] == fwd['egressNode']
+    assert node['config']['returnChannelId'] == 'v1->main/text/work'
+    response_out = next(c for c in main['components'] if c['id'] == 'response')
+    assert response_out['input'] == [{'lane': 'text', 'from': fwd['egressNode']}]
+    assert ret['ingressNode'] == fwd['egressNode']
 
-    # v1: stub + one ingress (from main) + one egress (to v2) + parse.
+    # v1: stub + forward ingress (from stub) + return egress (from work) + work.
     v1 = result.environments['v1']
     assert v1['source'] == 'venv_source_stub'
     assert sum(1 for c in v1['components'] if c['provider'] == 'venv_server') == 2
-    parse_out = next(c for c in v1['components'] if c['id'] == 'parse')
-    assert parse_out['input'] == [{'lane': 'text', 'from': routes['main->v1/text/dropper']['ingressNode']}]
-
-    # v2: stub + one ingress (from v1) + one egress (to main) + detect.
-    v2 = result.environments['v2']
-    assert sum(1 for c in v2['components'] if c['provider'] == 'venv_server') == 2
-    detect_out = next(c for c in v2['components'] if c['id'] == 'detect')
-    assert detect_out['input'] == [{'lane': 'image', 'from': routes['v1->v2/image/parse']['ingressNode']}]
-
-    # ret consumes from the v2->main ingress client in main.
-    ret_out = next(c for c in main['components'] if c['id'] == 'ret')
-    assert ret_out['input'] == [{'lane': 'image', 'from': routes['v2->main/image/detect']['ingressNode']}]
+    work_out = next(c for c in v1['components'] if c['id'] == 'work')
+    assert work_out['input'] == [{'lane': 'text', 'from': fwd['ingressNode']}]
+    egress = next(c for c in v1['components'] if c['id'] == ret['egressNode'])
+    assert egress['input'] == [{'lane': 'text', 'from': 'work'}]

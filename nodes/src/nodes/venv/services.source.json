@@ -1,0 +1,74 @@
+{
+	//
+	// Required:
+	//		The displayable name of this node
+	//
+	"title": "Infrastructure - Virtual Environment Source",
+	//
+	// Required:
+	//		The protocol is the endpoint protocol. The logical type (`venv_source_stub`)
+	//		is derived from it and must match the `source`/`provider` the partitioner
+	//		synthesizes for each venv child sub-document.
+	//
+	"protocol": "venv_source_stub://",
+	//
+	// Required:
+	//		Class type of the node - it is the source of a venv child document.
+	//
+	"classType": ["source"],
+	//
+	// Required:
+	//		`noinclude` keeps this node out of dependency include scans; it is synthesized
+	//		by the partitioner and never user-placed. (NOT `internal`: an internal source
+	//		is not registered as a usable pipeline source endpoint.)
+	//
+	"capabilities": ["noinclude"],
+	//
+	// Optional:
+	//		Description of this driver
+	//
+	"description": ["An internal infrastructure source that runs at the head of a virtual-environment child process. It keeps the child engine resident for the run and hosts the loopback /venv/pipe bridge endpoint; it produces no objects itself -- bridged lane data arrives over the wire."],
+	//
+	// Optional:
+	//		Register an endpoint factory for this python node so the child engine can
+	//		instantiate it as a source without a C++ wrapper.
+	//
+	"register": "endpoint",
+	//
+	// Optional:
+	//		The node is a python node.
+	//
+	"node": "python",
+	//
+	// Optional:
+	//		The path is the python package implementing the node.
+	//
+	"path": "nodes.venv.source",
+	//
+	// Required:
+	//		The prefix map when added/removed when converting URLs <=> paths
+	//
+	"prefix": "Venv Source",
+	//
+	//	Optional:
+	//		What this source nominally produces. Real data arrives over the bridge, so
+	//		this is declarative only; it lists the bridgeable lanes a child ingress may
+	//		read from the stub (all lanes except the non-bridgeable `words`).
+	//
+	"lanes": {
+		"_source": [
+			"tags",
+			"text",
+			"table",
+			"json",
+			"audio",
+			"video",
+			"image",
+			"questions",
+			"answers",
+			"classifications",
+			"classificationContext",
+			"documents"
+		]
+	}
+}
