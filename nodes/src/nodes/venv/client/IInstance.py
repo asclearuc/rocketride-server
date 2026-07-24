@@ -30,22 +30,31 @@ from ..base import IInstanceBase
 
 
 class IInstance(IInstanceBase):
-    """The ``venv`` (egress) bridge node.
+    """The ``venv`` (main-side) bridge client: the round-trip splice of a venv boundary.
 
-    Thin over the shared base: the 12 data ``write*`` egress overrides are inherited
-    from the base; this class adds only the connect lifecycle and the object-framing
-    lanes (``open``/``closing``/``close``), which the egress side drives forward -- the
-    server applies inbound framing via ``callLocal`` and does not override these.
+    It sits mid-chain in main (``producer -> venv -> consumer``) and dials the child once.
+    The venv boundary is a request/response splice of a **single** object -- the object never
+    forks -- so the whole boundary rides one socket with the ``remote`` request/response
+    protocol (``callRemote``), and the object is never re-opened on the main pipe:
+
+    - **Framing** (``open``/``closing``/``close``): sent forward via ``callRemote`` and then
+      returned normally, so the engine's default *also* propagates the framing to the
+      downstream consumer -- the same object opens/closes on both this node and, e.g., a
+      ``response`` node, once.
+    - **Forward data** (inherited ``write*``): sent forward via ``callRemote`` and
+      ``preventDefault``-ed so the forward stream does not leak into the downstream consumer.
+    - **Return data**: the venv's output arrives interleaved on ``callRemote``'s ack channel
+      (during ``closing``/``close``) and is applied downstream via ``callLocal`` ->
+      ``self.instance.write*`` -> the consumer, on the already-open object.
     """
 
     IGlobal: IGlobal
 
     def beginInstance(self):
-        # Step 6: the venv child (and thus its loopback endpoint) is spawned in step 7.
         if not self.IGlobal.urlProcess:
-            raise Exception('venv bridge transport is not wired yet (spawn + routing land in step 7)')
+            raise Exception('venv bridge transport not configured: no urlProcess injected at spawn')
 
-        # Connect to the WebSocket synchronously and keep it open
+        # Dial the child's /venv/pipe once and keep it open for the node's lifetime.
         webSocket = connect(
             self.IGlobal.urlProcess, additional_headers=self.IGlobal.headers, open_timeout=None, close_timeout=None
         )

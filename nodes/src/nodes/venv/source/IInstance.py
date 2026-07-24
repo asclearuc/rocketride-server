@@ -21,27 +21,8 @@
 # SOFTWARE.
 # =============================================================================
 
-from rocketlib import IGlobalBase
+from rocketlib import IInstanceBase
 
 
-class IGlobal(IGlobalBase):
-    """Shared state for the ``venv_server`` (child-side) bridge node.
-
-    Records the channel direction from the engine-supplied config for reference. A
-    ``venv_server`` whose ``sourceEnv == 'main'`` is the boundary's forward INGRESS (its
-    ``handleWebSocket`` accept loop is run by the ``/venv/pipe`` route); one whose
-    ``targetEnv == 'main'`` is the return EGRESS (the route binds it the same socket, and the
-    engine data-drives its ``write*`` back over it). Both share the one socket, so no
-    per-global socket state is kept here.
-    """
-
-    def beginGlobal(self):
-        config = self.glb.connConfig or {}
-        self.sourceEnv = config.get('sourceEnv')
-        self.targetEnv = config.get('targetEnv')
-
-    def endGlobal(self):
-        pass
-
-    sourceEnv: str = None
-    targetEnv: str = None
+class IInstance(IInstanceBase):
+    pass

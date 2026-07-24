@@ -30,27 +30,27 @@ from ..base import IInstanceBase
 
 
 class IInstance(IInstanceBase):
-    """The ``venv_server`` (ingress) bridge node.
+    """The ``venv_server`` (child-side) bridge node.
 
-    Thin over the shared base. It adds only the accept-loop; everything else is
-    inherited:
+    Thin over the shared base; both roles of a boundary share **one** socket (the ``remote``
+    request/response model), which the ``/venv/pipe`` route binds to both instances:
 
-    - ``callLocal`` (from the base) handles the **forward** path -- inbound lanes land
-      on ``self.instance.write*`` / ``self.instance.pipe.*``.
-    - the 12 data ``write*`` overrides (from the base) handle the **return** path -- when
-      the venv pipeline emits data into this node, it is serialized and ``callRemote``-ed
-      back to the client.
-
-    It does not override the framing lanes: inbound framing is applied through
-    ``callLocal``, and the server never drives framing back.
+    - **Forward ingress** (``sourceEnv == 'main'``): the route runs its ``handleWebSocket``
+      accept loop, which reads main->child lanes and applies them to the local (venv)
+      pipeline via ``callLocal`` (framing opens/closes the child object; data lanes flow
+      downstream).
+    - **Return egress** (``targetEnv == 'main'``): the engine data-drives its inherited
+      ``write*`` (from the forward-ingress call stack, nested on the same event loop), which
+      ``callRemote``-serializes the venv's output back over the **same** socket and reads its
+      own ack -- so the return re-enters main through the round-trip client's ack channel.
+      It sends data only; object framing is owned by the main round-trip node, so the
+      inherited no-op ``open``/``closing``/``close`` are correct here.
     """
 
     def handleWebSocket(self, webSocket: WebSocket):
-        """
-        Handle the main WebSocket loop.
-
-        Receive the input lanes from the bridged (main) pipeline, process them with the
-        local (venv) pipeline and send any results back.
+        """Service a forward-ingress (main -> child) connection: receive lanes and apply them
+        to the local pipeline, acking each. The return egress's ``callRemote`` sends nest
+        inside this loop's ``callLocal`` (same socket, same thread), so no second loop runs.
         """
         self.connect(webSocket)
 

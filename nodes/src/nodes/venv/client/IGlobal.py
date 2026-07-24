@@ -21,28 +21,41 @@
 # SOFTWARE.
 # =============================================================================
 
+import os
+
 from typing import Any, Dict
 
 from rocketlib import IGlobalBase
 
+# The per-run bridge token, inherited from the spawning orchestrator's environment (§4.5:
+# never argv/disk). The child's /venv/pipe route verifies it before accepting.
+VENV_TOKEN_ENV = 'ROCKETRIDE_VENV_TOKEN'
+
 
 class IGlobal(IGlobalBase):
-    """Shared state for the ``venv`` (egress) bridge node.
+    """Shared state for the ``venv`` (client) bridge node.
 
-    Step 6 scope: the lane bridge itself is complete, but the loopback endpoint of the
-    spawned venv child does not exist yet. Spawning the child and injecting its
-    WebSocket URL + bearer token is step 7 (local spawn + hub routing), so these stay
-    unset here and ``beginInstance`` refuses to connect until then.
+    At spawn (step 7) the orchestrator injects the live loopback URL into this node's config
+    (``ws://127.0.0.1:<child_port>/venv/pipe?channel=<channelId>``). We read it from the
+    engine-supplied ``connConfig`` here; the Bearer token comes from the inherited env, not
+    the config. ``beginInstance`` refuses to connect if the URL is still absent.
     """
 
     def beginGlobal(self):
-        # TODO(step 7): the partitioner/orchestrator spawns the venv child on loopback
-        # and supplies `urlProcess` (ws://127.0.0.1:<port>/...) + a Bearer `token`.
-        self.urlProcess = None
-        self.headers = {}
+        config = self.glb.connConfig or {}
+        self.urlProcess = config.get('urlProcess')
+        # Direction (Gap C): this client runs in main, so it is the RETURN INGRESS
+        # (receives child->main data) when its channel targets main, else the FORWARD
+        # EGRESS (sends main->child data, engine-driven).
+        self.targetEnv = config.get('targetEnv')
+        self.sourceEnv = config.get('sourceEnv')
+        token = os.environ.get(VENV_TOKEN_ENV)
+        self.headers = {'Authorization': f'Bearer {token}'} if token else {}
 
     def endGlobal(self):
         pass
 
     urlProcess: str = None
     headers: Dict[str, Any] = None
+    targetEnv: str = None
+    sourceEnv: str = None

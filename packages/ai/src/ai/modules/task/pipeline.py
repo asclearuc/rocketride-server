@@ -102,9 +102,10 @@ MAIN_ENV = 'main'
 # edge on one of these is rejected at cut time rather than at runtime.
 NON_BRIDGEABLE_LANES = frozenset({'words'})
 
-# The synthesized source of every venv sub-document. Not a real registered node —
-# it exists only to make the ingress bridge nodes reachable from the child's source,
-# exactly like ``remote``'s ``remote_source_stub``. Real data arrives over the wire.
+# The source of every venv sub-document. It is a real registered resident source
+# (``nodes/venv/source``): it makes the child ingress bridge reachable from the child's
+# source AND hosts the child's ``/venv/pipe`` WebServer, blocking for the run so the
+# child engine stays alive while lane data arrives over the wire.
 VENV_SOURCE_STUB_PROVIDER = 'venv_source_stub'
 VENV_SOURCE_STUB_ID = 'venv_source_stub'
 
@@ -407,13 +408,77 @@ def _assign_channel_ids(
 
 
 def _bridge_config(channel: Dict[str, Any]) -> Dict[str, Any]:
-    """The bridge node's config; child URL/token are filled at spawn (step 7)."""
-    return {
+    """The bridge node's config; child URL/token are filled at spawn (step 7).
+
+    A forward channel (``main -> env``) that is paired with a return channel additionally
+    carries the return channel's id/lane: its main-side node is a **round-trip** ``venv``
+    node that both sends the forward stream and delivers the return downstream, so the
+    spawn injection dials one socket carrying both directions (``?channel=..&return=..``).
+    """
+    config = {
         'channelId': channel['channelId'],
         'lane': channel['lane'],
         'sourceEnv': channel['sourceEnv'],
         'targetEnv': channel['targetEnv'],
     }
+    ret = channel.get('returnChannel')
+    if ret is not None:
+        config['returnChannelId'] = ret['channelId']
+        config['returnLane'] = ret['lane']
+    return config
+
+
+def _pair_boundaries(channels: 'OrderedDict[Tuple[str, str, str], Dict[str, Any]]') -> None:
+    """Pair each venv env's forward (``main -> env``) and return (``env -> main``) channel
+    for the round-trip bridge model, and reject shapes v1 does not support (step 8).
+
+    The venv boundary is a request/response splice of one object: the object never forks,
+    so the return must ride back over the **forward** socket and re-enter main through the
+    **same** node that sent it (the engine allows one open object per pipe stack, entered
+    at the root -- a separate async re-injection cannot open the already-open object). v1
+    therefore supports the linear ``main -> venv -> main`` splice only: each venv env has
+    exactly one forward channel from main and at most one return channel to main. Direct
+    ``venv <-> venv`` channels and multi-lane fan-in/out to a single env need the step-8
+    byte-router and are rejected here with a named cause.
+
+    Mutates the channels in place: sets ``returnChannel`` on each paired forward channel,
+    and points each return channel's ``deliverNode``/``ingressNode`` at the round-trip node
+    (the forward egress) that delivers it.
+    """
+    forward_by_env: Dict[str, Dict[str, Any]] = {}
+    return_by_env: Dict[str, Dict[str, Any]] = {}
+    for channel in channels.values():
+        src, dst = channel['sourceEnv'], channel['targetEnv']
+        if src != MAIN_ENV and dst != MAIN_ENV:
+            raise ValueError(
+                f'Channel "{channel["channelId"]}" crosses directly between virtual environments '
+                f'"{src}" and "{dst}"; venv-to-venv routing is not supported yet'
+            )
+        if src == MAIN_ENV:
+            if dst in forward_by_env:
+                raise ValueError(
+                    f'Virtual environment "{dst}" receives more than one lane from main; '
+                    'multi-lane fan-in into one venv is not supported yet'
+                )
+            forward_by_env[dst] = channel
+        else:
+            if src in return_by_env:
+                raise ValueError(
+                    f'Virtual environment "{src}" returns more than one lane to main; '
+                    'multi-lane fan-out from one venv is not supported yet'
+                )
+            return_by_env[src] = channel
+
+    for env, ret in return_by_env.items():
+        forward = forward_by_env.get(env)
+        if forward is None:
+            raise ValueError(f'Virtual environment "{env}" returns to main but is not fed from main')
+        forward['returnChannel'] = ret
+        # The round-trip node (the forward egress) both sends into the venv and delivers its
+        # return downstream, so return consumers read from it and its routing entry points
+        # there rather than at a now-absent main ingress node.
+        ret['deliverNode'] = forward['egressNode']
+        ret['ingressNode'] = forward['egressNode']
 
 
 def _synthesize_bridges(
@@ -421,34 +486,52 @@ def _synthesize_bridges(
     buckets: 'OrderedDict[str, List[Dict[str, Any]]]',
     stub_ids: Dict[str, str],
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """Build each channel's bridge pair, grouped by the env whose document holds them.
+    """Build the bridge nodes for each channel, grouped by the env whose document holds them.
 
-    Egress sits in the source env (subscribed to the producer), ingress in the target env.
-    A node is a ``venv`` client in main and a ``venv_server`` in a child, since main dials
-    and children listen — the base is bidirectional, so a server also egresses. A child
-    ingress links to the stub for reachability; a main ingress has no input (data arrives
-    over the wire).
+    The boundary is spliced with the ``remote`` request/response model, over one socket per
+    forward channel:
+
+    - A **forward channel** (``main -> env``) yields a round-trip ``venv`` node in main (it
+      reads the main producer, sends the forward stream, and -- when a return is paired --
+      delivers the return downstream to the repointed consumers) and a ``venv_server``
+      ingress in the child (reads the child stub, applies the forward stream locally).
+    - A **return channel** (``env -> main``) yields only a ``venv_server`` egress in the
+      child (reads the venv producer, ships the return back over the **same** socket its
+      paired forward node dialed). Main has no separate ingress node: the return re-enters
+      through the round-trip node, so the object is never re-opened (see ``_pair_boundaries``).
     """
     bridge_nodes: Dict[str, List[Dict[str, Any]]] = {env: [] for env in buckets}
     for channel in channels.values():
         src, dst = channel['sourceEnv'], channel['targetEnv']
-        bridge_nodes[src].append(
-            {
-                'id': channel['egressNode'],
-                'provider': 'venv' if src == MAIN_ENV else 'venv_server',
-                'input': [{'lane': channel['lane'], 'from': channel['producer']}],
-                'config': _bridge_config(channel),
-            }
-        )
-        ingress_input = [] if dst == MAIN_ENV else [{'lane': channel['lane'], 'from': stub_ids[dst]}]
-        bridge_nodes[dst].append(
-            {
-                'id': channel['ingressNode'],
-                'provider': 'venv' if dst == MAIN_ENV else 'venv_server',
-                'input': ingress_input,
-                'config': _bridge_config(channel),
-            }
-        )
+        if src == MAIN_ENV:
+            # Forward channel: round-trip node in main + ingress in the child.
+            bridge_nodes[MAIN_ENV].append(
+                {
+                    'id': channel['egressNode'],
+                    'provider': 'venv',
+                    'input': [{'lane': channel['lane'], 'from': channel['producer']}],
+                    'config': _bridge_config(channel),
+                }
+            )
+            bridge_nodes[dst].append(
+                {
+                    'id': channel['ingressNode'],
+                    'provider': 'venv_server',
+                    'input': [{'lane': channel['lane'], 'from': stub_ids[dst]}],
+                    'config': _bridge_config(channel),
+                }
+            )
+        else:
+            # Return channel: egress in the child only; main delivery is the paired
+            # round-trip node (no separate main ingress).
+            bridge_nodes[src].append(
+                {
+                    'id': channel['egressNode'],
+                    'provider': 'venv_server',
+                    'input': [{'lane': channel['lane'], 'from': channel['producer']}],
+                    'config': _bridge_config(channel),
+                }
+            )
     return bridge_nodes
 
 
@@ -530,10 +613,14 @@ def _cut_pipeline(pipeline: Dict[str, Any], source: Optional[str]) -> PartitionR
 
     venv_envs = [env for env in buckets if env != MAIN_ENV]
     stub_ids = _assign_channel_ids(channels, buckets, venv_envs)
+    _pair_boundaries(channels)
 
-    # Repoint each boundary consumer edge to read from its channel's ingress node.
+    # Repoint each boundary consumer edge. A forward consumer (in a child) reads from its
+    # child ingress; a return consumer (in main) reads from the round-trip node that both
+    # sent the forward stream and delivers the return (its ``deliverNode``).
     for edge, key in edge_rewrites:
-        edge['from'] = channels[key]['ingressNode']
+        channel = channels[key]
+        edge['from'] = channel['deliverNode'] if channel['targetEnv'] == MAIN_ENV else channel['ingressNode']
 
     bridge_nodes = _synthesize_bridges(channels, buckets, stub_ids)
     environments = _assemble_documents(work, buckets, bridge_nodes, env_blocks, stub_ids)

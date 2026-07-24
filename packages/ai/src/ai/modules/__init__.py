@@ -12,5 +12,6 @@ ALL = frozenset(
         'shell',
         'task',
         'task_http',
+        'venv',
     }
 )

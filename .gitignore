@@ -110,10 +110,12 @@ __pycache__/
 .Python
 env/
 venv/
-# The `venv/` bridge node dirs are source code (a node literally named "venv"),
-# not Python virtualenvs -- keep them tracked. See design/virtual-environments.md §4.4.
+# The `venv/` bridge node dirs and the `venv` server-side module are source code
+# (literally named "venv"), not Python virtualenvs -- keep them tracked. See
+# design/virtual-environments.md §4.4.
 !nodes/src/nodes/venv/
 !nodes/test/venv/
+!packages/ai/src/ai/modules/venv/
 .venv/
 ENV/
 .eggs/

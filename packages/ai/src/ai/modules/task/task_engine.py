@@ -32,6 +32,7 @@ import os
 import asyncio
 import sys
 import json
+import secrets
 import tempfile
 import time
 import socket
@@ -67,7 +68,16 @@ from rocketride import (
 )
 from .dbg_debugpy import DbgDebugpy
 from .dbg_stdio import DbgStdio
-from .pipeline import partition_pipeline, resolve_pipeline_env
+from .pipeline import partition_pipeline, resolve_pipeline_env, has_isolated_group, PartitionResult
+from .venv_spawn import (
+    VenvChild,
+    VENV_TOKEN_ENV,
+    build_child_env,
+    inject_venv_urls,
+    overlay_site,
+    probe_ready,
+    kill_process,
+)
 from .types import LAUNCH_TYPE, TaskError
 from .task_conn import TaskConn
 from .task_metrics import TaskMetrics
@@ -342,6 +352,13 @@ class Task(DAPBase):
         self._pipelineTraceLevel = _args.get('pipelineTraceLevel', None)
         self._task_name: Optional[str] = _args.get('name', None)
         self._engine_process: Optional[asyncio.subprocess.Process] = None
+
+        # Per-run venv child subprocesses (one per isolated group), spawned before the main
+        # engine and torn down with it in _terminated. Empty unless venv scoping is active.
+        self._venv_children: List[VenvChild] = []
+        # The per-run bridge token, shared (via inherited env) by the main engine and every
+        # venv child; None unless venv scoping is active this run.
+        self._run_venv_token: Optional[str] = None
 
         # Status tracking
         self._status = TASK_STATUS()
@@ -683,6 +700,187 @@ class Task(DAPBase):
 
         return taskpath
 
+    def _venv_scoping_enabled(self, resolved: Dict[str, Any]) -> bool:
+        """Whether this run cuts isolated groups into venv children (§4.15 master switch).
+
+        ``venv_env`` reads ``ROCKETRIDE_SERVER_USE_VENV`` and lives on the engine's sys.path
+        (``dist/server/lib``); a guarded import means any non-engine context (or a broken
+        deployment missing the lib) degrades to the legacy flatten path rather than erroring.
+        """
+        try:
+            import venv_env  # engine sys.path only
+        except ImportError:
+            debug('venv_env unavailable; venv scoping disabled (legacy flatten)')
+            return False
+        return venv_env.scoping_enabled(venv_env.use_venv_mode(), has_isolated_group(resolved))
+
+    async def _spawn_venv_children(self, result: PartitionResult, run_token: str) -> Dict[str, int]:
+        """Spawn one resident venv child per isolated group; return ``{env_id: data_port}``.
+
+        Children are siblings of the main engine (spawned by this server-side Task). v1 wires
+        only main<->child channels; a venv->venv channel needs the step-8 hub byte-router, so
+        it is rejected here rather than silently dropped. On any failure the caller's run
+        fails and _terminated tears down whatever was spawned.
+        """
+        for entry in result.routing:
+            if entry['sourceEnv'] != 'main' and entry['targetEnv'] != 'main':
+                raise RuntimeError(
+                    f'venv->venv channel "{entry["channelId"]}" needs the step-8 hub router; not supported in v1'
+                )
+
+        exec_dir = os.path.dirname(sys.executable)
+        project_id = result.environments['main'].get('project_id')
+        avoid_mocks = bool(self._pipeline.get('avoidMocks'))
+
+        port_by_env: Dict[str, int] = {}
+        for env_id, child_doc in result.environments.items():
+            if env_id == 'main':
+                continue
+            port = self._server.assign_port()
+            try:
+                child = await self._spawn_one_venv_child(
+                    env_id, child_doc, port, run_token, exec_dir, project_id, avoid_mocks, result.groups
+                )
+            except Exception:
+                self._server.release_port(port)
+                raise
+            self._venv_children.append(child)
+            port_by_env[env_id] = port
+        return port_by_env
+
+    async def _spawn_one_venv_child(
+        self,
+        env_id: str,
+        child_doc: Dict[str, Any],
+        port: int,
+        run_token: str,
+        exec_dir: str,
+        project_id: Optional[str],
+        avoid_mocks: bool,
+        groups: Dict[str, Dict[str, Any]],
+    ) -> VenvChild:
+        """Spawn and ready one venv child, mirroring the main-engine spawn pattern."""
+        name = (groups.get(env_id) or {}).get('name') or env_id
+        tmpfile = await self._write_task_file(child_doc)
+
+        child_args = [
+            CONST_AI_NODE_SCRIPT,
+            tmpfile,
+            '--autoterm',
+            '--monitor=app',
+            f'--data_port={port}',
+            '--data_host=localhost',
+        ]
+        modelserver = self._server._config.get('modelserver')
+        if modelserver:
+            child_args.append(f'--modelserver={modelserver}')
+
+        child_env = build_child_env(
+            os.environ,
+            self.client_id,
+            run_token,
+            overlay_site(exec_dir, project_id, env_id),
+            avoid_mocks,
+        )
+
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            *child_args,
+            cwd=exec_dir,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=CONST_SUBPROCESS_BUFFER_LIMIT,
+            env=child_env,
+        )
+        child = VenvChild(env_id=env_id, name=name, process=process, port=port, tmpfile=tmpfile)
+        # Drain the child's stdout/stderr so its pipes never fill and deadlock it; the tail
+        # buffer keeps the last lines so a startup failure can report the child's own error.
+        child.drains.append(asyncio.create_task(self._drain_child_stream(process.stdout, env_id, child.tail)))
+        child.drains.append(asyncio.create_task(self._drain_child_stream(process.stderr, env_id, child.tail)))
+
+        try:
+            # Readiness: the resident source's WebServer must be accepting connections before
+            # the main engine (whose venv clients dial it) starts. Transport-level probe (the
+            # /venv/pipe route rejects unauthenticated peers pre-accept, so a WS connect can't
+            # confirm readiness).
+            await probe_ready('127.0.0.1', port, process)
+        except BaseException as e:
+            # This child is not yet registered for teardown, so clean it up here or it leaks:
+            # a hung child would survive until the server dies (its stdin stays open, so
+            # --autoterm never fires). Let the drains flush the child's last output (for the
+            # message) if it exited, then cancel them, kill+reap the process, drop its file.
+            if process.returncode is not None:
+                try:
+                    await asyncio.wait_for(asyncio.gather(*child.drains, return_exceptions=True), timeout=1.0)
+                except Exception:
+                    pass
+            for drain in child.drains:
+                drain.cancel()
+            try:
+                await kill_process(process, CONST_CANCEL_WAIT_TIMEOUT_SECONDS)
+            except Exception:
+                pass
+            try:
+                os.remove(tmpfile)
+            except OSError:
+                pass
+            detail = '\n'.join(child.tail).strip() or '(no output captured from the child)'
+            raise RuntimeError(f'venv "{name}" ({env_id}) failed to start: {e}\n--- child output ---\n{detail}') from e
+
+        self.debug_message(f'venv child "{name}" ({env_id}) ready on port {port} (PID {process.pid})')
+        return child
+
+    async def _drain_child_stream(self, stream: Optional[asyncio.StreamReader], env_id: str, tail=None) -> None:
+        """Continuously drain a venv child's stdout/stderr so it never blocks on a full pipe.
+
+        Each line is mirrored to ``%TEMP%/venv-child-<env>.log`` and, when a ``tail`` ring is
+        given, kept there so a startup failure can quote the child's own error.
+        """
+        if stream is None:
+            return
+        log_path = os.path.join(tempfile.gettempdir(), f'venv-child-{env_id}.log')
+        try:
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                text = line.decode(errors='replace').rstrip()
+                if tail is not None:
+                    tail.append(text)
+                self.debug_message(f'[venv {env_id}] {text}')
+                try:
+                    with open(log_path, 'a', encoding='utf-8') as f:
+                        f.write(text + '\n')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    async def _teardown_venv_children(self) -> None:
+        """Kill and reap every venv child, releasing its port and removing its task file.
+
+        Idempotent (clears the list). The children are resident and never self-stop, so this
+        explicit teardown -- reached on every _terminated path, including a main-engine crash
+        -- is what bounds their lifetime to the run.
+        """
+        children, self._venv_children = self._venv_children, []
+        for child in children:
+            for drain in child.drains:
+                drain.cancel()
+            try:
+                await kill_process(child.process, CONST_CANCEL_WAIT_TIMEOUT_SECONDS)
+            except Exception as e:
+                self.debug_message(f'Error stopping venv child {child.env_id}: {e}')
+            try:
+                self._server.release_port(child.port)
+            except Exception as e:
+                self.debug_message(f'Error releasing venv child port {child.port}: {e}')
+            try:
+                os.remove(child.tmpfile)
+            except OSError:
+                pass
+
     def _file_checksum(self, path: str) -> str:
         """
         Calculate SHA256 checksum for file integrity.
@@ -929,6 +1127,10 @@ class Task(DAPBase):
                     self._task_metrics = None
         except Exception as e:
             self.debug_message(f'Error cleaning up metrics: {e}')
+
+        # Tear down venv children (resident, they never self-stop): two-phase kill + reap,
+        # release their ports, remove their task files. Runs on every _terminated path.
+        await self._teardown_venv_children()
 
         try:
             # Clean up temporary files
@@ -2054,23 +2256,40 @@ class Task(DAPBase):
             # so secrets are not retained in memory beyond the temp file write.
             resolved = self._resolve_pipeline(self._pipeline)
 
-            # Lift container members to the top level. Before _check_pipeline, not
-            # after: that check looks for the source among top-level components only,
-            # so a source inside a group would not be found yet. Everything downstream
-            # then sees the document the engine will actually run. Throws on a
-            # container the engine cannot execute as written.
-            resolved = partition_pipeline(resolved, source=self.source)
+            # Gate per-environment scoping (§4.15). Off -> partition_pipeline flattens
+            # containers into one document (a dict), byte-identical to legacy. On -> it
+            # returns a PartitionResult with one sub-document per environment; each isolated
+            # group runs in its own venv child engine, wired to main over loopback.
+            scoped = self._venv_scoping_enabled(resolved)
 
-            # Check it - throws on error
-            self._check_pipeline(resolved)
+            # Lift container members to the top level. The flatten path is unchanged; the
+            # source check below looks for the source among top-level components, so a source
+            # inside a group would not be found before this. Throws on a container the engine
+            # cannot execute as written.
+            result = partition_pipeline(resolved, source=self.source, scoped=scoped)
 
-            # Mark the start time
             if not self._is_restarting:
                 self._status.startTime = time.time()
 
-            # Write it out, then let `resolved` go out of scope
-            self._tmpfile = await self._write_task_file(resolved)
-            del resolved
+            if not scoped:
+                # Legacy single-process path (unchanged): `result` is the flattened document.
+                self._check_pipeline(result)
+                self._tmpfile = await self._write_task_file(result)
+                del resolved, result
+            else:
+                # Venv path. Spawn the children FIRST — main's `venv` client nodes dial them
+                # at beginInstance — then inject their live loopback URLs into the main
+                # document before writing the main task file. The shared bridge token rides
+                # an inherited env var (set here for main below, and for each child at spawn).
+                main_doc = result.environments['main']
+                self._check_pipeline(main_doc)
+                self._run_venv_token = secrets.token_urlsafe(32)
+                port_by_env = await self._spawn_venv_children(result, self._run_venv_token)
+                inject_venv_urls(main_doc.get('components', []), port_by_env)
+                self._tmpfile = await self._write_task_file(main_doc)
+                # Drop the PartitionResult (every in-memory sub-document carries resolved
+                # secrets) once all task files are written, mirroring the flatten path.
+                del resolved, result, main_doc
 
             # Setup the first part of the command line args
             # --autoterm: exit when parent dies (stdin closes)
@@ -2169,6 +2388,11 @@ class Task(DAPBase):
             # _build_subprocess_env additionally scrubs the RocketRide DB
             # broker credentials and injects the resolved per-tenant DSN.
             subprocess_env = await self._build_subprocess_env()
+
+            # Share the per-run bridge token with the main engine so its venv client nodes
+            # present it to the children (inherited env, never argv/disk; §4.5).
+            if self._run_venv_token:
+                subprocess_env[VENV_TOKEN_ENV] = self._run_venv_token
 
             # avoidMocks: strip ROCKETRIDE_MOCK so node.py loads real libraries
             if self._pipeline.get('avoidMocks'):

@@ -282,9 +282,21 @@ class IInstance(IInstanceBase):
             lanes.decode(self.instance, lane, data, header or {})
 
     def _encode_and_send(self, lane: str, *write_args):
-        """Serialize a ``write*`` call via the table and ship it over the bridge."""
+        """Serialize a ``write*`` call via the table, ship it over the bridge, and suppress
+        the engine's default downstream propagation.
+
+        Both bridge roles the engine data-drives ship a data lane over the socket with the
+        synchronous request/response ack protocol (``callRemote``): the main round-trip node
+        sends the forward stream, the child return egress sends the stream back. Neither may
+        ALSO let the engine forward the same lane to the next local filter -- the main node
+        would leak the forward stream into its return consumer, and the child egress is
+        terminal -- so after the round-trip we ``preventDefault`` to drop the default write.
+        The return values the peer sends back on the ack channel re-enter through
+        ``callRemote``'s receive loop (``callLocal`` -> ``self.instance.write*``), downstream.
+        """
         header_extra, payload = lanes.encode(lane, *write_args)
         self.callRemote(lane, payload, header_extra)
+        self.preventDefault()
 
     # -------------------------------------------------------------------------
     # Data-lane egress overrides (inherited by both the client and the server).
