@@ -237,27 +237,33 @@ and `groups` (each venv's `config.environment` block, for step-7/8 logging). The
   venv (a cross-boundary invoke into it was missed; an intra-venv invoke into it was wrongly rejected).
 - **Boundary channels, deduplicated per `(producer, lane, targetEnv)`.** Consumers in one target env
   share a single ingress; distinct target envs get distinct channels. Each channel gets a
-  `venv`/`venv_server` bridge pair and a `channelId = '{srcEnv}->{dstEnv}/{lane}/{producer}'` (1:1 with
-  the dedup key, so unique by construction; asserted, since it is the routing key). Node ids are the
-  role-based, sanitized `venv_egress--…` / `venv_ingress--…` (unique **per document**; the type prefix
-  would collide for venv→venv, where both ends are `venv_server`).
-- **Bridge placement (verified against the node code).** The `venv` client dials, `venv_server` listens,
-  so the child always holds `venv_server` and a `venv` client appears in main only when main is a genuine
-  endpoint. `main→venv`: client(main, from producer) + server(child, from stub); consumers repoint to the
-  server. `venv→main`: server(child, from producer) + client(main, input `[]`); main consumers repoint to
-  the client. `venv→venv`: `venv_server` in **both** children, **no node in main** — main byte-routes the
-  opaque frames (§4.6) and needs no codecs. Each child sub-document is seeded with a synthesized
-  `venv_source_stub` source (like `remote_source_stub`) that the ingress servers link to for reachability.
-  Unlike `remote`, child docs are NOT nested under the client config — they are separate `environments[]`
-  entries the orchestrator (step 7) spawns from.
+  `channelId = '{srcEnv}->{dstEnv}/{lane}/{producer}'` (1:1 with the dedup key, so unique by construction;
+  asserted, since it is the routing key) and role-based, sanitized `venv_egress--…` / `venv_ingress--…`
+  node ids (unique **per document**).
+- **Bridge placement — the round-trip splice (`remote` model; see step 7 for why).** A venv boundary is a
+  request/response splice of one object, so its forward and return channels are **paired** per env and the
+  return rides back over the forward socket. `_pair_boundaries` pairs each env's single `main→env` forward
+  channel with its optional `env→main` return channel. `main→env`: **one** round-trip `venv` node in main
+  reads the forward producer, and a `venv_server` ingress (from the child stub) applies the forward stream
+  in the child; the child's forward consumers repoint to that ingress. `env→main`: a `venv_server` egress
+  (from the venv producer) ships the return over the **same** socket, and main's return consumers repoint
+  to the paired round-trip node (its `deliverNode`) — there is **no** separate main ingress node, so the
+  spliced object is never re-opened. Each child sub-document is seeded with a synthesized
+  `venv_source_stub` resident source that the ingress links to for reachability; unlike `remote`, child
+  docs are NOT nested under the client config — they are separate `environments[]` entries the
+  orchestrator (step 7) spawns from. v1 supports the linear case only: `_pair_boundaries` rejects, with
+  named causes, `venv→venv` channels, multi-lane fan-in/out into one env, and `main→v1→v2→main` chains
+  (the general fan-in/out + venv→venv hub is step 8).
 - **Env-cycle detection over the quotient graph, main excluded.** Edges are `env_of(producer) →
   env_of(consumer)`, so venv→venv is a direct edge and routing through main is invisible; dropping main
-  accepts main-terminated chains (`main→V1→V2→main`) while still catching venv↔venv deadlocks. Rejected
-  with a named cause, like the other validations.
+  catches venv↔venv deadlocks without flagging main-terminated chains at this layer. Rejected with a named
+  cause, like the other validations. (Chains and any venv→venv edge are then rejected outright by the v1
+  `_pair_boundaries` linear-only check above; the cycle guard remains for the step-8 hub that will allow
+  them.)
 - **Extra scoped rejections:** a boundary edge on the non-bridgeable `words` lane; an implied
   (`Source`-mode) source or the document `source` field inside a venv; a base environment left with no
   components while a venv exists; a group whose id is literally `main`. The `scoped=False` path and the 19
-  increment-1 tests are unchanged; the cut adds `test_partition_cut.py` (31 tests). Deferred: §4.13's
+  increment-1 tests are unchanged; the cut adds `test_partition_cut.py` (32 tests). Deferred: §4.13's
   "all nodes in ONE venv → collapse" (a runnable all-in-one-venv doc cannot exist while source-in-venv is
   rejected, and honoring it only when scoped would make `=1` accept what `=0` rejects). The bridge nodes'
   live child URL/token are written at spawn (step 7).
@@ -1094,6 +1100,60 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
 7. **Local spawn + transport (v1 = WS-over-loopback unchanged):** spawn the venv child (its overlay) and
    point the existing `remote` WS bridge at it over loopback (Bearer token; raise the ~1 MB AV ceiling);
    main-orchestrator hub routing. No layer-2 swap in v1.
+   *Step 7 — **IMPLEMENTED, live round-trip verified**.* The child is a normal task
+   subprocess (mirrors `task_engine`'s engine spawn) whose source is a **resident** `venv_source_stub`
+   (`nodes/venv/source`, `classType: source`, `register: endpoint`): its `scanObjects` starts a
+   `WebServer` on `--data_port`, publishes `app.state.target`, mounts the new `ai/modules/venv` module
+   (`/venv/pipe`) and blocks for the run. Gating (`task_engine.py`, `_venv_scoping_enabled` →
+   `scoping_enabled(use_venv_mode(), has_isolated_group(doc))`, module-top `import venv_env`) branches to
+   `_spawn_venv_children`: assign a port, write the child task file, build the child env
+   (`ROCKETRIDE_CLIENT_ID` + per-run `ROCKETRIDE_VENV_TOKEN` + `ROCKETRIDE_VENV_SITE` via `venv_env` when
+   the overlay exists), `create_subprocess_exec` with `--autoterm`, drain stdio, and TCP-probe readiness —
+   all children up before the main engine, whose `venv` nodes dial them. The token rides the inherited env
+   (§4.5), never the config. Teardown (`_terminated`, universal exit path): two-phase `terminate→kill→wait`
+   per child + `release_port` + remove task file; children are resident and never self-stop.
+
+   **Startup-failure handling (verified).** A main-engine error surfaces exactly as under `=0` (its spawn
+   path is unchanged). A child that fails readiness fails the run synchronously (the `use()` call raises →
+   the canvas shows it) with a message that **names the venv and quotes the child's own output** (a ring
+   buffer of its last stdio lines), so the child engine's real error (a validate failure, a dependency
+   conflict) is visible, not just an exit code. The failing child cleans up itself in `_spawn_one_venv_child`
+   (kill+reap + cancel drains + drop its task file) — it is not yet registered for `_teardown_venv_children`,
+   and a *hung* one would otherwise survive until server death (its stdin stays open, so `--autoterm` never
+   fires); already-spawned siblings are killed by `_terminated`. Live-verified: a bogus-provider child left
+   **no orphan `engine.exe`** and surfaced its `>ERR*InvalidParam…` to the caller. Richer per-child
+   monitor/trace fan-in (beyond the stdio tail) is step 8.
+
+   **Return-path architecture — the `remote` request/response model (decisive).** The venv boundary is a
+   request/response *splice of one object*, and the engine allows exactly one open object per pipe stack,
+   entered at the root (`pipe.instance.cpp`) — so an async re-injection of the return on a *separate*
+   channel cannot open the already-open forward object, and the SDK's `send()` awaits the *forward* pipe's
+   `close` (correlated by DAP `pipe_id`/`request_seq`, not `objectId`, `data_conn.py`), so a fresh return
+   pipe cannot reach it either. The return therefore rides back over the **forward** socket and re-enters
+   main through the **same** node that sent it — exactly how `remote` works. A linear `main→venv→main`
+   boundary is spliced with **one** main-side round-trip `venv` node (`producer→venv→consumer`): `open`/
+   `closing`/`close` are `callRemote`-forwarded and returned normally so the engine also propagates the
+   framing to the downstream consumer (the object opens/closes once); forward `write*` are `callRemote`-ed
+   and `preventDefault`-ed (the forward stream does not leak downstream); the venv's return arrives
+   interleaved on `callRemote`'s ack channel and is applied downstream via `callLocal → self.instance.write*`
+   on the already-open object. The child runs a forward `venv_server` ingress (`handleWebSocket` accept
+   loop) and a return `venv_server` egress (engine-driven `write*` → `callRemote` back), which
+   `/venv/pipe` binds to **one** socket (dialled `?channel=<forward>&return=<return>`); the egress's
+   `callRemote` nests inside the ingress loop's `callLocal`, one thread, no second loop. This dissolves the
+   earlier Blocker B (no input-less main ingress, no synthetic `control` edge) and Gap C (no async receive
+   pump, no separate return socket). (Blocker D still applies: `venv_source_stub` is a registered resident
+   source — a no-op source exits before WS data arrives — and both `venv_server` and the round-trip `venv`
+   node carry a passthrough `lanes` map so the child ingress and the mid-chain round-trip node pass the
+   task-file `validate()` lane-linking.) v1 rejects, with named causes, venv→venv channels, multi-lane
+   fan-in/out into one venv, and `main→v1→v2→main` chains (all step-8 hub).
+
+   **Live proof (`ROCKETRIDE_SERVER_USE_VENV=1`, `webhook → [isolated group: text_revert] → response`):**
+   sending `"hello"` spawns the resident child, dials one Bearer-authenticated socket, crosses
+   main→child, `text_revert` reverses in the child, the return crosses child→main over the same socket, and
+   the SDK `send()` result carries `text: ["olleh\n\n"]` on the forward object. Regression: `=0` flattens
+   in-process (same `"olleh"`, **no child spawned**). `builder ai:test`: 1449 passed / 122 skipped.
+   Orphan-safe binding, N-child metric/monitor fan-in, the general fan-in/out + venv→venv hub, and
+   response/failure merge-back for a `response` node *inside* a venv remain step 8.
 8. **Orchestrator** (`task_engine.py`): N children/run (sibling lifetime), channel wiring, readiness,
    teardown-with-run, response/failure merge-back, monitor/trace/SSE fan-in, **metric aggregation across
    child PIDs**, orphan-safe binding (OS process-tree: Windows Job Objects / Unix process groups),
