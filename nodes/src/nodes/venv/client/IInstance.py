@@ -21,9 +21,10 @@
 # SOFTWARE.
 # =============================================================================
 
+from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect
 
-from rocketlib import Entry
+from rocketlib import Entry, Lvl, debug
 
 from .IGlobal import IGlobal
 from ..base import IInstanceBase
@@ -37,10 +38,12 @@ class IInstance(IInstanceBase):
     forks -- so the whole boundary rides one socket with the ``remote`` request/response
     protocol (``callRemote``), and the object is never re-opened on the main pipe:
 
-    - **Framing** (``open``/``closing``/``close``): sent forward via ``callRemote`` and then
+    - **Framing** (``open`` + a single ``close``): sent forward via ``callRemote`` and then
       returned normally, so the engine's default *also* propagates the framing to the
       downstream consumer -- the same object opens/closes on both this node and, e.g., a
-      ``response`` node, once.
+      ``response`` node, once. A bridge never sends ``closing``: the child's ``pipe.close()``
+      already runs the closing pass and then the close pass, so a second frame would flush
+      every node in the child twice (see ``closing`` below).
     - **Forward data** (inherited ``write*``): sent forward via ``callRemote`` and
       ``preventDefault``-ed so the forward stream does not leak into the downstream consumer.
     - **Return data**: the venv's output arrives interleaved on ``callRemote``'s ack channel
@@ -70,7 +73,40 @@ class IInstance(IInstanceBase):
         self.callRemote('open', data)
 
     def closing(self):
-        self.callRemote('closing')
+        """Drive the child's entire lifecycle end with the one ``close`` round-trip.
+
+        The engine's ``pipe.close()`` already runs the closing pass and *then* the close pass
+        (``pipe.instance.cpp``: ``Parent::closing()`` followed by ``Parent::close()``) -- which is
+        why the client drives a pipe with ``pipe.close()`` alone (``data_conn.close_sync``). Sending
+        a ``closing`` frame as well would run the closing pass twice in the child, so every node
+        there would flush twice.
+
+        The frame goes out from ``closing()`` and not from ``close()`` so the venv's return data
+        reaches main's downstream nodes *before* their own ``closing()``: framing is bound per edge
+        and a node's Python ``closing()`` runs before ``Parent::closing()`` hands off to its
+        consumers, so a producer always closes ahead of everything it feeds.
+        """
+        try:
+            self.callRemote('close')
+
+        except ConnectionClosed:
+            # The child tore the socket down before this frame: it died during the data phase, so
+            # its error already crossed the boundary and failed this object. Letting the now
+            # meaningless close frame raise would abort main's closing pass at the first error and
+            # rob the downstream nodes of their flush. A dead socket under a *clean* object is a
+            # child that died with nothing reported, so that still propagates.
+            currentObject = self.instance.currentObject
+            if currentObject is None or not currentObject.objectFailed:
+                raise
+
+            debug(
+                Lvl.Remoting,
+                'venv child closed the connection before its close frame; the object already '
+                'carries the child failure, so main keeps closing',
+            )
 
     def close(self):
-        self.callRemote('close')
+        # Deliberately inert: `closing()` already drove the child's full close over the single
+        # round-trip. The engine calls `Parent::close()` after this returns, so main's own framing
+        # still propagates downstream exactly as before.
+        pass

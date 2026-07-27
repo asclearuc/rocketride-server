@@ -1,0 +1,55 @@
+{
+	//
+	// Required:
+	//		The displayable name of this node
+	//
+	"title": "Text Revert",
+	//
+	// Required:
+	//		The protocol; the logical type (`text_revert`) is derived from it and is the
+	//		`provider` used in a pipeline document.
+	//
+	"protocol": "text_revert://",
+	//
+	// Required:
+	//		Class type of the node - a text filter.
+	//
+	"classType": ["text"],
+	//
+	// Required:
+	//		No special capabilities.
+	//
+	"capabilities": [],
+	//
+	// Optional:
+	//		Description of this driver.
+	//
+	"description": ["A trivial text filter that emits the character-reversed text (hello -> olleh). Used to give the virtual-environment round-trip a deterministic, verifiable payload."],
+	//
+	// Optional:
+	//		Register a python filter factory for this node.
+	//
+	"register": "filter",
+	//
+	// Optional:
+	//		The node is a python node.
+	//
+	"node": "python",
+	//
+	// Optional:
+	//		The python package implementing the node.
+	//
+	"path": "nodes.text_revert",
+	//
+	// Required:
+	//		The prefix map when added/removed when converting URLs <=> paths.
+	//
+	"prefix": "text_revert",
+	//
+	//	Optional:
+	//		Consumes text, produces text.
+	//
+	"lanes": {
+		"text": ["text"]
+	}
+}
