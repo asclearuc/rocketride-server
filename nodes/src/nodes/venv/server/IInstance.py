@@ -23,7 +23,7 @@
 
 from fastapi import WebSocket
 
-from rocketlib import APERR, Ec
+from rocketlib import APERR, Ec, error
 
 from .IGlobal import IGlobal
 from ..base import IInstanceBase
@@ -58,14 +58,33 @@ class IInstance(IInstanceBase):
             # Receive the next call from the bridged pipeline
             lane, data, header = self._recv()
 
+            if lane == 'open':
+                # Start of a new object: forget the previous one before anything can ship it.
+                # The base replaces `_obj` only *after* its type-check and `data['url']` access, so
+                # a malformed open frame would otherwise leave the previous entry in place and the
+                # except-branch below would merge that stale object into this one's error path.
+                self._obj = None
+                self._entryMerged = False
+
             try:
                 # Send it to the local pipeline
                 self.callLocal(lane, data, header)
+
+                # The object is finished: ship its entry home before acking, so main can fold the
+                # response and the failure into the object the client actually reads (§4.12).
+                if lane == 'close':
+                    self._mergeBackEntry()
 
                 # Send the success signal to the bridged pipeline
                 self._send('error', APERR().toDict())
 
             except Exception as e:
+                # Ship the entry on *any* failing lane, not just `close`. A node that raises during
+                # the data phase kills this loop, so the `close` frame never arrives -- a close-only
+                # hook would merge nothing and main would report the wrapped RemoteException
+                # instead of the child's own error.
+                self._mergeBackEntry()
+
                 # Determine whether this error originated from the far side.
                 # If so, propagate the original error code; otherwise wrap it as
                 # a new RemoteException so the far side sees what went wrong.
@@ -76,5 +95,46 @@ class IInstance(IInstanceBase):
 
                 raise
 
+    def _mergeBackEntry(self):
+        """Ship this object's entry to main so its response and failure are not lost (§4.12).
+
+        A ``response``/``end`` node inside a venv writes into the **child's** entry, which no
+        client ever reads -- ``data_conn.close_sync`` only ever reads main's root entry. This is
+        the frame that carries it home; main folds it into the object the client awaits.
+
+        Read from ``self._obj``, not ``self.instance.currentObject``: by the time the object is
+        closed ``cb_close`` has set ``pyCurrentEntry`` to ``None`` and cleared ``currentEntry``.
+        ``self._obj`` is the Python-held ``Entry`` the base keeps alive, and ``cb_open`` binds the
+        engine to it by reference, so the child's ``response`` node wrote into that very object.
+
+        Never raises: it runs on the failure path too, where an exception here would replace the
+        original one on its way to the caller's error ack.
+        """
+        try:
+            if self._entryMerged or self._obj is None:
+                return
+
+            payload = self._obj.toDict()
+            objectFailed = self._obj.objectFailed
+
+            # Nothing to contribute: stay off the wire entirely, so a venv without a `response`
+            # node that simply succeeds behaves exactly as it did before merge-back existed.
+            # Gate on the response, NOT on the payload: `toDict` always emits at least `name`
+            # (it falls back to the url's filename), so a payload emptiness check would never fire.
+            if not payload.get('response') and not objectFailed:
+                return
+
+            payload['objectFailed'] = objectFailed
+            payload['completionError'] = self._obj.completionError
+
+            self._entryMerged = True
+            self.callRemote('entry', payload)
+
+        except Exception as e:
+            error(e)
+
     # Shared global reference and socket state
     IGlobal: IGlobal = None
+
+    # One `entry` frame per object; reset when the next `open` arrives.
+    _entryMerged: bool = False
