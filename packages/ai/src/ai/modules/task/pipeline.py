@@ -317,15 +317,21 @@ def _validate_source_placement(
 
 def _collect_channels(
     components: List[Dict[str, Any]], env_of: Dict[str, str]
-) -> Tuple['OrderedDict[Tuple[str, str, str], Dict[str, Any]]', List[Tuple[Dict[str, Any], Tuple[str, str, str]]]]:
-    """Classify boundary edges into channels, deduped per ``(producer, lane, targetEnv)``.
+) -> Tuple['OrderedDict[Tuple[str, str], Dict[str, Any]]', List[Tuple[Dict[str, Any], Tuple[str, str]]]]:
+    """Classify boundary edges into one channel per environment pair ``(sourceEnv, targetEnv)``.
 
-    Returns the channels in first-encounter order and the ``(edge, key)`` pairs to repoint
-    once ingress ids exist. An unknown ``from`` stays a dangling edge (as today); a boundary
-    edge on a non-bridgeable lane is rejected.
+    A single bridge node carries a whole boundary (all its lanes) over one socket -- the child
+    runs one pipe stack, so a venv boundary is one connection, and the frame ``lane`` header
+    demuxes the lanes to their consumers (§1.2, Arch-1). Each lane in a channel therefore has
+    exactly **one** producer: a node's ``write*`` carries no producer identity, so two same-lane
+    producers on one boundary cannot be told apart downstream and are rejected. Multiple
+    consumers of a lane (in-venv fan-out) are fine.
+
+    Returns the channels in first-encounter order and the ``(edge, key)`` pairs to repoint once
+    ingress ids exist. An unknown ``from`` stays a dangling edge; a non-bridgeable lane is rejected.
     """
-    channels: 'OrderedDict[Tuple[str, str, str], Dict[str, Any]]' = OrderedDict()
-    edge_rewrites: List[Tuple[Dict[str, Any], Tuple[str, str, str]]] = []
+    channels: 'OrderedDict[Tuple[str, str], Dict[str, Any]]' = OrderedDict()
+    edge_rewrites: List[Tuple[Dict[str, Any], Tuple[str, str]]] = []
     for component, _ in walk_components(components):
         if is_container(component):
             continue
@@ -343,19 +349,23 @@ def _collect_channels(
                 raise ValueError(
                     f'Boundary edge on lane "{lane}" from "{producer}" to "{consumer_id}" crosses a virtual environment boundary, but "{lane}" is not bridgeable'
                 )
-            key = (producer, lane, target_env)
+            key = (source_env, target_env)
             channel = channels.get(key)
             if channel is None:
-                channel = {
-                    'lane': lane,
-                    'sourceEnv': source_env,
-                    'targetEnv': target_env,
-                    'producer': producer,
-                    'consumers': [],
-                }
+                channel = {'sourceEnv': source_env, 'targetEnv': target_env, 'lanes': OrderedDict()}
                 channels[key] = channel
-            if consumer_id not in channel['consumers']:
-                channel['consumers'].append(consumer_id)
+            lane_info = channel['lanes'].get(lane)
+            if lane_info is None:
+                lane_info = {'producer': producer, 'consumers': []}
+                channel['lanes'][lane] = lane_info
+            elif lane_info['producer'] != producer:
+                raise ValueError(
+                    f'Environment boundary "{source_env}" -> "{target_env}" carries lane "{lane}" from '
+                    f'more than one producer ("{lane_info["producer"]}" and "{producer}"); a single bridge '
+                    'node cannot tell same-lane producers apart, so this shape is not supported yet'
+                )
+            if consumer_id not in lane_info['consumers']:
+                lane_info['consumers'].append(consumer_id)
             edge_rewrites.append((edge, key))
     return channels, edge_rewrites
 
@@ -381,27 +391,28 @@ def _reject_env_cycles(channels: 'OrderedDict[Tuple[str, str, str], Dict[str, An
 
 
 def _assign_channel_ids(
-    channels: 'OrderedDict[Tuple[str, str, str], Dict[str, Any]]',
+    channels: 'OrderedDict[Tuple[str, str], Dict[str, Any]]',
     buckets: 'OrderedDict[str, List[Dict[str, Any]]]',
     venv_envs: List[str],
 ) -> Dict[str, str]:
     """Assign each channel its ``channelId`` and bridge node ids; return per-child stub ids.
 
-    Node ids are unique **within their own document** (main and each child are separate
-    docs); ``channelId`` is the global routing key and must not collide.
+    One channel per environment pair, so ``channelId`` is ``{sourceEnv}->{targetEnv}``. Node ids
+    are unique **within their own document** (main and each child are separate docs); the
+    ``channelId`` is the global routing key and must not collide (only possible if an env id
+    itself contains ``->``).
     """
     taken: Dict[str, set] = {env: {leaf.get('id') for leaf in leaves} for env, leaves in buckets.items()}
     stub_ids = {env: _unique_id(VENV_SOURCE_STUB_ID, taken[env]) for env in venv_envs}
 
     seen_channel_ids: set = set()
-    for (producer, lane, target_env), channel in channels.items():
-        source_env = channel['sourceEnv']
-        channel_id = f'{source_env}->{target_env}/{lane}/{producer}'
+    for (source_env, target_env), channel in channels.items():
+        channel_id = f'{source_env}->{target_env}'
         if channel_id in seen_channel_ids:
-            raise ValueError(f'Duplicate channelId "{channel_id}"; component ids must not contain "->" or "/"')
+            raise ValueError(f'Duplicate channelId "{channel_id}"; environment ids must not contain "->"')
         seen_channel_ids.add(channel_id)
         channel['channelId'] = channel_id
-        parts = '--'.join(_sanitize_id_part(p) for p in (source_env, target_env, lane, producer))
+        parts = '--'.join(_sanitize_id_part(p) for p in (source_env, target_env))
         channel['egressNode'] = _unique_id(f'venv_egress--{parts}', taken[source_env])
         channel['ingressNode'] = _unique_id(f'venv_ingress--{parts}', taken[target_env])
     return stub_ids
@@ -410,40 +421,40 @@ def _assign_channel_ids(
 def _bridge_config(channel: Dict[str, Any]) -> Dict[str, Any]:
     """The bridge node's config; child URL/token are filled at spawn (step 7).
 
-    A forward channel (``main -> env``) that is paired with a return channel additionally
-    carries the return channel's id/lane: its main-side node is a **round-trip** ``venv``
-    node that both sends the forward stream and delivers the return downstream, so the
-    spawn injection dials one socket carrying both directions (``?channel=..&return=..``).
+    One channel carries a whole boundary (all its ``lanes``) over one socket. A forward channel
+    (``main -> env``) that is paired with a return channel additionally carries the return
+    channel's id and lanes: its main-side node is a **round-trip** ``venv`` node that both sends
+    the forward stream and delivers the return downstream, so the spawn injection dials one
+    socket carrying both directions (``?channel=..&return=..``).
     """
     config = {
         'channelId': channel['channelId'],
-        'lane': channel['lane'],
         'sourceEnv': channel['sourceEnv'],
         'targetEnv': channel['targetEnv'],
+        'lanes': list(channel['lanes'].keys()),
     }
     ret = channel.get('returnChannel')
     if ret is not None:
         config['returnChannelId'] = ret['channelId']
-        config['returnLane'] = ret['lane']
+        config['returnLanes'] = list(ret['lanes'].keys())
     return config
 
 
-def _pair_boundaries(channels: 'OrderedDict[Tuple[str, str, str], Dict[str, Any]]') -> None:
-    """Pair each venv env's forward (``main -> env``) and return (``env -> main``) channel
-    for the round-trip bridge model, and reject shapes v1 does not support (step 8).
+def _pair_boundaries(channels: 'OrderedDict[Tuple[str, str], Dict[str, Any]]') -> None:
+    """Pair each venv's forward (``main -> env``) and return (``env -> main``) channel for the
+    round-trip bridge model, and reject shapes v1 does not support (step 8.3).
 
-    The venv boundary is a request/response splice of one object: the object never forks,
-    so the return must ride back over the **forward** socket and re-enter main through the
-    **same** node that sent it (the engine allows one open object per pipe stack, entered
-    at the root -- a separate async re-injection cannot open the already-open object). v1
-    therefore supports the linear ``main -> venv -> main`` splice only: each venv env has
-    exactly one forward channel from main and at most one return channel to main. Direct
-    ``venv <-> venv`` channels and multi-lane fan-in/out to a single env need the step-8
-    byte-router and are rejected here with a named cause.
+    The venv boundary is a request/response splice of one object: the object never forks, so the
+    return must ride back over the **forward** socket and re-enter main through the **same** node
+    that sent it (the engine allows one open object per pipe stack, entered at the root -- a
+    separate async re-injection cannot open the already-open object). Channels are keyed per
+    environment pair, so each venv has at most one forward and one return channel, each carrying
+    all its lanes over one socket (§1.2, Arch-1). Direct ``venv <-> venv`` channels need the
+    step-8.3 graph-serialization rewrite and are rejected here with a named cause.
 
-    Mutates the channels in place: sets ``returnChannel`` on each paired forward channel,
-    and points each return channel's ``deliverNode``/``ingressNode`` at the round-trip node
-    (the forward egress) that delivers it.
+    Mutates the channels in place: sets ``returnChannel`` on the paired forward channel, and
+    points the return channel's ``deliverNode``/``ingressNode`` at the round-trip node (the
+    forward egress) that delivers it.
     """
     forward_by_env: Dict[str, Dict[str, Any]] = {}
     return_by_env: Dict[str, Dict[str, Any]] = {}
@@ -455,18 +466,8 @@ def _pair_boundaries(channels: 'OrderedDict[Tuple[str, str, str], Dict[str, Any]
                 f'"{src}" and "{dst}"; venv-to-venv routing is not supported yet'
             )
         if src == MAIN_ENV:
-            if dst in forward_by_env:
-                raise ValueError(
-                    f'Virtual environment "{dst}" receives more than one lane from main; '
-                    'multi-lane fan-in into one venv is not supported yet'
-                )
-            forward_by_env[dst] = channel
+            forward_by_env[dst] = channel  # exactly one per target env by (src, dst) keying
         else:
-            if src in return_by_env:
-                raise ValueError(
-                    f'Virtual environment "{src}" returns more than one lane to main; '
-                    'multi-lane fan-out from one venv is not supported yet'
-                )
             return_by_env[src] = channel
 
     for env, ret in return_by_env.items():
@@ -475,8 +476,8 @@ def _pair_boundaries(channels: 'OrderedDict[Tuple[str, str, str], Dict[str, Any]
             raise ValueError(f'Virtual environment "{env}" returns to main but is not fed from main')
         forward['returnChannel'] = ret
         # The round-trip node (the forward egress) both sends into the venv and delivers its
-        # return downstream, so return consumers read from it and its routing entry points
-        # there rather than at a now-absent main ingress node.
+        # return downstream, so return consumers read from it and its routing entry points there
+        # rather than at a now-absent main ingress node.
         ret['deliverNode'] = forward['egressNode']
         ret['ingressNode'] = forward['egressNode']
 
@@ -503,13 +504,15 @@ def _synthesize_bridges(
     bridge_nodes: Dict[str, List[Dict[str, Any]]] = {env: [] for env in buckets}
     for channel in channels.values():
         src, dst = channel['sourceEnv'], channel['targetEnv']
+        # One input edge per lane, each from that lane's single producer.
+        producer_edges = [{'lane': lane, 'from': info['producer']} for lane, info in channel['lanes'].items()]
         if src == MAIN_ENV:
             # Forward channel: round-trip node in main + ingress in the child.
             bridge_nodes[MAIN_ENV].append(
                 {
                     'id': channel['egressNode'],
                     'provider': 'venv',
-                    'input': [{'lane': channel['lane'], 'from': channel['producer']}],
+                    'input': producer_edges,
                     'config': _bridge_config(channel),
                 }
             )
@@ -517,7 +520,7 @@ def _synthesize_bridges(
                 {
                     'id': channel['ingressNode'],
                     'provider': 'venv_server',
-                    'input': [{'lane': channel['lane'], 'from': stub_ids[dst]}],
+                    'input': [{'lane': lane, 'from': stub_ids[dst]} for lane in channel['lanes']],
                     'config': _bridge_config(channel),
                 }
             )
@@ -528,7 +531,7 @@ def _synthesize_bridges(
                 {
                     'id': channel['egressNode'],
                     'provider': 'venv_server',
-                    'input': [{'lane': channel['lane'], 'from': channel['producer']}],
+                    'input': producer_edges,
                     'config': _bridge_config(channel),
                 }
             )
@@ -567,16 +570,16 @@ def _assemble_documents(
     return environments
 
 
-def _routing_table(channels: 'OrderedDict[Tuple[str, str, str], Dict[str, Any]]') -> List[Dict[str, Any]]:
-    """One routing entry per channel, keyed by ``channelId`` for the step-8 byte router."""
+def _routing_table(channels: 'OrderedDict[Tuple[str, str], Dict[str, Any]]') -> List[Dict[str, Any]]:
+    """One routing entry per environment-pair channel, keyed by ``channelId``."""
     return [
         {
             'channelId': channel['channelId'],
-            'lane': channel['lane'],
             'sourceEnv': channel['sourceEnv'],
             'targetEnv': channel['targetEnv'],
-            'producer': channel['producer'],
-            'consumers': list(channel['consumers']),
+            'lanes': list(channel['lanes'].keys()),
+            'producers': {lane: info['producer'] for lane, info in channel['lanes'].items()},
+            'consumers': {lane: list(info['consumers']) for lane, info in channel['lanes'].items()},
             'egressNode': channel['egressNode'],
             'ingressNode': channel['ingressNode'],
         }

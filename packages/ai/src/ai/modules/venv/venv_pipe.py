@@ -41,12 +41,13 @@ async def venv_pipe(webSocket: WebSocket):
     stack (``app.state.target`` -- the DATA module's mechanism, not an ``ILoader``):
 
     - the **ingress** (matched by ``channel``) is serviced by its ``handleWebSocket`` accept
-      loop, applying the forward stream to the local pipeline;
+      loop, applying the forward stream (all its lanes) to the local pipeline;
     - the **egress** (matched by ``return``) has the same socket bound to it, so the engine
-      driving its ``write*`` ships the venv's output back over this one connection (its
-      ``callRemote`` nests inside the ingress loop's ``callLocal``).
+      driving its ``write*`` ships the venv's output (all its return lanes) back over this one
+      connection (its ``callRemote`` nests inside the ingress loop's ``callLocal``).
 
-    One socket carries both directions, so the spliced object is never re-opened on main.
+    One socket carries both directions and all lanes, so the spliced object is never re-opened
+    on main.
     """
     # §4.5: reject unauthenticated connections BEFORE completing the handshake. A bad/absent
     # token closes with 1008 (policy violation) so no socket is ever serviced.
@@ -74,7 +75,7 @@ async def venv_pipe(webSocket: WebSocket):
         in_instance = in_node.pyInstance
 
         # A boundary that returns data binds the SAME socket to its egress node, so the
-        # engine-driven return write* ship back over this one connection.
+        # engine-driven return write* (all its lanes) ship back over this one connection.
         if return_id:
             out_node = _find_venv_server(pipe, return_id)
             if out_node is None:
