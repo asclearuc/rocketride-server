@@ -71,10 +71,13 @@ over the WebSocket when the lane is listed in `input`:
 | `words` | string list | `writeWords` -- only if `words` is in `input` |
 | `documents` | document list | `writeDocuments` -- only if `documents` is in `input` |
 
-Lifecycle calls `open`, `closing`, and `close` are always forwarded so the remote
-pipeline tracks the local object lifecycle. Responses from the remote pipeline
-(`writeText`, `writeDocuments`, etc.) are dispatched back into the local pipeline as
-they arrive.
+Lifecycle is forwarded as `open` and a single `close`, so the remote pipeline tracks the
+local object lifecycle. The `close` frame is sent from the client's `closing()` -- the
+engine's `pipe.close()` already runs the closing pass and *then* the close pass, so a
+separate `closing` frame would drive the remote closing pass twice. A received `closing`
+frame is ignored rather than rejected, so an older client that still sends both frames
+keeps working. Responses from the remote pipeline (`writeText`, `writeDocuments`, etc.)
+are dispatched back into the local pipeline as they arrive.
 
 ### Fields
 
