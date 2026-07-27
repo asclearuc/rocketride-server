@@ -55,12 +55,38 @@ import nest_asyncio
 from fastapi import WebSocket as ServerConnection
 from websockets.sync.client import ClientConnection
 
-from rocketlib import APERR, Ec, Entry, IInstanceBase
+from rocketlib import APERR, Ec, Entry, IInstanceBase, Lvl, debug, error
 
-from . import lanes
+from . import lanes, merge
 
 # Enable running the async coroutines in a synchronous context
 nest_asyncio.apply()
+
+
+def _ecFromCode(code):
+    """Rebuild an engine error code from the child's integer, falling back to ``Ec.Failed``.
+
+    A ``try``/``except`` alone is not enough. Verified against the shipped engine: an unknown
+    *positive* value yields a nameless ``Ec.???`` rather than raising -- only a negative or a
+    non-integer raises -- so the constructed value has to be checked by name.
+    """
+    try:
+        ec = type(Ec.NoErr)(code)
+    except Exception:
+        return Ec.Failed
+
+    return Ec.Failed if '?' in str(ec) else ec
+
+
+def _childErrorMessage(childError: dict) -> str:
+    """The child's message with its own source location folded in.
+
+    Only the fallback path needs this: ``completionCode`` builds its ``APERR`` inside the binding,
+    so the structured ``file``/``line``/``function`` would point at ``bindings.cpp`` instead of the
+    node that actually failed. The decoration path keeps them intact and leaves the message alone.
+    """
+    origin = '{}:{} {}'.format(childError.get('file'), childError.get('line'), childError.get('function'))
+    return '{} (in venv at {})'.format(childError.get('message'), origin)
 
 
 class IInstance(IInstanceBase):
@@ -223,6 +249,11 @@ class IInstance(IInstanceBase):
                 # Check if the bridged pipeline completed the call and returned an error code.
                 if rspLane == 'error':
                     ccode = APERR.fromDict(rspData)
+                    if ccode.ec != Ec.NoErr:
+                        # Only on a real error: this branch is also the *success* terminator, and
+                        # decorating there would consume the stash on a clean ack and silently
+                        # disable the fallback that exists for a child which fails without raising.
+                        self._decorateWithChildFailure(ccode)
                     ccode.check_raise()
                     break
 
@@ -281,10 +312,124 @@ class IInstance(IInstanceBase):
 
             self.instance.pipe.close()
 
+        elif lane == 'entry':
+            # Merge-back (§4.12). NOT a `lanes.py` entry on purpose: this is our own frame, not an
+            # engine lane, and it must never become bindable.
+            #
+            # It lives in the base rather than the client subclass so it recurses for free: in a
+            # chain (main->v1->v2) the mid-process bridge folds v2's entry into v1's with this same
+            # code, and v1's egress then carries the merged result upward at its own close.
+            self._applyChildEntry(data)
+
         else:
             # Every data lane -- including `words`, which raises LaneNotBridgeable --
             # is dispatched from the single table.
             lanes.decode(self.instance, lane, data, header or {})
+
+    # -------------------------------------------------------------------------
+    # Merge-back (§4.12): fold a child's entry into this side's object
+    # -------------------------------------------------------------------------
+    def _applyChildEntry(self, data):
+        """Apply a child's ``entry`` frame to the local object. Never raises.
+
+        Two halves land differently. The **response** is merged here and now. The **failure** is
+        only *stashed*: the child's provenance rides home on a ``__formatted`` decoration of the
+        exception the boundary already raises, which lets the engine reconstruct the child's exact
+        code and Python source location. ``_applyStashedChildFailure`` is the safety net for a
+        child that fails without raising.
+
+        Mirrors ``data_conn.close_sync``'s extract-despite-failure shape: whatever goes wrong here,
+        the caller must still ack, so nothing escapes.
+        """
+        try:
+            if not isinstance(data, dict):
+                raise TypeError(f'Unexpected data type {type(data)} for lane entry')
+
+            entry = self.instance.currentObject
+            if entry is None:
+                debug(Lvl.Remoting, 'venv merge-back: no open object on this side, dropping the child entry')
+                return
+
+            # Apply whitelist: the response only. The frame carries the child's whole entry so the
+            # whitelist can widen later without a wire change, but identity (objectId/instanceId/
+            # version/parentId) must never overwrite this side's.
+            childResponse = data.get('response') or {}
+            if childResponse:
+                merged = merge.merge_response(entry.response.toDict(), childResponse)
+                for key, value in merged.items():
+                    entry.response[key] = value
+
+            if data.get('objectFailed'):
+                self._childError = data.get('completionError')
+
+        except Exception as e:
+            error(e)
+
+    def _decorateWithChildFailure(self, ccode: APERR):
+        """Carry the child's code and Python source location home on the raised exception.
+
+        ``bindings.cpp`` tags engine errors raised into Python with ``__formatted`` plus
+        ``code``/``message``/``filename``/``function``/``line``, and ``call.hpp`` restores those
+        fields verbatim -- *before* it looks at an ``APERR``'s own ``ec``. Decorating the exception
+        the boundary already raises therefore hands the engine the child's real error, with no
+        reconstruction on our side.
+
+        This matters because the ``error`` lane cannot carry it: the child wraps whatever a node
+        raised into ``APERR(Ec.RemoteException, ...)``, so the ``entry`` frame is the only carrier
+        of the child's true code.
+
+        Consumes the stash, so the fallback does not also fire.
+        """
+        childError = self._childError
+        if not childError:
+            return
+
+        self._childError = None
+
+        # All five attributes or none: `call.hpp` reads them unconditionally, and a missing one
+        # makes the cast throw, which degrades to a generic exception -- worse than not decorating.
+        required = ('code', 'message', 'file', 'line', 'function')
+        if any(childError.get(key) is None for key in required):
+            debug(
+                Lvl.Remoting, f'venv merge-back: incomplete child error {childError}, leaving the boundary error as is'
+            )
+            return
+
+        # `__formatted` written inside a class body would be name-mangled to `_IInstance__formatted`
+        # and the engine's hasattr() would miss it -- so set it by name.
+        setattr(ccode, '__formatted', True)
+        setattr(ccode, 'code', childError['code'])
+        setattr(ccode, 'message', childError['message'])
+        setattr(ccode, 'filename', childError['file'])  # completionError exposes `file`
+        setattr(ccode, 'line', childError['line'])
+        setattr(ccode, 'function', childError['function'])
+
+    def _applyStashedChildFailure(self):
+        """Fallback for a child that failed *without* raising across the boundary.
+
+        A node can set a completion code and still return cleanly, so the child acks OK and this
+        side sees no exception to decorate. Applying the code here keeps that failure from
+        vanishing. Never raises.
+        """
+        childError = self._childError
+        if not childError:
+            return
+
+        self._childError = None
+
+        try:
+            entry = self.instance.currentObject
+            if entry is None or entry.objectFailed:
+                debug(
+                    Lvl.Remoting,
+                    f'venv merge-back: not applying the child failure, object already failed: {childError}',
+                )
+                return
+
+            entry.completionCode(_ecFromCode(childError.get('code')), _childErrorMessage(childError))
+
+        except Exception as e:
+            error(e)
 
     def _encode_and_send(self, lane: str, *write_args):
         """Serialize a ``write*`` call via the table, ship it over the bridge, and suppress
@@ -408,3 +553,7 @@ class IInstance(IInstanceBase):
 
     _webSocket: (ClientConnection, ServerConnection) = None
     _obj: Entry = None
+
+    # The child's `completionError`, held between the `entry` frame and whichever of the two
+    # failure paths consumes it -- exactly one of them must, or a run reports two different errors.
+    _childError: dict = None

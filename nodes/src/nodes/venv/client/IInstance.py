@@ -68,6 +68,12 @@ class IInstance(IInstanceBase):
         self.disconnect()
 
     def open(self, object: Entry):
+        # Drop any child failure left over from the previous object: the stash lives on this
+        # instance for the node's whole lifetime, and a stale one would decorate an unrelated
+        # error on this object. (The child-side one-shot flag resets in `handleWebSocket`'s
+        # `open` branch -- same idea, opposite side of the socket.)
+        self._childError = None
+
         data = object.toDict()
         data['url'] = object.url
         self.callRemote('open', data)
@@ -88,6 +94,10 @@ class IInstance(IInstanceBase):
         """
         try:
             self.callRemote('close')
+
+            # The round-trip came back clean, so no exception carried the child's failure home.
+            # If the child failed without raising, this is what keeps that from vanishing.
+            self._applyStashedChildFailure()
 
         except ConnectionClosed:
             # The child tore the socket down before this frame: it died during the data phase, so

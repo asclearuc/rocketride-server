@@ -1,0 +1,55 @@
+{
+	//
+	// Required:
+	//		The displayable name of this node
+	//
+	"title": "Text Fail",
+	//
+	// Required:
+	//		The protocol; the logical type (`text_fail`) is derived from it and is the
+	//		`provider` used in a pipeline document.
+	//
+	"protocol": "text_fail://",
+	//
+	// Required:
+	//		Class type of the node - a text filter.
+	//
+	"classType": ["text"],
+	//
+	// Required:
+	//		No special capabilities.
+	//
+	"capabilities": [],
+	//
+	// Optional:
+	//		Description of this driver.
+	//
+	"description": ["A text filter that always fails at closing. Used to give the virtual-environment merge-back a deterministic in-venv failure to carry back to the client."],
+	//
+	// Optional:
+	//		Register a python filter factory for this node.
+	//
+	"register": "filter",
+	//
+	// Optional:
+	//		The node is a python node.
+	//
+	"node": "python",
+	//
+	// Optional:
+	//		The python package implementing the node.
+	//
+	"path": "nodes.text_fail",
+	//
+	// Required:
+	//		The prefix map when added/removed when converting URLs <=> paths.
+	//
+	"prefix": "text_fail",
+	//
+	//	Optional:
+	//		Consumes text, produces text.
+	//
+	"lanes": {
+		"text": ["text"]
+	}
+}
