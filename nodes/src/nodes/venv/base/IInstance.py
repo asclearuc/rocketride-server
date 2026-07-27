@@ -248,9 +248,10 @@ class IInstance(IInstanceBase):
         """
         Send specified lane data to the local pipeline.
 
-        Framing lanes (open/closing/close) drive the object lifecycle through
-        ``self.instance.pipe.*``; every data lane is dispatched through the ``lanes``
-        table, which writes to ``self.instance.write*``.
+        Framing lanes drive the object lifecycle through ``self.instance.pipe.*``; every data
+        lane is dispatched through the ``lanes`` table, which writes to ``self.instance.write*``.
+        The framing pair is ``open``/``close`` only -- ``pipe.close()`` runs the closing pass and
+        then the close pass, so a ``closing`` frame would double the child's flush and is rejected.
         """
         if lane == 'open':
             if not isinstance(data, dict):
@@ -265,10 +266,14 @@ class IInstance(IInstanceBase):
             self.instance.pipe.open(self._obj)
 
         elif lane == 'closing':
-            if data is not None:
-                raise TypeError(f'Unexpected data {data} for lane {lane}')
-
-            self.instance.pipe.closing()
+            # A bridge drives the child's lifecycle end with `close` alone: `pipe.close()` runs the
+            # closing pass and then the close pass by itself. Honouring a `closing` frame as well
+            # would flush every node in the child twice, and silently -- so say so instead.
+            raise ValueError(
+                'Unexpected framing lane "closing": a venv bridge ends the child object with a '
+                'single "close" frame, because pipe.close() already runs the closing pass; '
+                'honouring this frame would run the closing pass of the child twice'
+            )
 
         elif lane == 'close':
             if data is not None:
