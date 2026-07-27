@@ -85,8 +85,8 @@ def build_child_env(
 def inject_venv_urls(main_components: List[Dict[str, Any]], port_by_env: Dict[str, int]) -> None:
     """Fill each main-side round-trip ``venv`` node's live loopback ``urlProcess`` (in place).
 
-    The partitioner leaves the bridge config as ``{channelId, lane, sourceEnv, targetEnv}``
-    (plus ``returnChannelId``/``returnLane`` when the venv returns data); at spawn the
+    The partitioner leaves the bridge config as ``{channelId, sourceEnv, targetEnv, lanes}``
+    (plus ``returnChannelId``/``returnLanes`` when the venv returns data); at spawn the
     orchestrator adds the child URL. The node dials the boundary's child (the ``main -> env``
     forward channel's target) on one socket that carries both directions: ``?channel=`` is the
     forward channel; ``&return=`` (when present) is the return channel the route binds the
