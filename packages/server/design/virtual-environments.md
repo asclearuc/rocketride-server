@@ -235,11 +235,14 @@ and `groups` (each venv's `config.environment` block, for step-7/8 logging). The
   inside a venv, or a venv nested inside a plain group (which becomes a top-level env), fall out of it.
   The transitive map also fixes two latent increment-1 bugs for a member of a plain group nested in a
   venv (a cross-boundary invoke into it was missed; an intra-venv invoke into it was wrongly rejected).
-- **Boundary channels, deduplicated per `(producer, lane, targetEnv)`.** Consumers in one target env
-  share a single ingress; distinct target envs get distinct channels. Each channel gets a
-  `channelId = '{srcEnv}->{dstEnv}/{lane}/{producer}'` (1:1 with the dedup key, so unique by construction;
-  asserted, since it is the routing key) and role-based, sanitized `venv_egress--…` / `venv_ingress--…`
-  node ids (unique **per document**).
+- **Boundary channels, one per `(sourceEnv, targetEnv)` pair** (step 8.1, Arch-1). A child runs one
+  pipe stack, so a whole boundary is **one** connection: a single bridge node carries every lane of
+  that boundary over one socket, and the frame's `lane` header demuxes to the consumers. Each lane in
+  a channel has exactly **one** producer — a node's `write*` carries no producer identity, so two
+  same-lane producers on one boundary cannot be told apart downstream and are rejected with a named
+  cause; multiple consumers of a lane (in-venv fan-out) are fine. `channelId = '{srcEnv}->{dstEnv}'`
+  (the routing key; collision is only possible if an env id itself contains `->`, which is rejected),
+  plus role-based, sanitized `venv_egress--…` / `venv_ingress--…` node ids (unique **per document**).
 - **Bridge placement — the round-trip splice (`remote` model; see step 7 for why).** A venv boundary is a
   request/response splice of one object, so its forward and return channels are **paired** per env and the
   return rides back over the forward socket. `_pair_boundaries` pairs each env's single `main→env` forward
@@ -251,9 +254,10 @@ and `groups` (each venv's `config.environment` block, for step-7/8 logging). The
   spliced object is never re-opened. Each child sub-document is seeded with a synthesized
   `venv_source_stub` resident source that the ingress links to for reachability; unlike `remote`, child
   docs are NOT nested under the client config — they are separate `environments[]` entries the
-  orchestrator (step 7) spawns from. v1 supports the linear case only: `_pair_boundaries` rejects, with
-  named causes, `venv→venv` channels, multi-lane fan-in/out into one env, and `main→v1→v2→main` chains
-  (the general fan-in/out + venv→venv hub is step 8).
+  orchestrator (step 7) spawns from. Multi-lane fan-in/out across a boundary **is** supported (step 8.1:
+  one channel per env pair carries all of its lanes on one socket). What v1 still rejects, with named
+  causes, is `venv→venv` channels, the same lane from two producers on one boundary, and
+  `main→v1→v2→main` chains (the venv→venv hub via graph serialization is step 8.3).
 - **Env-cycle detection over the quotient graph, main excluded.** Edges are `env_of(producer) →
   env_of(consumer)`, so venv→venv is a direct edge and routing through main is invisible; dropping main
   catches venv↔venv deadlocks without flagging main-terminated chains at this layer. Rejected with a named
@@ -355,7 +359,34 @@ the rejected `venvEgress`/`venvIngress` reinvention; it is a sibling of `remote`
   surface is symmetric — the client sends the forward stream, the server the return stream, the same 12
   methods over the same table — and both are placed **once in the base**, not duplicated per node as
   `remote` does. Client and server subclasses then carry only their lifecycle: the client adds `connect`
-  plus the framing overrides (`open`/`closing`/`close`), the server adds the `handleWebSocket` accept-loop.
+  plus the framing overrides, the server adds the `handleWebSocket` accept-loop.
+- **A bridge never calls `pipe.closing()`; the framing pair on the wire is `open` + `close`.** The
+  engine's `pipe.close()` runs the closing pass and *then* the close pass
+  (`pipe.instance.cpp`: `Parent::closing()` followed by `Parent::close()`) — which is exactly how the
+  client drives a pipe (`data_conn.close_sync` calls `pipe.close()` and never `pipe.closing()`).
+  Forwarding a `closing` frame as well makes every node inside the child flush **twice**; the child
+  side therefore refuses that lane with a named cause rather than honouring it silently.
+  **Measured, not predicted:** restoring the two-frame shape on a post-#1667 engine does not merely
+  duplicate the output — the boundary **deadlocks** and the run hangs. The second closing pass emits
+  into a nested round-trip that main is no longer reading, which breaks the strictly-nested
+  synchronous invariant the whole transport rests on. A/B on the same build: collapsed →
+  `text: ["olleh\n\n"]`; two-frame → timeout.
+  *This was latent, not theoretical.* Python `instance.closing` used to be bound to `cb_close`, so
+  `pipe.closing()` performed both passes and the follow-up `pipe.close()` was inert — the bridge was
+  accidentally correct. Engine **#1667** rebound it to `cb_closing`, which is right in itself and
+  turns the second frame into a real double flush.
+  **The one `close` frame is sent from the main node's `closing()`, not its `close()`**, so the venv's
+  return data reaches main's downstream consumers before *their* `closing()`: framing is bound per
+  edge (`endpoint.pipes.cpp`) and `IPythonInstanceBase::closing()` runs a node's own Python `closing()`
+  before `Parent::closing()` hands off to its consumers, so a producer always closes ahead of
+  everything it feeds. Main's `close()` is consequently inert; the engine still calls `Parent::close()`
+  after it, so main's own framing propagates unchanged.
+  **Dead-socket guard.** A child that dies mid-*data* tears the socket down before main's closing pass
+  runs, so that lone frame would raise into a pass the engine aborts at the first error, costing the
+  downstream nodes their flush — even though the child's error already crossed and failed the object.
+  `closing()` therefore swallows a connection-closed send **only when the object already failed**, and
+  re-raises on a clean object (a dead socket with nothing reported is a child crash that must not
+  complete as a success).
 - **`callLocal` is bidirectional.** `venv_server` uses it for the forward path (main→venv); the egress
   client's `callRemote` receive-loop uses it for return lanes (venv→main). That is precisely why the
   full-lane table belongs in the shared base rather than only in `venv_server`.
@@ -393,6 +424,10 @@ env/handle, never argv.
   (`remote/base/IInstance.py`); large image/video relies on chunking. **Measure a representative
   image/video crossing against a target throughput ceiling as a v1 acceptance criterion**; raise the
   chunk ceiling for AV if it misses.
+- **The merge-back `entry` frame shares that ceiling, and is *not* chunked.** `callRemote` chunks only
+  top-level *lists*, so the frame's dict crosses whole: a response above `~1 MB` — realistically a
+  base64 media blob written by a `response` node **inside** a venv (§4.12) — fails. Same cause as the
+  un-chunked AV buffers above, and accepted on the same terms; lifting one should lift the other.
 - **Cloud-store direction shrinks the *payload*, not the *lane set*.** In the planned model AV bytes
   live in **cloud storage** (`ai..account.store`); the bulk bytes are fetched from the store, not
   streamed node-to-node. **But AV metadata still travels on the `writeVideo`/`writeAudio`/`writeImage`
@@ -808,6 +843,50 @@ the pywin32 path hack).
 A venv node's final response and any `objectFailed`/`completionError` must be shipped back and **merged
 into the root entry** the client reads (`data_conn.py:_close`), or venv-produced results/failures
 silently vanish. This is what allows an **end/return node to live in a venv** (§4.11 asymmetry).
+**Implemented in step 8.1.1's successor, 8.2** — the shape below is what shipped.
+
+- **The `entry` frame.** When a child object ends, `venv_server` ships `entry.toDict()` plus the two
+  fields `toDict` deliberately excludes — `objectFailed` and `completionError` — as a lane named
+  `entry`. It is **not** a `lanes.py` entry: this is the bridge's own frame, not an engine lane, and it
+  must never become bindable. The frame is emitted **before** the ack, on `close` *and* on any lane whose
+  dispatch raises — a node that fails during the data phase kills the child's accept loop, so a
+  close-only hook would merge nothing. One frame per object, and none at all when the child produced no
+  response and did not fail, so a venv without an in-venv `response` node stays exactly as it was.
+  *The skip is gated on the response, never on the payload:* `toDict` always emits at least `name`.
+- **Where the child reads it.** From the `Entry` the bridge base holds, not `instance.currentObject`: by
+  close time `cb_close` has set `pyCurrentEntry` to `None` and cleared `currentEntry`. `cb_open` binds
+  the engine to that held object by reference, so the child's `response` node wrote into it.
+- **Merge rule** (`nodes/venv/base/merge.py`, kept engine-free so it is testable without one): dicts
+  merge deep — which unions `result_types` without special-casing; lists **concatenate, main's first**;
+  scalars are child-wins. The response node's own `deep_merge_dicts` *replaces* lists and must not be
+  reused. Only the response is applied — identity (`objectId`/`instanceId`/`version`/`parentId`) never
+  is, though the frame carries the whole entry so the whitelist can widen later without a wire change.
+  Double-counting is impossible by construction: `Entry::__toJson` emits `response` but
+  `Entry::__fromJson` never reads it back, so the `open` frame cannot seed the child with main's.
+  *Ordering caveat:* "main first" orders only what main holds **at merge time**.
+- **Failure: decorate primarily, merge as the safety net.** The `error` lane cannot carry the child's
+  code — the child wraps whatever a node raised into `APERR(Ec.RemoteException, …)` — so the `entry`
+  frame is its only carrier. Main *stashes* the child's `completionError` and, since that frame always
+  precedes the boundary's terminator, decorates the exception the boundary already raises with
+  `__formatted` + `code`/`message`/`filename`/`function`/`line`. `call.hpp` restores those verbatim
+  (and tests `__formatted` *before* its `APERR` branch), so the engine writes the child's real code and
+  Python source location onto main's entry with no reconstruction here. Three ways to get this silently
+  wrong: `__formatted` written inside a class body is name-mangled and invisible to the engine's
+  `hasattr`; `completionError` exposes `file` while the decoration must supply `filename`; and all five
+  attributes must be set or none, because a partial set makes the cast throw and degrades the error to a
+  generic exception. A child can also fail *without* raising, so an unconsumed stash is applied as a
+  `completionCode` after the round-trip returns — with the provenance folded into the message, since
+  that path's location would otherwise point at `bindings.cpp`. The stash is consumed exactly once,
+  which is what stops one run reporting two different errors, and the decoration is skipped on a
+  `NoErr` terminator — that branch is also the *success* terminator, and eating the stash there would
+  disable the fallback entirely.
+- **Verified live.** `webhook → [venv: text_revert → response]` returns `text: ["olleh\n\n"]`, which is
+  impossible without merge-back. For the failure half, `text_fail` inside the venv was **diffed against
+  the same pipeline under `=0`**: `code`, `message`, `file`, `line` and `function` come back identical,
+  so crossing the process boundary costs nothing in error fidelity.
+- Because the branch lives in the shared base, this recurses for free: in a chain (`main→v1→v2`) the
+  mid-process bridge folds v2's entry into v1's with the same code, and v1's egress carries the merged
+  result upward at its own close.
 
 ### 4.13 Edge cases
 - **Membership is `parentId`, not canvas geometry.** A node belongs to exactly one venv. Two boxes that
@@ -1144,20 +1223,55 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    pump, no separate return socket). (Blocker D still applies: `venv_source_stub` is a registered resident
    source — a no-op source exits before WS data arrives — and both `venv_server` and the round-trip `venv`
    node carry a passthrough `lanes` map so the child ingress and the mid-chain round-trip node pass the
-   task-file `validate()` lane-linking.) v1 rejects, with named causes, venv→venv channels, multi-lane
-   fan-in/out into one venv, and `main→v1→v2→main` chains (all step-8 hub).
+   task-file `validate()` lane-linking.) As shipped in step 7 this rejected, with named causes, venv→venv
+   channels, multi-lane fan-in/out into one venv, and `main→v1→v2→main` chains; **step 8.1 lifted the
+   fan-in/out restriction** (one channel per env pair, all lanes on one socket), leaving venv→venv, the
+   same lane from two producers on one boundary, and chains as the remaining rejections.
 
    **Live proof (`ROCKETRIDE_SERVER_USE_VENV=1`, `webhook → [isolated group: text_revert] → response`):**
    sending `"hello"` spawns the resident child, dials one Bearer-authenticated socket, crosses
    main→child, `text_revert` reverses in the child, the return crosses child→main over the same socket, and
    the SDK `send()` result carries `text: ["olleh\n\n"]` on the forward object. Regression: `=0` flattens
    in-process (same `"olleh"`, **no child spawned**). `builder ai:test`: 1449 passed / 122 skipped.
-   Orphan-safe binding, N-child metric/monitor fan-in, the general fan-in/out + venv→venv hub, and
-   response/failure merge-back for a `response` node *inside* a venv remain step 8.
+   *That proof was obtained against a **pre-#1667** engine, where `pipe.closing()` still performed both
+   passes; increment 8.1.1 collapsed the framing to the single `close` round-trip and re-verified the
+   same shape on a rebuilt engine (§4.4).*
+   Orphan-safe binding, N-child metric/monitor fan-in, the venv→venv hub, and response/failure
+   merge-back for a `response` node *inside* a venv remain step 8.
 8. **Orchestrator** (`task_engine.py`): N children/run (sibling lifetime), channel wiring, readiness,
    teardown-with-run, response/failure merge-back, monitor/trace/SSE fan-in, **metric aggregation across
    child PIDs**, orphan-safe binding (OS process-tree: Windows Job Objects / Unix process groups),
-   install reporting, purge/delete + GC.
+   install reporting, purge/delete + GC. Sequenced as independent increments.
+   *Increment 8.1 — **DONE**, live-verified:* multi-lane fan-in via one bridge node per child
+   (Arch-1). Channels are keyed by `(sourceEnv, targetEnv)`; one bridge node carries every lane of a
+   boundary over one socket and the header `lane` demuxes to the consumers; the same lane from two
+   producers on one boundary is rejected, since `write*` carries no producer identity. Live: linear
+   `hello`→`olleh`; the shape that previously deadlocked now fails fast with a named cause.
+   *Increment 8.1.1 — **DONE**, live-verified:* collapse the boundary's two framing round-trips into
+   one. Engine #1667 rebound Python `instance.closing` to `cb_closing`, so the bridge's
+   `closing`+`close` frame pair began driving the child's closing pass twice. A bridge now ends the
+   child object with a single `close` frame, sent from the main node's `closing()`, and refuses a
+   received `closing` lane with a named cause (§4.4). Behaviour-preserving — it only ever calls
+   `pipe.close()`, the one call #1667 did not change — and it drops the second, always-inert
+   round-trip. A/B on one rebuilt engine: collapsed → `text: ["olleh\n\n"]` (the reversed token
+   exactly once); the two-frame shape restored → the boundary **hangs**, so the regression is a
+   deadlock rather than merely duplicated output.
+   *Increment 8.2 — **DONE**, live-verified:* response/failure merge-back (§4.12). A `response`/`end`
+   node inside a venv now reaches the client: `webhook → [venv: text_revert → response]` returns
+   `text: ["olleh\n\n"]`. The failure half was diffed against the same pipeline under `=0` — `code`,
+   `message`, `file`, `line` and `function` come back identical, so the boundary costs nothing in
+   error fidelity.
+   *Remaining:* **8.3** graph serialization (chains + diamonds, lifting the venv→venv rejection);
+   **8.4** observability fan-in + metrics; **8.5** orphan-safe teardown; **8.6** purge/delete with
+   active-run gates.
+   *Observed while verifying 8.2, recorded for 8.5 rather than fixed here:* after an in-venv failure
+   a **second `send()` on the same token fails fast** — the boundary socket closed cleanly (1000) and
+   the SDK raises `PipeException` with its usual "pipeline isn't running" diagnostic. It does not hang
+   and does not silently return a stale result, so the failure mode is acceptable as it stands. The
+   child stays resident for the rest of the run and is reaped when the task ends normally; **only an
+   abruptly killed server leaves orphans**, which is exactly the gap 8.5 closes. Worth knowing during
+   development: leaked children keep holding the port and answer later runs with *their* pipeline's
+   results, which reads as "the feature broke" when nothing did.
 - **Prerequisites the 2A state uncovers rather than closes** — both cheap, both blocking the moment
   two environments live in one interpreter:
   - `BaseLoader._dependencies_loaded` (`ai/common/models/base.py`) is a **class-level bool**. With
@@ -1333,7 +1447,9 @@ actually imported is not observable from outside the process.
   (WS transport, reuse over loopback). `REMOTING` in
   `packages/client-python/src/rocketride/types/service.py` / services.json `noremote`.
 - `packages/ai/src/ai/modules/task/task_engine.py` — partitioner hook after `_check_pipeline`; spawn N
-  children; readiness; teardown; merge-back; metric/trace fan-in.
+  children; readiness; teardown; metric/trace fan-in. **Merge-back is not here:** it lives entirely in
+  the bridge nodes (`nodes/venv/{server,base,client}/IInstance.py` + `nodes/venv/base/merge.py`, §4.12)
+  and the orchestrator never sees it.
 - `packages/ai/src/ai/modules/task/task_server.py` — active-task registry (gate purge/GC); `project_id`.
 - `packages/ai/src/ai/modules/task/pipeline.py` — `resolve_implied_source` (source-in-venv guard).
 - `packages/ai/src/ai/modules/data/data_conn.py` — canonical lane serialization to reuse in the bridge.
