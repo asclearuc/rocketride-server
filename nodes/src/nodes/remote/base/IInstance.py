@@ -31,7 +31,7 @@ from websockets.sync.client import ClientConnection
 nest_asyncio.apply()
 
 from ai.common.schema import Doc
-from rocketlib import APERR, Ec, Entry, IInstanceBase
+from rocketlib import APERR, Ec, Entry, IInstanceBase, Lvl, debug
 
 
 class IInstance(IInstanceBase):
@@ -221,7 +221,15 @@ class IInstance(IInstanceBase):
             if data is not None:
                 raise TypeError(f'Unexpected data {data} for lane {lane}')
 
-            self.instance.pipe.closing()
+            # Ignored on purpose. `close` alone ends the object: `pipe.close()` runs the closing
+            # pass and then the close pass, so driving `pipe.closing()` here as well would flush
+            # every node of the sub-pipeline twice.
+            #
+            # Tolerated rather than rejected because `remote` bridges deployments that can skew:
+            # an older client still sends `closing` + `close`, and ignoring the first leaves
+            # exactly one closing pass under either engine binding. (The venv bridge raises here
+            # instead -- both ends of that socket are always the same build.)
+            debug(Lvl.Remoting, 'Ignoring a "closing" frame: "close" drives the whole object end')
 
         elif lane == 'close':
             if data is not None:

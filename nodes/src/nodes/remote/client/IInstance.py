@@ -71,7 +71,24 @@ class IInstance(IInstanceBase):
             self.callRemote('writeDocuments', documents)
 
     def closing(self):
-        self.callRemote('closing')
+        """End the remote object with the one ``close`` round-trip.
+
+        The engine's ``pipe.close()`` already runs the closing pass and *then* the close pass
+        (``pipe.instance.cpp``: ``Parent::closing()`` followed by ``Parent::close()``), which is why
+        the client drives a pipe with ``pipe.close()`` alone (``data_conn.close_sync``). Sending a
+        ``closing`` frame as well would run the closing pass twice on the remote side, so every node
+        of the sub-pipeline would flush twice.
+
+        This was harmless while Python ``instance.closing`` was bound to ``cb_close`` -- the first
+        frame then did both passes and the second was inert -- and became a real double flush when
+        engine #1667 rebound it to ``cb_closing``.
+
+        The frame is sent from ``closing()`` rather than ``close()`` so the remote pipeline's output
+        reaches the local downstream nodes before *their* ``closing()``.
+        """
+        self.callRemote('close')
 
     def close(self):
-        self.callRemote('close')
+        # Deliberately inert: `closing()` already drove the remote close over the single round-trip.
+        # The engine calls `Parent::close()` after this returns, so local framing still propagates.
+        pass
