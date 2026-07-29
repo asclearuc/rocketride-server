@@ -1229,9 +1229,20 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    routing through main's engine graph (step 8.3), not a transport-layer hub. No layer-2 swap in v1.
    *Step 7 — **IMPLEMENTED, live round-trip verified**.* The child is a normal task
    subprocess (mirrors `task_engine`'s engine spawn) whose source is a **resident** `venv_source_stub`
-   (`nodes/venv/source`, `classType: source`, `register: endpoint`): its `scanObjects` starts a
-   `WebServer` on `--data_port`, publishes `app.state.target`, mounts the new `ai/modules/venv` module
-   (`/venv/pipe`) and blocks for the run. Gating (`task_engine.py`, `_venv_scoping_enabled` →
+   (`nodes/venv/source`, `classType: source`, `register: endpoint`): its `scanObjects` publishes
+   `app.state.target`, mounts the new `ai/modules/venv` module (`/venv/pipe`) and blocks for the run.
+   *Amended when #912 landed:* the stub no longer builds its own `WebServer`. Every subprocess now
+   gets a shared one, bootstrapped by `ai/node.py` from `--data_port` **before** the engine runs, so a
+   second listener on that port made the child die at startup on the bind. The stub takes
+   `node.require_shared_web_server()` and mounts `/venv/pipe` on it — the migration `webhook` and
+   `telegram` already received — and blocks on a `threading.Event` instead of `server.run()`. Two
+   consequences worth keeping: the route is appended to an **already-serving** app (fine — Starlette
+   resolves routing per request), and the child now also serves `/task/data`, which is what 8.4's
+   metric fan-in wants. A third is a narrowing: `probe_ready` completes a TCP handshake against the
+   shared server, which binds at bootstrap, so it no longer proves `/venv/pipe` is mounted — the
+   child wins that race comfortably today (it only has to finish its own engine init while the
+   bridge's first dial waits on a whole main-engine startup), and the symptom if it ever loses is a
+   refused dial rather than a hang. Gating (`task_engine.py`, `_venv_scoping_enabled` →
    `scoping_enabled(use_venv_mode(), has_isolated_group(doc))`, module-top `import venv_env`) branches to
    `_spawn_venv_children`: assign a port, write the child task file, build the child env
    (`ROCKETRIDE_CLIENT_ID` + per-run `ROCKETRIDE_VENV_TOKEN` + `ROCKETRIDE_VENV_SITE` via `venv_env` when
@@ -1332,6 +1343,17 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    first live run with more than one child. This settles the one assumption the design had rated
    "high confidence, unmeasured": **bridge-to-bridge nesting inside main works** — `MV1.callRemote`
    holds the stack while `MV2.callRemote` runs on a second socket.
+   *Merge-back with two children (§4.12 for N > 1).* The chain exercises no merge-back and the
+   diamond exactly one, so a `response` was placed inside **both** venvs of a chain, with main
+   holding none: the root entry comes back `text: ["olleh\n\n", "hello\n\n"]` — one contribution per
+   child, v1's first. That is the closing order (`MV1` closes before `MV2`, so its entry merges
+   first and the list concatenation preserves it), and `=0` returns the same two values in the same
+   order, so crossing the boundary changes neither the set nor the ordering.
+   *Failure paths, both matching `=0` on `code`/`message`/`file`/`line`/`function`:* `text_fail`
+   inside a venv, and — new to the chain — `text_fail` in the **upstream** venv, where `MV1.closing()`
+   raises and aborts the remaining flush walk so `MV2` never closes. The cause still arrives intact
+   (the failure stash is per bridge instance, so the downstream bridge cannot swallow it) and nothing
+   hangs.
    *Fixture added:* `nodes/src/nodes/text_to_json/` (text → json, emitting during the **data phase**).
    `webhook` declares the `json` lane but does not emit it for a `text/plain` send, so a diamond
    wired straight off the source runs vacuously on that side — measured, and the reason the fixture
