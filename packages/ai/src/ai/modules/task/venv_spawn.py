@@ -122,10 +122,19 @@ async def probe_ready(
     """Wait until the child's WebServer accepts TCP connections (default ~30s).
 
     A transport-level probe, not a ``/venv/pipe`` WS connect: that route rejects
-    unauthenticated peers before accepting, so a bare connect cannot confirm readiness. A
-    completed TCP handshake means the resident source's server is bound. The window must
-    cover the whole child startup (engine init -> task setup -> resident source binds its
-    WebServer), so it is generous. Bails immediately if the child has already exited.
+    unauthenticated peers before accepting, and an unmatched path is refused the same way, so
+    a handshake cannot tell "route mounted" from "route missing".
+
+    **What it proves, since #912:** the shared subprocess WebServer (bootstrapped by
+    ``ai/node.py`` from ``--data_port``, before the engine runs) is listening and the child is
+    alive. It no longer proves ``/venv/pipe`` is mounted -- the resident source adds that route
+    later, from ``scanObjects``. In practice the child wins that race comfortably: it only has
+    to finish its own engine init, while the bridge's first dial waits on the rest of the spawn
+    loop, the main task file, and a whole main-engine startup that begins afterwards. If it ever
+    loses, the symptom is a refused first dial rather than a hang -- fix it then, with the
+    evidence, rather than guessing at a readiness protocol now.
+
+    Bails immediately if the child has already exited.
     """
     last: Optional[BaseException] = None
     for _ in range(attempts):
