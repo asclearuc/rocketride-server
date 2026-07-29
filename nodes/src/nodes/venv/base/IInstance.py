@@ -316,9 +316,10 @@ class IInstance(IInstanceBase):
             # Merge-back (§4.12). NOT a `lanes.py` entry on purpose: this is our own frame, not an
             # engine lane, and it must never become bindable.
             #
-            # It lives in the base rather than the client subclass so it recurses for free: in a
-            # chain (main->v1->v2) the mid-process bridge folds v2's entry into v1's with this same
-            # code, and v1's egress then carries the merged result upward at its own close.
+            # It lives in the base rather than the client subclass because BOTH roles reach it
+            # through `callLocal`. It does not recurse across a chain: under graph serialization
+            # (§4.6) a bridge is never nested inside a child -- every venv's bridge node lives in
+            # main -- so each child's entry merges DIRECTLY into main's root entry, one level.
             self._applyChildEntry(data)
 
         else:

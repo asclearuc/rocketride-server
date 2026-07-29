@@ -110,7 +110,9 @@ Two facts that shape the design (both **verified** against the code):
 **A virtual environment = a "local remote".** Each isolated group becomes a flat sub-pipeline run by
 a child `engine.exe` process (TARGET mode, as the engine runs any pipeline today), with its own
 isolated `site-packages` overlay. Boundary edges are bridged over a token-authed WebSocket on
-loopback; the main process's orchestrator routes inter-venv frames. The C++ engine is unchanged.
+loopback; inter-venv traffic is routed by **main's engine graph** — an environment feeding another
+becomes a plain edge between their two bridge nodes (§4.6, step 8.3), so every socket stays
+main↔child and no frame is ever relayed by the orchestrator. The C++ engine is unchanged.
 
 Three pillars:
 
@@ -120,8 +122,8 @@ Three pillars:
    shippable on its own.*
 2. **The venv runtime.** A new first-class canvas **Virtual Environment** container; a Python
    **partitioner** that turns isolated groups into venv sub-pipelines + bridge nodes; a **`venv`
-   bridge node** (sharing a base with `remote`) carrying all lanes; **local spawn + hub routing**;
-   orchestration (lifecycle, merge-back, observability).
+   bridge node** (sharing a base with `remote`) carrying all lanes; **local spawn + routing through
+   main's graph**; orchestration (lifecycle, merge-back, observability).
 3. **Polish & scale.** Cross-cut debug/observability, pre-warm, and v2 optimizations (direct
    venv↔venv mesh, shared-memory for large buffers, the local-IPC transport seam).
 
@@ -235,7 +237,15 @@ and `groups` (each venv's `config.environment` block, for step-7/8 logging). The
   inside a venv, or a venv nested inside a plain group (which becomes a top-level env), fall out of it.
   The transitive map also fixes two latent increment-1 bugs for a member of a plain group nested in a
   venv (a cross-boundary invoke into it was missed; an intra-venv invoke into it was wrongly rejected).
-- **Boundary channels, one per `(sourceEnv, targetEnv)` pair** (step 8.1, Arch-1). A child runs one
+- **Boundary channels, one forward and one return per environment** (step 8.1 Arch-1; re-keyed in
+  step 8.3). Channels are keyed `(direction, env)`, not by environment pair: everything entering a
+  venv shares its forward channel and everything leaving it shares its return channel, whatever the
+  other end is. A venv→venv edge is therefore cut **twice**, once at each boundary it crosses, and
+  reaches its consumer as an ordinary main-graph edge between the two bridge nodes (§4.6).
+  `sourceEnv`/`targetEnv` keep naming the **socket peers** (main and the child), never the data's
+  true origin — the child selects a `venv_server` node's role from `sourceEnv == 'main'`, and the
+  spawn injection picks the child env the same way. `channelId` (`main->{env}` / `{env}->main`) and
+  the sanitized `venv_egress--…` / `venv_ingress--…` node ids are unchanged. A child runs one
   pipe stack, so a whole boundary is **one** connection: a single bridge node carries every lane of
   that boundary over one socket, and the frame's `lane` header demuxes to the consumers. Each lane in
   a channel has exactly **one** producer — a node's `write*` carries no producer identity, so two
@@ -245,29 +255,43 @@ and `groups` (each venv's `config.environment` block, for step-7/8 logging). The
   plus role-based, sanitized `venv_egress--…` / `venv_ingress--…` node ids (unique **per document**).
 - **Bridge placement — the round-trip splice (`remote` model; see step 7 for why).** A venv boundary is a
   request/response splice of one object, so its forward and return channels are **paired** per env and the
-  return rides back over the forward socket. `_pair_boundaries` pairs each env's single `main→env` forward
-  channel with its optional `env→main` return channel. `main→env`: **one** round-trip `venv` node in main
-  reads the forward producer, and a `venv_server` ingress (from the child stub) applies the forward stream
-  in the child; the child's forward consumers repoint to that ingress. `env→main`: a `venv_server` egress
-  (from the venv producer) ships the return over the **same** socket, and main's return consumers repoint
-  to the paired round-trip node (its `deliverNode`) — there is **no** separate main ingress node, so the
-  spliced object is never re-opened. Each child sub-document is seeded with a synthesized
-  `venv_source_stub` resident source that the ingress links to for reachability; unlike `remote`, child
-  docs are NOT nested under the client config — they are separate `environments[]` entries the
-  orchestrator (step 7) spawns from. Multi-lane fan-in/out across a boundary **is** supported (step 8.1:
-  one channel per env pair carries all of its lanes on one socket). What v1 still rejects, with named
-  causes, is `venv→venv` channels, the same lane from two producers on one boundary, and
-  `main→v1→v2→main` chains (the venv→venv hub via graph serialization is step 8.3).
+  return rides back over the forward socket. `_pair_boundaries` pairs each env's forward channel with its
+  optional return channel — by construction, since the key is `(direction, env)`. Forward: **one**
+  round-trip `venv` node in main reads each lane's **main-side source** — the producer itself when it
+  lives in main, otherwise the bridge node of the venv that produced it — and a `venv_server` ingress
+  (from the child stub) applies the forward stream in the child; the child's forward consumers repoint to
+  that ingress. Return: a `venv_server` egress (from the venv producers) ships the return over the **same**
+  socket, and main's return consumers repoint to the paired round-trip node (its `deliverNode`) — there is
+  **no** separate main ingress node, so the spliced object is never re-opened. Each child sub-document is
+  seeded with a synthesized `venv_source_stub` resident source that the ingress links to for reachability;
+  unlike `remote`, child docs are NOT nested under the client config — they are separate `environments[]`
+  entries the orchestrator (step 7) spawns from. Multi-lane fan-in/out, `venv→venv` chains and diamonds
+  are all supported. What remains rejected, with named causes, is the same lane from two producers on one
+  boundary (the boundary is now the whole environment, so this bites more often than it did with
+  pair-keyed channels; the workaround is a merge/router node inside the venv), an environment entered
+  more than once around a base component, and quotient cycles.
 - **Env-cycle detection over the quotient graph, main excluded.** Edges are `env_of(producer) →
   env_of(consumer)`, so venv→venv is a direct edge and routing through main is invisible; dropping main
-  catches venv↔venv deadlocks without flagging main-terminated chains at this layer. Rejected with a named
-  cause, like the other validations. (Chains and any venv→venv edge are then rejected outright by the v1
-  `_pair_boundaries` linear-only check above; the cycle guard remains for the step-8 hub that will allow
-  them.)
+  catches venv↔venv deadlocks without flagging main-terminated chains, which are legal and are exactly
+  what step 8.3 enables. The adjacency is accumulated by `_collect_channels` rather than read off the
+  channels: under `(direction, env)` keying every channel has main on one side, so the venv→venv relation
+  lives inside a channel's lanes, not in its key. **A second, narrower cycle check** runs on main's
+  assembled document: a venv collapses to exactly one bridge node, so entering it twice around a base
+  component folds into `MV → m → MV`. That is a DAG as authored and runs fine flattened under `=0`, and
+  the author never wrote the node names in the cycle, so it is named at cut time rather than left to the
+  engine's own (post-#1669) Kahn check, which reports a lifecycle root index at pipeline open. It fires
+  only for cycles passing through a bridge node, so the partitioner never becomes stricter than the engine
+  on shapes unrelated to venvs.
+
+  *Ordering trap when writing fixtures:* the same-lane conflict check sits **upstream** of both cycle
+  checks. A cycle needs an environment entered twice, and if both entries carry the same lane the
+  conflict fires first — so a cycle fixture must use distinct lanes per direction.
 - **Extra scoped rejections:** a boundary edge on the non-bridgeable `words` lane; an implied
   (`Source`-mode) source or the document `source` field inside a venv; a base environment left with no
-  components while a venv exists; a group whose id is literally `main`. The `scoped=False` path and the 19
-  increment-1 tests are unchanged; the cut adds `test_partition_cut.py` (32 tests). Deferred: §4.13's
+  components while a venv exists; a group whose id is literally `main`; an environment that emits across
+  its boundary but is fed by nothing (nothing dials it, so its egress would have no socket). The
+  `scoped=False` path and the 19 increment-1 tests are unchanged; the cut adds `test_partition_cut.py`
+  (39 tests after step 8.3). Deferred: §4.13's
   "all nodes in ONE venv → collapse" (a runnable all-in-one-venv doc cannot exist while source-in-venv is
   rejected, and honoring it only when scoped would make `=1` accept what `=0` rejects). The bridge nodes'
   live child URL/token are written at spawn (step 7).
@@ -280,7 +304,8 @@ environments; and a lane edge that takes input from a container, which produces 
 also rejects a control edge whose source is a container (it dangles once the container flattens away).
 Env-cycle detection is now implemented on the `scoped=True` cut (see Increment 2 above).
 
-Covered cases: lane fan-out across envs, multiple lanes per env-pair, A→B→main chains, source/sink
+Covered cases: lane fan-out across envs, multiple lanes on one boundary, A→B→main chains and
+diamonds, a venv feeding two venvs, source/sink
 placement (§4.11). **Invoke/control edges never cross a boundary** (the editor's `isValidConnection`
 requires equal `parentId` for invoke handles; data lanes cross freely) — so cross-env tool-call RPC is
 out of v1 *by construction*. **This is editor-only — C++ does not check `parentId` on invoke edges
@@ -444,26 +469,46 @@ env/handle, never argv.
   Windows-specific** — but it requires the same `IInstance.py` transport refactor that makes the
   transport not-separable, so it is deferred, not a v1 item.
 
-### 4.6 Inter-venv routing — hub via main
-All venv children connect **only to main**. Main's **orchestrator** (the Python process that spawned
-them, *not* main's node pipeline) owns a socket per child and acts as a **byte router** at the
-transport layer: it reads a frame off one child's socket and forwards it to another's via the routing
-table.
+### 4.6 Inter-venv routing — graph serialization through main
+All venv children connect **only to main**, and each has exactly one socket. An environment that
+feeds another is **not** relayed frame-by-frame: the partitioner rewrites the venv quotient into
+ordinary edges of main's engine graph, between the bridge nodes that already represent each child
+there (step 8.3). A venv's outputs come back into main through its own bridge node; handing them to
+the next venv is then just that bridge node being the next one's input.
 
 ```
 dropper(main) → parse(venv1) → detect(venv2) → return_image(main)
-connections: main↔venv1, main↔venv2   (no venv1↔venv2 link)
-parse(venv1) ──▶ main ──(route by channelId)──▶ detect(venv2)
+main graph:  dropper ──▶ [venv1 bridge] ──▶ [venv2 bridge] ──▶ return_image
+sockets:     bridge ↔ child venv1, bridge ↔ child venv2   (no venv1↔venv2 link)
 ```
 
-**The data never enters main's engine/node graph nor main's `site-packages`** — main forwards **opaque
-frames**, so it needs **no codecs/deps** for the data crossing it (a venv-`torch` image passes through
-main without main having `torch`). Routing through main's *nodes* would force main's env to understand
-every crossing lane — explicitly avoided.
+Why it is correct in one breath: each child has exactly **one** connection, so a double-open is
+impossible by construction; `open`/`closing`/`close` ordering is delegated to **main's engine**; and
+main's engine thread is only ever inside one bridge node's call, so a return always arrives on the
+socket being read. The two calls simply nest — one logical thread, strictly nested round-trips.
 
-Rationale for hub over mesh: N connections (not N²), central lifecycle/token/routing/observability, each
-child authenticates with **only main**. Cost: a venv→venv edge is 2 transfers. **v2 optimization:**
-direct venv↔venv peering for hot large-buffer edges (+ shared-memory for AV).
+**Main still needs no codecs or heavy deps for the data crossing it.** A hop does decode into main's
+engine objects and re-encode, but `nodes/venv/base/lanes.py` is dependency-free: AV crosses as an
+`action`/`mime` header plus a raw byte buffer, so a venv-`torch` image passes through main without
+main having `torch`. The §4.6 promise holds; what changed is *who* forwards, not what main must
+understand.
+
+Two properties fall out of the serialization and are not obvious from the rewrite rule: a chain of N
+venvs is N **nested blocking** round-trips on main's single engine thread (latency composes, and an
+inner child's stall blocks every outer bridge), and a venv is entered **once per run** — re-entering
+one around a base-environment component collapses to a cycle on its single bridge node and is
+rejected at cut time (§4.3).
+
+Rationale for one-socket-per-child over a mesh: N connections (not N²), central
+lifecycle/token/routing/observability, each child authenticates with **only main**. Cost: a venv→venv
+edge is still 2 transfers. **v2 optimization:** direct venv↔venv peering for hot large-buffer edges
+(+ shared-memory for AV).
+
+*Superseded:* this section previously specified an orchestrator-level **byte router** — main's Python
+process reading a frame off one child's socket and forwarding it to another's by `channelId`. Graph
+serialization replaced it at step 8.3: no new transport, no new endpoint, no frame tags, and diamonds
+(a venv fed from two environments) fall out as an ordinary multi-input join on the bridge node, which
+the byte router never solved.
 
 ### 4.7 Per-environment requirement scoping (the conflict fix)
 Today `_find_requirement_files()` globs **all** `nodes/**` + `ai/**` requirements (pipeline-blind);
@@ -884,9 +929,11 @@ silently vanish. This is what allows an **end/return node to live in a venv** (�
   impossible without merge-back. For the failure half, `text_fail` inside the venv was **diffed against
   the same pipeline under `=0`**: `code`, `message`, `file`, `line` and `function` come back identical,
   so crossing the process boundary costs nothing in error fidelity.
-- Because the branch lives in the shared base, this recurses for free: in a chain (`main→v1→v2`) the
-  mid-process bridge folds v2's entry into v1's with the same code, and v1's egress carries the merged
-  result upward at its own close.
+- The branch lives in the shared base because **both** roles reach it through `callLocal`, not because
+  it recurses. Under graph serialization (§4.6) it never does: a bridge is never nested inside a child —
+  every environment's bridge node lives in main — so in a chain (`main→v1→v2`) each child's entry merges
+  **directly** into main's root entry, one level, and two children contributing to the same entry is an
+  ordinary repeated merge rather than a nested one.
 
 ### 4.13 Edge cases
 - **Membership is `parentId`, not canvas geometry.** A node belongs to exactly one venv. Two boxes that
@@ -1165,10 +1212,11 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    losing its members.
    *Increment 2 — **DONE**:* the cut (`scoped=True` → `PartitionResult`). Per-env sub-documents
    (leaf-bucketing by transitive env), `venv`/`venv_server` bridge pairs at each boundary lane edge with
-   `channelId`-keyed routing table, hub-through-main placement (no main node for venv→venv), and
-   venv-only env-cycle detection over the quotient graph, plus the source-in-venv guard on the implied
-   source. 31 unit tests in `test_partition_cut.py`; the 19 increment-1 tests are unchanged. The cut is
-   pure Python and NOT yet wired at the call site — `task_engine.py` still calls `partition_pipeline`
+   `channelId`-keyed routing table, one bridge node per environment in main (step 8.3 makes a
+   venv→venv lane an edge *between* two of them), and venv-only env-cycle detection over the quotient
+   graph, plus the source-in-venv guard on the implied
+   source. 39 unit tests in `test_partition_cut.py` after 8.3; the 19 increment-1 tests are unchanged.
+   Wired at the call site since step 7 — `task_engine.py` calls `partition_pipeline`
    with the default `scoped=False`; the orchestrator flips the gate in step 8 via
    `scoping_enabled(use_venv_mode(), has_isolated_group(doc))` (helper exported from `pipeline.py`).
    Two step-7 flags recorded: a return-only (`venv→main`) client has `input: []` (does the engine
@@ -1178,7 +1226,7 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    remote untouched.
 7. **Local spawn + transport (v1 = WS-over-loopback unchanged):** spawn the venv child (its overlay) and
    point the existing `remote` WS bridge at it over loopback (Bearer token; raise the ~1 MB AV ceiling);
-   main-orchestrator hub routing. No layer-2 swap in v1.
+   routing through main's engine graph (step 8.3), not a transport-layer hub. No layer-2 swap in v1.
    *Step 7 — **IMPLEMENTED, live round-trip verified**.* The child is a normal task
    subprocess (mirrors `task_engine`'s engine spawn) whose source is a **resident** `venv_source_stub`
    (`nodes/venv/source`, `classType: source`, `register: endpoint`): its `scanObjects` starts a
@@ -1225,8 +1273,10 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    node carry a passthrough `lanes` map so the child ingress and the mid-chain round-trip node pass the
    task-file `validate()` lane-linking.) As shipped in step 7 this rejected, with named causes, venv→venv
    channels, multi-lane fan-in/out into one venv, and `main→v1→v2→main` chains; **step 8.1 lifted the
-   fan-in/out restriction** (one channel per env pair, all lanes on one socket), leaving venv→venv, the
-   same lane from two producers on one boundary, and chains as the remaining rejections.
+   fan-in/out restriction** (one bridge node per environment, all its lanes on one socket) and **step
+   8.3 lifted venv→venv and chains** (graph serialization). What remains rejected is the same lane
+   from two producers on one boundary — now the whole environment's boundary, so it bites more often
+   than it did with pair-keyed channels.
 
    **Live proof (`ROCKETRIDE_SERVER_USE_VENV=1`, `webhook → [isolated group: text_revert] → response`):**
    sending `"hello"` spawns the resident child, dials one Bearer-authenticated socket, crosses
@@ -1236,17 +1286,19 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    *That proof was obtained against a **pre-#1667** engine, where `pipe.closing()` still performed both
    passes; increment 8.1.1 collapsed the framing to the single `close` round-trip and re-verified the
    same shape on a rebuilt engine (§4.4).*
-   Orphan-safe binding, N-child metric/monitor fan-in, the venv→venv hub, and response/failure
-   merge-back for a `response` node *inside* a venv remain step 8.
+   Orphan-safe binding and N-child metric/monitor fan-in remain step 8; venv→venv routing landed as
+   8.3 (graph serialization, not a hub) and merge-back for a `response` node *inside* a venv as 8.2.
 8. **Orchestrator** (`task_engine.py`): N children/run (sibling lifetime), channel wiring, readiness,
    teardown-with-run, response/failure merge-back, monitor/trace/SSE fan-in, **metric aggregation across
    child PIDs**, orphan-safe binding (OS process-tree: Windows Job Objects / Unix process groups),
    install reporting, purge/delete + GC. Sequenced as independent increments.
    *Increment 8.1 — **DONE**, live-verified:* multi-lane fan-in via one bridge node per child
-   (Arch-1). Channels are keyed by `(sourceEnv, targetEnv)`; one bridge node carries every lane of a
-   boundary over one socket and the header `lane` demuxes to the consumers; the same lane from two
-   producers on one boundary is rejected, since `write*` carries no producer identity. Live: linear
-   `hello`→`olleh`; the shape that previously deadlocked now fails fast with a named cause.
+   (Arch-1). One bridge node carries every lane of a boundary over one socket and the header `lane`
+   demuxes to the consumers; the same lane from two producers on one boundary is rejected, since
+   `write*` carries no producer identity. (Channels were keyed by `(sourceEnv, targetEnv)` here; 8.3
+   re-keyed them `(direction, env)` so one environment's whole boundary is one channel whatever the
+   other end is.) Live: linear `hello`→`olleh`; the shape that previously deadlocked now fails fast
+   with a named cause.
    *Increment 8.1.1 — **DONE**, live-verified:* collapse the boundary's two framing round-trips into
    one. Engine #1667 rebound Python `instance.closing` to `cb_closing`, so the bridge's
    `closing`+`close` frame pair began driving the child's closing pass twice. A bridge now ends the
@@ -1261,9 +1313,31 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    `text: ["olleh\n\n"]`. The failure half was diffed against the same pipeline under `=0` — `code`,
    `message`, `file`, `line` and `function` come back identical, so the boundary costs nothing in
    error fidelity.
-   *Remaining:* **8.3** graph serialization (chains + diamonds, lifting the venv→venv rejection);
-   **8.4** observability fan-in + metrics; **8.5** orphan-safe teardown; **8.6** purge/delete with
-   active-run gates.
+   *Increment 8.3 — **DONE, live-verified**: graph serialization (chains + diamonds).* Channels are
+   re-keyed `(direction, env)`: one forward and one return channel per environment, so a venv→venv
+   edge is cut at **both** boundaries it crosses and reaches its consumer as an ordinary main-graph
+   edge between the two bridge nodes (§4.6). The only new wiring is a forward lane's *main-side
+   source* — the producer when it lives in main, otherwise the producing environment's bridge node.
+   Children are untouched: each still sees the linear step-7 shape, which is why the whole
+   behavioural change is `pipeline.py` plus deleting the duplicate spawn-time guard in
+   `task_engine.py`. New rejections: an environment entered more than once around a base component
+   (it collapses onto its single bridge node, `MV → m → MV`), and the same-lane-two-producers rule
+   now applied to the whole merged boundary. 39 partitioner tests.
+   *Live (chain, diamond, and a linear regression, each against the same pipeline under `=0`):*
+   `main→v1→v2→main` with **three** reversals returns `olleh` — deliberately odd, so a pair of
+   bridges that quietly passed text through could not produce it; the diamond (v2 fed `text` from v1
+   and `json` from main, `response` inside v2) returns **both** lanes, `text: ["olleh\n\n"]` and
+   `json: [{len: 5, text: "hello"}]`, merged home by 8.2's `entry` frame. Both match `=0` exactly.
+   Two children were spawned and each reported ready (`%TEMP%/venv-child-v1.log`, `-v2.log`) — the
+   first live run with more than one child. This settles the one assumption the design had rated
+   "high confidence, unmeasured": **bridge-to-bridge nesting inside main works** — `MV1.callRemote`
+   holds the stack while `MV2.callRemote` runs on a second socket.
+   *Fixture added:* `nodes/src/nodes/text_to_json/` (text → json, emitting during the **data phase**).
+   `webhook` declares the `json` lane but does not emit it for a `text/plain` send, so a diamond
+   wired straight off the source runs vacuously on that side — measured, and the reason the fixture
+   exists rather than a convenience.
+   *Remaining:* **8.4** observability fan-in + metrics; **8.5** orphan-safe teardown; **8.6**
+   purge/delete with active-run gates.
    *Observed while verifying 8.2, recorded for 8.5 rather than fixed here:* after an in-venv failure
    a **second `send()` on the same token fails fast** — the boundary socket closed cleanly (1000) and
    the SDK raises `PipeException` with its usual "pipeline isn't running" diagnostic. It does not hang
@@ -1326,12 +1400,16 @@ Three layers; each test is tagged with the phase that first makes it runnable (*
   containers to one level, drop the container node, empty container disappears, no-container pipeline
   returned by identity, members keep their connections; and the validations — nested environments,
   source-in-venv (a plain group is fine), invoke edge across an environment boundary, lane edge into a
-  container, and a control edge whose source is a container. *Increment 2 **DONE** (31 tests,
-  `test_partition_cut.py`):* `scoped=True` cuts isolated groups → per-venv sub-doc + `venv`/`venv_server`
-  bridge pair + `channelId`-keyed routing table; hub-through-main placement (no main node for venv→venv);
-  venv-only env-cycle detection over the quotient graph; the scoped-path rejections (non-bridgeable
-  `words`, implied/field source in a venv, empty base env, a group named `main`); id-collision suffixing;
-  determinism; and the §4.6 golden authoring→sub-docs example. [2B]
+  container, and a control edge whose source is a container. *Increment 2 **DONE**, extended by 8.3
+  (39 tests, `test_partition_cut.py`):* `scoped=True` cuts isolated groups → per-venv sub-doc +
+  `venv`/`venv_server` bridge pair + `channelId`-keyed routing table; one bridge node per environment,
+  with a venv→venv lane wired as an edge between two of them (chain, diamond, and a venv feeding two
+  venvs); venv-only env-cycle detection over the quotient graph **plus** the collapsed-cycle check for
+  an environment entered twice around a base component — and its counterpart, a user cycle with no
+  bridge node left to the engine; the scoped-path rejections (non-bridgeable `words`, implied/field
+  source in a venv, empty base env, a group named `main`, an environment that emits but is fed by
+  nothing, same lane from two producers on one merged boundary); id-collision suffixing; determinism;
+  and the §4.6 golden authoring→sub-docs example. [2B]
 
 ### 8.2 Test-fixture nodes (purpose-built, lightweight, decoupled from `ai/**`)
 Add a pair of **trivial pure-Python nodes** under the node-test tree (e.g.

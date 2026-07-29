@@ -33,7 +33,11 @@ from ..base import IInstanceBase
 class IInstance(IInstanceBase):
     """The ``venv`` (main-side) bridge client: the round-trip splice of a venv boundary.
 
-    It sits mid-chain in main (``producer -> venv -> consumer``) and dials the child once.
+    It sits mid-chain in main (``producer -> venv -> consumer``) and dials the child once. Since
+    step 8.3 that producer and/or consumer may itself be **another** ``venv`` node: an
+    environment feeding another is routed through main's engine graph as a plain edge between
+    their two bridge nodes (§4.6), so the two calls simply nest -- this node's ``callRemote``
+    holds the stack while the next one runs on its own socket.
     The venv boundary is a request/response splice of a **single** object -- the object never
     forks -- so the whole boundary rides one socket with the ``remote`` request/response
     protocol (``callRemote``), and the object is never re-opened on the main pipe:

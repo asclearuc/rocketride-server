@@ -196,9 +196,10 @@ def test_venv_to_main_delivers_the_return_through_the_round_trip_node():
     assert ingress['input'] == [{'lane': 'text', 'from': 'venv_source_stub'}]
 
 
-def test_venv_to_venv_is_rejected():
-    # The round-trip model (v1) splices one linear main->venv->main boundary; a direct
-    # venv->venv edge needs the step-8 byte-router and is rejected with a named cause.
+def test_venv_to_venv_becomes_an_edge_between_bridge_nodes():
+    # Graph serialization (§4.6): a venv->venv lane is cut at BOTH boundaries and reaches its
+    # consumer as an ordinary main-graph edge between the two bridge nodes. v2 is a sink here —
+    # fed only by another venv, producing nothing — so it gets a forward channel and no return.
     seed = _node('seed')
     parse = _node('parse', input=[{'lane': 'text', 'from': 'seed'}])
     detect = _node('detect', input=[{'lane': 'image', 'from': 'parse'}])
@@ -207,8 +208,28 @@ def test_venv_to_venv_is_rejected():
         'components': [seed, _venv('v1', [parse], name='v1'), _venv('v2', [detect], name='v2')],
     }
 
-    with pytest.raises(ValueError, match='venv-to-venv'):
-        partition_pipeline(pipeline, scoped=True)
+    result = partition_pipeline(pipeline, scoped=True)
+
+    routes = _routes(result)
+    assert set(routes) == {'main->v1', 'v1->main', 'main->v2'}, 'v2 is a sink: no return channel'
+
+    # v1's image leaves through its own bridge, and that bridge is what v2's bridge reads.
+    main = result.environments['main']
+    v1_node = next(c for c in main['components'] if c['id'] == routes['main->v1']['egressNode'])
+    v2_node = next(c for c in main['components'] if c['id'] == routes['main->v2']['egressNode'])
+    assert v1_node['input'] == [{'lane': 'text', 'from': 'seed'}]
+    assert v2_node['input'] == [{'lane': 'image', 'from': v1_node['id']}]
+
+    # A sink venv is dialled without a return, so no `&return=` at spawn.
+    assert 'returnChannelId' not in v2_node['config']
+    assert v1_node['config']['returnChannelId'] == 'v1->main'
+
+    # The routing entry keeps the AUTHORED producer, not the bridge that relays it.
+    assert routes['main->v2']['producers'] == {'image': 'parse'}
+
+    # Each child is untouched by the chain: the linear step-7 shape, twice.
+    detect_out = next(c for c in result.environments['v2']['components'] if c['id'] == 'detect')
+    assert detect_out['input'] == [{'lane': 'image', 'from': routes['main->v2']['ingressNode']}]
 
 
 # ---------------------------------------------------------------------------
@@ -398,8 +419,9 @@ def test_two_independent_round_trips_each_get_their_own_node():
 # ---------------------------------------------------------------------------
 
 
-def test_a_to_b_to_main_chain_is_rejected():
-    # A main->v1->v2->main chain contains a v1->v2 edge (venv-to-venv), rejected in v1.
+def test_a_to_b_to_main_chain_is_wired_bridge_to_bridge():
+    # main->v1->v2->main. In main the chain is dropper -> MV1 -> MV2 -> ret, with the lane
+    # changing across the boundary (text in, image out) to prove each channel carries its own.
     pipeline = {
         'source': 'dropper',
         'components': [
@@ -410,14 +432,61 @@ def test_a_to_b_to_main_chain_is_rejected():
         ],
     }
 
-    with pytest.raises(ValueError, match='venv-to-venv'):
-        partition_pipeline(pipeline, scoped=True)
+    result = partition_pipeline(pipeline, scoped=True)
+
+    routes = _routes(result)
+    assert set(routes) == {'main->v1', 'v1->main', 'main->v2', 'v2->main'}
+    mv1, mv2 = routes['main->v1']['egressNode'], routes['main->v2']['egressNode']
+
+    main = result.environments['main']
+    assert [c for c in main['components'] if c['provider'] == 'venv'].__len__() == 2, 'one bridge per venv'
+    assert next(c for c in main['components'] if c['id'] == mv1)['input'] == [{'lane': 'text', 'from': 'dropper'}]
+    assert next(c for c in main['components'] if c['id'] == mv2)['input'] == [{'lane': 'image', 'from': mv1}]
+    # The main-side consumer reads the last venv through its round-trip node.
+    assert next(c for c in main['components'] if c['id'] == 'ret')['input'] == [{'lane': 'image', 'from': mv2}]
+
+    # Each child keeps the linear step-7 shape: stub + ingress + egress + its own node.
+    for env, node_id, lane_in, lane_out in (('v1', 'parse', 'text', 'image'), ('v2', 'detect', 'image', 'image')):
+        child = result.environments[env]
+        assert sum(1 for c in child['components'] if c['provider'] == 'venv_server') == 2
+        assert next(c for c in child['components'] if c['id'] == node_id)['input'] == [
+            {'lane': lane_in, 'from': routes[f'main->{env}']['ingressNode']}
+        ]
+        egress = next(c for c in child['components'] if c['id'] == routes[f'{env}->main']['egressNode'])
+        assert egress['input'] == [{'lane': lane_out, 'from': node_id}]
+
+
+def test_venv_feeding_two_venvs_fans_out_from_one_bridge():
+    # One producer, many consumers is legal — even when the consumers live in different venvs.
+    # v1 returns `text` once; both v2 and v3 read that single delivered lane off MV1.
+    a = _node('a', input=[{'lane': 'text', 'from': 'seed'}])
+    pipeline = {
+        'source': 'seed',
+        'components': [
+            _node('seed'),
+            _venv('v1', [a], name='v1'),
+            _venv('v2', [_node('b', input=[{'lane': 'text', 'from': 'a'}])], name='v2'),
+            _venv('v3', [_node('c', input=[{'lane': 'text', 'from': 'a'}])], name='v3'),
+        ],
+    }
+
+    result = partition_pipeline(pipeline, scoped=True)
+
+    routes = _routes(result)
+    mv1 = routes['main->v1']['egressNode']
+    main = result.environments['main']
+    for env in ('v2', 'v3'):
+        node = next(c for c in main['components'] if c['id'] == routes[f'main->{env}']['egressNode'])
+        assert node['input'] == [{'lane': 'text', 'from': mv1}]
+    # One return channel on v1, whose consumers live in two different child documents.
+    assert routes['v1->main']['consumers'] == {'text': ['b', 'c']}
 
 
 def test_venv_to_venv_cycle_is_rejected():
-    # seed(main) -> a(v1); a<->b across v1/v2 forms a venv cycle. Main stays non-empty so
-    # the empty-main guard does not pre-empt cycle detection.
-    a = _node('a', input=[{'lane': 'text', 'from': 'seed'}, {'lane': 'text', 'from': 'b'}])
+    # seed(main) -> a(v1); a<->b across v1/v2 forms a venv cycle. The two edges into v1 must
+    # use DISTINCT lanes: the merged-boundary conflict check sits upstream of cycle detection,
+    # so same-lane entries would be rejected as a conflict and never reach it.
+    a = _node('a', input=[{'lane': 'text', 'from': 'seed'}, {'lane': 'json', 'from': 'b'}])
     b = _node('b', input=[{'lane': 'text', 'from': 'a'}])
     pipeline = {
         'source': 'seed',
@@ -425,6 +494,60 @@ def test_venv_to_venv_cycle_is_rejected():
     }
 
     with pytest.raises(ValueError, match='cycle'):
+        partition_pipeline(pipeline, scoped=True)
+
+
+def test_venv_entered_twice_around_a_main_node_is_rejected():
+    # Authored as a DAG (seed -> a(v1) -> m(main) -> b(v1) -> out), but v1 collapses to ONE
+    # bridge node, so it rewrites to MV1 -> m -> MV1. Distinct lanes per direction, again so
+    # the conflict check does not pre-empt the cycle check.
+    a = _node('a', input=[{'lane': 'text', 'from': 'seed'}])
+    b = _node('b', input=[{'lane': 'json', 'from': 'm'}])
+    pipeline = {
+        'source': 'seed',
+        'components': [
+            _node('seed'),
+            _venv('v1', [a, b], name='v1'),
+            _node('m', input=[{'lane': 'text', 'from': 'a'}]),
+            _node('out', input=[{'lane': 'json', 'from': 'b'}]),
+        ],
+    }
+
+    with pytest.raises(ValueError, match='entered more than once'):
+        partition_pipeline(pipeline, scoped=True)
+
+
+def test_a_user_cycle_without_a_bridge_is_left_to_the_engine():
+    # The collapsed-cycle check is deliberately narrow: a cycle that does not pass through a
+    # bridge node is not the cut's doing, so the partitioner must not become stricter than the
+    # engine on shapes that have nothing to do with venvs.
+    pipeline = {
+        'source': 'seed',
+        'components': [
+            _node('seed'),
+            _node('x', input=[{'lane': 'text', 'from': 'seed'}, {'lane': 'text', 'from': 'y'}]),
+            _node('y', input=[{'lane': 'text', 'from': 'x'}]),
+            _venv('v1', [_node('a', input=[{'lane': 'text', 'from': 'seed'}])], name='v1'),
+        ],
+    }
+
+    result = partition_pipeline(pipeline, scoped=True)
+    assert 'v1' in result.environments
+
+
+def test_venv_that_only_emits_is_rejected():
+    # Nothing dials the child, so its egress would have no socket to ship the return on. This
+    # is also what keeps the forward-source lookup from dying on a KeyError instead.
+    pipeline = {
+        'source': 'seed',
+        'components': [
+            _node('seed'),
+            _venv('v1', [_node('a')], name='v1'),
+            _node('out', input=[{'lane': 'text', 'from': 'a'}]),
+        ],
+    }
+
+    with pytest.raises(ValueError, match='nothing is routed into it'):
         partition_pipeline(pipeline, scoped=True)
 
 

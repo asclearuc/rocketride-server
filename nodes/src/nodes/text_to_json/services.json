@@ -1,0 +1,55 @@
+{
+	//
+	// Required:
+	//		The displayable name of this node
+	//
+	"title": "Text To Json",
+	//
+	// Required:
+	//		The protocol; the logical type (`text_fail`) is derived from it and is the
+	//		`provider` used in a pipeline document.
+	//
+	"protocol": "text_to_json://",
+	//
+	// Required:
+	//		Class type of the node - a text filter.
+	//
+	"classType": ["json"],
+	//
+	// Required:
+	//		No special capabilities.
+	//
+	"capabilities": [],
+	//
+	// Optional:
+	//		Description of this driver.
+	//
+	"description": ["A text -> json filter that emits during the data phase. Used to give the virtual-environment diamond check a second branch that carries real data."],
+	//
+	// Optional:
+	//		Register a python filter factory for this node.
+	//
+	"register": "filter",
+	//
+	// Optional:
+	//		The node is a python node.
+	//
+	"node": "python",
+	//
+	// Optional:
+	//		The python package implementing the node.
+	//
+	"path": "nodes.text_to_json",
+	//
+	// Required:
+	//		The prefix map when added/removed when converting URLs <=> paths.
+	//
+	"prefix": "text_to_json",
+	//
+	//	Optional:
+	//		Consumes text, produces text.
+	//
+	"lanes": {
+		"text": ["json"]
+	}
+}
