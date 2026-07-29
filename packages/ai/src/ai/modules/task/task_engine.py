@@ -717,17 +717,12 @@ class Task(DAPBase):
     async def _spawn_venv_children(self, result: PartitionResult, run_token: str) -> Dict[str, int]:
         """Spawn one resident venv child per isolated group; return ``{env_id: data_port}``.
 
-        Children are siblings of the main engine (spawned by this server-side Task). v1 wires
-        only main<->child channels; a venv->venv channel needs the step-8 hub byte-router, so
-        it is rejected here rather than silently dropped. On any failure the caller's run
+        Children are siblings of the main engine (spawned by this server-side Task). Every
+        channel is main<->child by construction: an environment that feeds another is routed
+        through main's engine graph, as an edge between their two bridge nodes, so no channel
+        ever spans two children (§4.6, graph serialization). On any failure the caller's run
         fails and _terminated tears down whatever was spawned.
         """
-        for entry in result.routing:
-            if entry['sourceEnv'] != 'main' and entry['targetEnv'] != 'main':
-                raise RuntimeError(
-                    f'venv->venv channel "{entry["channelId"]}" needs the step-8 hub router; not supported in v1'
-                )
-
         exec_dir = os.path.dirname(sys.executable)
         project_id = result.environments['main'].get('project_id')
         avoid_mocks = bool(self._pipeline.get('avoidMocks'))

@@ -116,10 +116,11 @@ class PartitionResult:
 
     ``environments`` maps an env id to a runnable engine document (``'main'`` first,
     then each isolated group in document order). ``routing`` lists one entry per
-    boundary channel (keyed by ``channelId``) so the step-8 orchestrator can byte-route
-    frames between children through main. ``groups`` carries each venv's original
-    ``config.environment`` block (its display name; the container node itself is
-    stripped from the documents) for step-7/8 logging and metrics.
+    boundary channel (keyed by ``channelId``), a record of how each child was wired --
+    inter-venv traffic is routed by main's engine graph, not by the orchestrator.
+    ``groups`` carries each venv's original ``config.environment`` block (its display
+    name; the container node itself is stripped from the documents) for step-7/8
+    logging and metrics.
     """
 
     environments: 'OrderedDict[str, Dict[str, Any]]'
@@ -315,23 +316,70 @@ def _validate_source_placement(
         raise ValueError('The pipeline has no components in the base environment; the source/root must stay in main')
 
 
+FORWARD, RETURN = 'forward', 'return'
+
+
 def _collect_channels(
     components: List[Dict[str, Any]], env_of: Dict[str, str]
-) -> Tuple['OrderedDict[Tuple[str, str], Dict[str, Any]]', List[Tuple[Dict[str, Any], Tuple[str, str]]]]:
-    """Classify boundary edges into one channel per environment pair ``(sourceEnv, targetEnv)``.
+) -> Tuple[
+    'OrderedDict[Tuple[str, str], Dict[str, Any]]',
+    List[Tuple[Dict[str, Any], Tuple[str, str]]],
+    Dict[str, List[str]],
+]:
+    """Classify boundary edges into one **forward** and one **return** channel per venv.
 
     A single bridge node carries a whole boundary (all its lanes) over one socket -- the child
     runs one pipe stack, so a venv boundary is one connection, and the frame ``lane`` header
-    demuxes the lanes to their consumers (§1.2, Arch-1). Each lane in a channel therefore has
-    exactly **one** producer: a node's ``write*`` carries no producer identity, so two same-lane
-    producers on one boundary cannot be told apart downstream and are rejected. Multiple
-    consumers of a lane (in-venv fan-out) are fine.
+    demuxes the lanes to their consumers (§1.2, Arch-1). Channels are therefore keyed
+    ``(direction, env)``, not by environment pair: everything entering a venv shares its forward
+    channel and everything leaving it shares its return channel, whatever the other end is. That
+    is what lets a venv feed another venv (§4.6, graph serialization) -- such an edge is cut
+    **twice**, once at each boundary it crosses, and reaches its consumer as an ordinary
+    main-graph edge between the two bridge nodes.
 
-    Returns the channels in first-encounter order and the ``(edge, key)`` pairs to repoint once
-    ingress ids exist. An unknown ``from`` stays a dangling edge; a non-bridgeable lane is rejected.
+    ``sourceEnv``/``targetEnv`` keep naming the **socket peers** (main and the child), never the
+    data's true origin: the child selects a ``venv_server`` node's role from ``sourceEnv ==
+    'main'``, and the spawn injection picks the child env the same way.
+
+    Each lane in a channel has exactly **one** producer -- a node's ``write*`` carries no producer
+    identity, so two same-lane producers on one boundary cannot be told apart downstream. On the
+    forward side the comparison is on the *main-side* identity (the producer itself when it lives
+    in main, otherwise its environment, since a whole venv arrives through one bridge node); on
+    the return side it is on the producing node. Multiple consumers of a lane are fine.
+
+    Returns the channels in first-encounter order, the ``(edge, key)`` pairs to repoint once
+    ingress ids exist (exactly one per edge, keyed by the **consumer-side** channel), and the
+    venv-only quotient adjacency for cycle detection. An unknown ``from`` stays a dangling edge;
+    a non-bridgeable lane is rejected.
     """
+
+    def main_side_identity(node: str) -> str:
+        """What a forward boundary can tell apart: a main node, or an entire venv."""
+        env = env_of[node]
+        return node if env == MAIN_ENV else env
+
     channels: 'OrderedDict[Tuple[str, str], Dict[str, Any]]' = OrderedDict()
     edge_rewrites: List[Tuple[Dict[str, Any], Tuple[str, str]]] = []
+    quotient: Dict[str, List[str]] = {}
+
+    def channel_for(direction: str, env: str) -> Dict[str, Any]:
+        key = (direction, env)
+        channel = channels.get(key)
+        if channel is None:
+            source_env, target_env = (MAIN_ENV, env) if direction == FORWARD else (env, MAIN_ENV)
+            channel = {'sourceEnv': source_env, 'targetEnv': target_env, 'lanes': OrderedDict()}
+            channels[key] = channel
+        return channel
+
+    def register(channel: Dict[str, Any], lane: str, producer: str, consumer: str, on_conflict) -> None:
+        lane_info = channel['lanes'].get(lane)
+        if lane_info is None:
+            channel['lanes'][lane] = lane_info = {'producer': producer, 'consumers': []}
+        else:
+            on_conflict(lane_info['producer'], producer)
+        if consumer not in lane_info['consumers']:
+            lane_info['consumers'].append(consumer)
+
     for component, _ in walk_components(components):
         if is_container(component):
             continue
@@ -349,42 +397,55 @@ def _collect_channels(
                 raise ValueError(
                     f'Boundary edge on lane "{lane}" from "{producer}" to "{consumer_id}" crosses a virtual environment boundary, but "{lane}" is not bridgeable'
                 )
-            key = (source_env, target_env)
-            channel = channels.get(key)
-            if channel is None:
-                channel = {'sourceEnv': source_env, 'targetEnv': target_env, 'lanes': OrderedDict()}
-                channels[key] = channel
-            lane_info = channel['lanes'].get(lane)
-            if lane_info is None:
-                lane_info = {'producer': producer, 'consumers': []}
-                channel['lanes'][lane] = lane_info
-            elif lane_info['producer'] != producer:
-                raise ValueError(
-                    f'Environment boundary "{source_env}" -> "{target_env}" carries lane "{lane}" from '
-                    f'more than one producer ("{lane_info["producer"]}" and "{producer}"); a single bridge '
-                    'node cannot tell same-lane producers apart, so this shape is not supported yet'
-                )
-            if consumer_id not in lane_info['consumers']:
-                lane_info['consumers'].append(consumer_id)
-            edge_rewrites.append((edge, key))
-    return channels, edge_rewrites
+
+            # The producer's side first, so that a shape which conflicts on both boundaries
+            # reports the cause nearest the data's origin.
+            if source_env != MAIN_ENV:
+
+                def out_conflict(held: str, incoming: str, env: str = source_env, lane: str = lane) -> None:
+                    if held != incoming:
+                        raise ValueError(
+                            f'The boundary out of virtual environment "{env}" carries lane "{lane}" '
+                            f'from more than one producer ("{held}" and "{incoming}"); one egress '
+                            'node cannot tell same-lane producers apart. Merge or route them inside '
+                            'the environment instead.'
+                        )
+
+                register(channel_for(RETURN, source_env), lane, producer, consumer_id, out_conflict)
+
+            if target_env != MAIN_ENV:
+
+                def in_conflict(held: str, incoming: str, env: str = target_env, lane: str = lane) -> None:
+                    if main_side_identity(held) != main_side_identity(incoming):
+                        raise ValueError(
+                            f'The boundary into virtual environment "{env}" carries lane "{lane}" '
+                            f'from more than one producer ("{held}" and "{incoming}"); one bridge '
+                            'node cannot tell same-lane producers apart. Merge or route them inside '
+                            'the environment instead.'
+                        )
+
+                register(channel_for(FORWARD, target_env), lane, producer, consumer_id, in_conflict)
+
+            if source_env != MAIN_ENV and target_env != MAIN_ENV:
+                quotient.setdefault(source_env, [])
+                quotient.setdefault(target_env, [])
+                if target_env not in quotient[source_env]:
+                    quotient[source_env].append(target_env)
+
+            # One rewrite per edge: the consumer reads from its own side of the boundary.
+            edge_rewrites.append((edge, (FORWARD, target_env) if target_env != MAIN_ENV else (RETURN, source_env)))
+    return channels, edge_rewrites, quotient
 
 
-def _reject_env_cycles(channels: 'OrderedDict[Tuple[str, str, str], Dict[str, Any]]') -> None:
+def _reject_env_cycles(quotient: Dict[str, List[str]]) -> None:
     """Reject a directed cycle in the venv-only env-quotient graph.
 
-    Main is excluded: routing through main is transparent, so only venv↔venv dependency
-    cycles can deadlock, while main-terminated chains (``main→V1→V2→main``) stay legal.
+    Main is excluded: routing through main is transparent, so only venv↔venv dependency cycles
+    can deadlock, while main-terminated chains (``main→V1→V2→main``) are legal and are exactly
+    what step 8.3 enables. The adjacency comes from ``_collect_channels`` rather than from the
+    channels themselves -- under ``(direction, env)`` keying every channel has main on one side,
+    so the venv→venv relation lives inside the channels' lanes, not in their keys.
     """
-    quotient: Dict[str, List[str]] = {}
-    for channel in channels.values():
-        src, dst = channel['sourceEnv'], channel['targetEnv']
-        if src == MAIN_ENV or dst == MAIN_ENV:
-            continue
-        quotient.setdefault(src, [])
-        quotient.setdefault(dst, [])
-        if dst not in quotient[src]:
-            quotient[src].append(dst)
     cycle = _detect_cycle(quotient)
     if cycle is not None:
         raise ValueError('Cross-environment cycle between virtual environments: ' + ' -> '.join(cycle))
@@ -397,16 +458,19 @@ def _assign_channel_ids(
 ) -> Dict[str, str]:
     """Assign each channel its ``channelId`` and bridge node ids; return per-child stub ids.
 
-    One channel per environment pair, so ``channelId`` is ``{sourceEnv}->{targetEnv}``. Node ids
-    are unique **within their own document** (main and each child are separate docs); the
-    ``channelId`` is the global routing key and must not collide (only possible if an env id
-    itself contains ``->``).
+    One forward and one return channel per venv, so ``channelId`` stays ``{sourceEnv}->{targetEnv}``
+    -- i.e. ``main->{env}`` and ``{env}->main``, naming the socket peers. Node ids are unique
+    **within their own document** (main and each child are separate docs); the ``channelId`` is the
+    global routing key and must not collide (only possible if an env id itself contains ``->``).
+    The channel *key* is ``(direction, env)`` and must not be unpacked here -- the ids come from
+    the channel's own ``sourceEnv``/``targetEnv``.
     """
     taken: Dict[str, set] = {env: {leaf.get('id') for leaf in leaves} for env, leaves in buckets.items()}
     stub_ids = {env: _unique_id(VENV_SOURCE_STUB_ID, taken[env]) for env in venv_envs}
 
     seen_channel_ids: set = set()
-    for (source_env, target_env), channel in channels.items():
+    for channel in channels.values():
+        source_env, target_env = channel['sourceEnv'], channel['targetEnv']
         channel_id = f'{source_env}->{target_env}'
         if channel_id in seen_channel_ids:
             raise ValueError(f'Duplicate channelId "{channel_id}"; environment ids must not contain "->"')
@@ -441,39 +505,27 @@ def _bridge_config(channel: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _pair_boundaries(channels: 'OrderedDict[Tuple[str, str], Dict[str, Any]]') -> None:
-    """Pair each venv's forward (``main -> env``) and return (``env -> main``) channel for the
-    round-trip bridge model, and reject shapes v1 does not support (step 8.3).
+    """Pair each venv's forward and return channel for the round-trip bridge model.
 
     The venv boundary is a request/response splice of one object: the object never forks, so the
     return must ride back over the **forward** socket and re-enter main through the **same** node
     that sent it (the engine allows one open object per pipe stack, entered at the root -- a
-    separate async re-injection cannot open the already-open object). Channels are keyed per
-    environment pair, so each venv has at most one forward and one return channel, each carrying
-    all its lanes over one socket (§1.2, Arch-1). Direct ``venv <-> venv`` channels need the
-    step-8.3 graph-serialization rewrite and are rejected here with a named cause.
+    separate async re-injection cannot open the already-open object). Channels are keyed
+    ``(direction, env)``, so each venv has at most one forward and one return channel by
+    construction, each carrying all its lanes over one socket (§1.2, Arch-1).
 
     Mutates the channels in place: sets ``returnChannel`` on the paired forward channel, and
     points the return channel's ``deliverNode``/``ingressNode`` at the round-trip node (the
     forward egress) that delivers it.
     """
-    forward_by_env: Dict[str, Dict[str, Any]] = {}
-    return_by_env: Dict[str, Dict[str, Any]] = {}
-    for channel in channels.values():
-        src, dst = channel['sourceEnv'], channel['targetEnv']
-        if src != MAIN_ENV and dst != MAIN_ENV:
-            raise ValueError(
-                f'Channel "{channel["channelId"]}" crosses directly between virtual environments '
-                f'"{src}" and "{dst}"; venv-to-venv routing is not supported yet'
-            )
-        if src == MAIN_ENV:
-            forward_by_env[dst] = channel  # exactly one per target env by (src, dst) keying
-        else:
-            return_by_env[src] = channel
+    forward_by_env = {env: channel for (direction, env), channel in channels.items() if direction == FORWARD}
+    return_by_env = {env: channel for (direction, env), channel in channels.items() if direction == RETURN}
 
     for env, ret in return_by_env.items():
         forward = forward_by_env.get(env)
         if forward is None:
-            raise ValueError(f'Virtual environment "{env}" returns to main but is not fed from main')
+            # Nothing dials the child, so its egress would have no socket to ship the return on.
+            raise ValueError(f'Virtual environment "{env}" produces output but nothing is routed into it')
         forward['returnChannel'] = ret
         # The round-trip node (the forward egress) both sends into the venv and delivers its
         # return downstream, so return consumers read from it and its routing entry points there
@@ -482,8 +534,30 @@ def _pair_boundaries(channels: 'OrderedDict[Tuple[str, str], Dict[str, Any]]') -
         ret['ingressNode'] = forward['egressNode']
 
 
+def _resolve_forward_sources(channels: 'OrderedDict[Tuple[str, str], Dict[str, Any]]', env_of: Dict[str, str]) -> None:
+    """Record, per forward lane, the **main-side** node its bridge reads from.
+
+    A lane produced in main is read from the producer itself; a lane produced inside another venv
+    is read from *that* venv's bridge node, which is what delivers it into main. That single
+    substitution is the whole of graph serialization (§4.6): the venv quotient becomes ordinary
+    edges between bridge nodes.
+
+    Must run **after** ``_pair_boundaries``: a venv that emits into another venv but is itself fed
+    by nothing has no forward channel, and pairing is what turns that into a named error rather
+    than the ``KeyError`` this lookup would raise.
+    """
+    for (direction, _env), channel in channels.items():
+        if direction != FORWARD:
+            continue
+        for lane_info in channel['lanes'].values():
+            producer_env = env_of[lane_info['producer']]
+            lane_info['sourceNode'] = (
+                lane_info['producer'] if producer_env == MAIN_ENV else channels[(FORWARD, producer_env)]['egressNode']
+            )
+
+
 def _synthesize_bridges(
-    channels: 'OrderedDict[Tuple[str, str, str], Dict[str, Any]]',
+    channels: 'OrderedDict[Tuple[str, str], Dict[str, Any]]',
     buckets: 'OrderedDict[str, List[Dict[str, Any]]]',
     stub_ids: Dict[str, str],
 ) -> Dict[str, List[Dict[str, Any]]]:
@@ -492,27 +566,27 @@ def _synthesize_bridges(
     The boundary is spliced with the ``remote`` request/response model, over one socket per
     forward channel:
 
-    - A **forward channel** (``main -> env``) yields a round-trip ``venv`` node in main (it
-      reads the main producer, sends the forward stream, and -- when a return is paired --
-      delivers the return downstream to the repointed consumers) and a ``venv_server``
-      ingress in the child (reads the child stub, applies the forward stream locally).
-    - A **return channel** (``env -> main``) yields only a ``venv_server`` egress in the
-      child (reads the venv producer, ships the return back over the **same** socket its
-      paired forward node dialed). Main has no separate ingress node: the return re-enters
-      through the round-trip node, so the object is never re-opened (see ``_pair_boundaries``).
+    - A **forward channel** yields a round-trip ``venv`` node in main (it reads each lane's
+      main-side source -- a main producer, or another venv's bridge node -- sends the forward
+      stream, and, when a return is paired, delivers that return downstream to the repointed
+      consumers) and a ``venv_server`` ingress in the child (reads the child stub, applies the
+      forward stream locally).
+    - A **return channel** yields only a ``venv_server`` egress in the child (reads the venv
+      producers, ships the return back over the **same** socket its paired forward node dialed).
+      Main has no separate ingress node: the return re-enters through the round-trip node, so the
+      object is never re-opened (see ``_pair_boundaries``).
     """
     bridge_nodes: Dict[str, List[Dict[str, Any]]] = {env: [] for env in buckets}
     for channel in channels.values():
         src, dst = channel['sourceEnv'], channel['targetEnv']
-        # One input edge per lane, each from that lane's single producer.
-        producer_edges = [{'lane': lane, 'from': info['producer']} for lane, info in channel['lanes'].items()]
         if src == MAIN_ENV:
-            # Forward channel: round-trip node in main + ingress in the child.
+            # Forward channel: round-trip node in main + ingress in the child. Its inputs are the
+            # lanes' main-side sources, so a venv-produced lane arrives from that venv's bridge.
             bridge_nodes[MAIN_ENV].append(
                 {
                     'id': channel['egressNode'],
                     'provider': 'venv',
-                    'input': producer_edges,
+                    'input': [{'lane': lane, 'from': info['sourceNode']} for lane, info in channel['lanes'].items()],
                     'config': _bridge_config(channel),
                 }
             )
@@ -526,12 +600,13 @@ def _synthesize_bridges(
             )
         else:
             # Return channel: egress in the child only; main delivery is the paired
-            # round-trip node (no separate main ingress).
+            # round-trip node (no separate main ingress). One input edge per lane, each from
+            # that lane's single in-venv producer.
             bridge_nodes[src].append(
                 {
                     'id': channel['egressNode'],
                     'provider': 'venv_server',
-                    'input': producer_edges,
+                    'input': [{'lane': lane, 'from': info['producer']} for lane, info in channel['lanes'].items()],
                     'config': _bridge_config(channel),
                 }
             )
@@ -570,8 +645,49 @@ def _assemble_documents(
     return environments
 
 
+def _reject_main_cycles(main_components: List[Dict[str, Any]], bridge_env: Dict[str, str]) -> None:
+    """Reject a cycle that the cut itself creates in main's graph.
+
+    A venv collapses to exactly **one** bridge node in main (§1.2, Arch-1), so entering the same
+    environment twice around a base-environment node folds into ``MV -> m -> MV`` -- a cycle,
+    even though the authored document is a DAG and runs fine flattened under ``=0``. The author
+    never wrote the node names in that cycle, so the engine's own check (which names a lifecycle
+    root index, and only at pipeline open, after N children have been spawned) cannot explain it;
+    this one names the environment at cut time instead.
+
+    Deliberately narrow: only a cycle that passes through a bridge node is ours to reject, so the
+    partitioner never becomes stricter than the engine on shapes that have nothing to do with
+    venvs. ``_detect_cycle`` returns a single cycle, so a document containing both a user cycle
+    and a bridge cycle may surface neither here -- the engine remains the backstop.
+    """
+    known = {component.get('id') for component in main_components}
+    adjacency: Dict[str, List[str]] = {component.get('id'): [] for component in main_components}
+    for component in main_components:
+        for edge in component.get('input', []) or []:
+            producer = edge.get('from')
+            if producer in known and component.get('id') not in adjacency[producer]:
+                adjacency[producer].append(component.get('id'))
+
+    cycle = _detect_cycle(adjacency)
+    if cycle is None or not any(node in bridge_env for node in cycle):
+        return
+    envs = list(OrderedDict.fromkeys(bridge_env[node] for node in cycle if node in bridge_env))
+    path = ' -> '.join(bridge_env.get(node, node) for node in cycle)
+    raise ValueError(
+        f'Virtual environment "{envs[0]}" is entered more than once along "{path}"; a virtual '
+        'environment is one bridge node in the base pipeline, so re-entering it around a base '
+        'component forms a cycle. Move the base component inside the environment, or split it '
+        'into two environments.'
+    )
+
+
 def _routing_table(channels: 'OrderedDict[Tuple[str, str], Dict[str, Any]]') -> List[Dict[str, Any]]:
-    """One routing entry per environment-pair channel, keyed by ``channelId``."""
+    """One routing entry per channel, keyed by ``channelId``.
+
+    ``producers``/``consumers`` stay **authored** ids: for a venv→venv lane the producer lives in
+    the source venv's document and the consumer in the target's, not the bridge nodes that carry
+    them across. The rewritten main-side source is kept separately, on the lane's ``sourceNode``.
+    """
     return [
         {
             'channelId': channel['channelId'],
@@ -611,12 +727,13 @@ def _cut_pipeline(pipeline: Dict[str, Any], source: Optional[str]) -> PartitionR
     buckets = _bucket_leaves_by_env(components, env_of)
     _validate_source_placement(components, env_of, work.get('source'), buckets)
 
-    channels, edge_rewrites = _collect_channels(components, env_of)
-    _reject_env_cycles(channels)
+    channels, edge_rewrites, quotient = _collect_channels(components, env_of)
+    _reject_env_cycles(quotient)
 
     venv_envs = [env for env in buckets if env != MAIN_ENV]
     stub_ids = _assign_channel_ids(channels, buckets, venv_envs)
     _pair_boundaries(channels)
+    _resolve_forward_sources(channels, env_of)
 
     # Repoint each boundary consumer edge. A forward consumer (in a child) reads from its
     # child ingress; a return consumer (in main) reads from the round-trip node that both
@@ -627,6 +744,12 @@ def _cut_pipeline(pipeline: Dict[str, Any], source: Optional[str]) -> PartitionR
 
     bridge_nodes = _synthesize_bridges(channels, buckets, stub_ids)
     environments = _assemble_documents(work, buckets, bridge_nodes, env_blocks, stub_ids)
+
+    # Only now does main's graph exist in final form, which is where a venv entered twice shows
+    # up as a cycle between its own bridge node and the base components around it.
+    bridge_env = {channel['egressNode']: env for (direction, env), channel in channels.items() if direction == FORWARD}
+    _reject_main_cycles(environments[MAIN_ENV]['components'], bridge_env)
+
     groups = {env: env_blocks[env] for env in venv_envs}
     return PartitionResult(environments=environments, routing=_routing_table(channels), groups=groups)
 
@@ -664,7 +787,9 @@ def partition_pipeline(pipeline: Dict[str, Any], source: Optional[str] = None, s
         ValueError: A container nests an environment inside another, holds the source, is
             connected to as if it produced data, an invoke edge crosses an environment
             boundary; or, when scoped, a boundary edge on a non-bridgeable lane, a
-            cross-env cycle between venvs, or a base environment left without the source.
+            cross-env cycle between venvs, an environment entered more than once around a
+            base component, one boundary carrying a lane from two producers, an environment
+            that emits but is fed by nothing, or a base environment left without the source.
     """
     if scoped:
         return _cut_pipeline(pipeline, source)
