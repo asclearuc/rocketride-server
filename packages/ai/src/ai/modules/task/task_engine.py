@@ -769,7 +769,10 @@ class Task(DAPBase):
             '--autoterm',
             '--monitor=app',
             f'--data_port={port}',
-            '--data_host=localhost',
+            # 127.0.0.1, not 'localhost': the bridge dials ws://127.0.0.1:{port} and on Windows
+            # 'localhost' can resolve to ::1 first, binding a listener the dial never reaches.
+            # Upstream moved the main engine's data channel off 'localhost' for the same reason.
+            '--data_host=127.0.0.1',
         ]
         modelserver = self._server._config.get('modelserver')
         if modelserver:
