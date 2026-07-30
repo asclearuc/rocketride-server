@@ -72,7 +72,20 @@ from .pipeline import partition_pipeline, resolve_pipeline_env, has_isolated_gro
 from .venv_spawn import (
     VenvChild,
     VENV_TOKEN_ENV,
+    CH_DETAIL,
+    CH_FLOW,
+    CH_NONE,
+    CH_OUTPUT,
+    CH_SSE,
+    SE_ERROR,
+    SE_EXIT,
+    SE_METRICS,
+    SE_STATUS_TRACE,
+    SE_STATUS_WINDOW,
+    SE_TAIL,
+    SE_WARNING,
     build_child_env,
+    classify_child_event,
     inject_venv_urls,
     overlay_site,
     probe_ready,
@@ -228,6 +241,71 @@ class Task(DAPBase):
             """
             await self._parent_task._terminated()
 
+    class VenvChildStdio(DbgStdio):
+        """DAP client for stdio communication with ONE venv child.
+
+        Same transport as the main engine's ``TaskDbgStdio`` -- the child is spawned with the
+        same ``--monitor=app``, so its stdout speaks the same '>' protocol -- but a different
+        contract on both ends: events are routed through the venv policy table rather than
+        straight into ``Task.on_event``, and a disconnect does NOT end the run.
+        """
+
+        def __init__(self, parent_task: 'Task', child: VenvChild, **kwargs):
+            """Bind the pump to its child so routing can attribute every event."""
+            self._parent_task = parent_task
+            self._child = child
+            super().__init__(**kwargs)
+
+        async def on_event(self, event: Dict[str, Any]) -> None:
+            """Stamp at ingress, then hand to the venv fan-in.
+
+            Stamping mirrors ``TaskDbgStdio``: the time is the child's emission time, and the
+            logSeq is deliberately NOT assigned here because the policy drops some events
+            entirely and a seq burned on an undelivered message leaves a gap in the continuum.
+            """
+            self._parent_task.stamp_log_event(event, assign_seq=False)
+            await self._parent_task._on_child_event(self._child, event)
+
+        async def on_disconnected(self, reason=None, has_error=False):
+            """A child's stdio closing is not the run ending.
+
+            The main engine's ``TaskDbgStdio`` calls ``_terminated`` here; doing the same for a
+            child would let one venv's exit kill the whole run. Deliberate teardown also lands
+            here (``disconnect()`` fires this callback itself), which is what ``stopping``
+            distinguishes -- without it every clean run would end by logging N child deaths.
+            """
+            self._child.exited = True
+            if not self._child.stopping:
+                self._parent_task.debug_message(
+                    f'venv child "{self._child.name}" ({self._child.env_id}) stdio closed unexpectedly'
+                )
+
+        async def drain_pending(self, timeout: float = 1.0) -> None:
+            """Let the stream readers finish naturally before a disconnect cancels them.
+
+            ``TransportStdio.disconnect()`` CANCELS its stdout/stderr tasks rather than
+            letting them drain, so calling it on a just-exited child truncates exactly the
+            last lines the startup-failure message quotes. After the process exits those
+            readers hit EOF and complete on their own, so a bounded wait recovers them. The
+            transport exposes no such call, hence this shim -- knowing about its internals
+            belongs here rather than in the orchestration.
+            """
+            transport = getattr(self, '_transport', None)
+            tasks = [
+                task
+                for task in (
+                    getattr(transport, '_stdout_task', None),
+                    getattr(transport, '_stderr_task', None),
+                )
+                if task is not None and not task.done()
+            ]
+            if not tasks:
+                return
+            try:
+                await asyncio.wait(tasks, timeout=timeout)
+            except Exception:
+                pass
+
     class TaskDbgDebugpy(DbgDebugpy):
         """DAP client for debugpy server connections."""
 
@@ -359,6 +437,12 @@ class Task(DAPBase):
         # The per-run bridge token, shared (via inherited env) by the main engine and every
         # venv child; None unless venv scoping is active this run.
         self._run_venv_token: Optional[str] = None
+        # False until this run's main engine is spawned. Gates the one thing a venv child may
+        # write to the run's status (its startup progress), because that window IS child
+        # startup. Deliberately a per-run flag rather than `_engine_process is None`: that
+        # attribute is assigned once at spawn and never nulled, so on a RESTARTED task it
+        # still holds the previous run's dead handle and the window would never reopen.
+        self._main_engine_started = False
 
         # Status tracking
         self._status = TASK_STATUS()
@@ -743,6 +827,23 @@ class Task(DAPBase):
             port_by_env[env_id] = port
         return port_by_env
 
+    def _effective_trace_arg(self) -> Optional[str]:
+        """The ``--trace=`` this run actually uses, or ``None`` when it never set one.
+
+        Mirrors the precedence the main-engine spawn applies: an explicit flag in the launch
+        request's ``args`` wins, and the server's own ``startup_args()`` is only the
+        fallback. Kept as one helper so the child cannot drift from main by inheriting just
+        the fallback half.
+        """
+        for arg in self._launch_args.get('args', []) or []:
+            for part in shlex.split(arg) if ' ' in arg else [arg]:
+                if part.startswith('--trace='):
+                    return part
+        for arg in startup_args():
+            if arg.startswith('--trace='):
+                return arg
+        return None
+
     async def _spawn_one_venv_child(
         self,
         env_id: str,
@@ -773,6 +874,16 @@ class Task(DAPBase):
         if modelserver:
             child_args.append(f'--modelserver={modelserver}')
 
+        # Inherit the run's EFFECTIVE trace level. Without this the boundary forwards the
+        # child's traces (8.4) at the engine default while main's carry the level the run
+        # asked for -- so a venv appears to "lose" trace data at exactly the moment someone
+        # raises the level to debug something. Effective, not just startup_args(): the main
+        # engine takes a --trace= from the launch request first and only falls back to the
+        # server's own, so inheriting the fallback alone recreates the asymmetry.
+        trace_arg = self._effective_trace_arg()
+        if trace_arg:
+            child_args.append(trace_arg)
+
         child_env = build_child_env(
             os.environ,
             self.client_id,
@@ -791,11 +902,35 @@ class Task(DAPBase):
             limit=CONST_SUBPROCESS_BUFFER_LIMIT,
             env=child_env,
         )
-        child = VenvChild(env_id=env_id, name=name, process=process, port=port, tmpfile=tmpfile)
-        # Drain the child's stdout/stderr so its pipes never fill and deadlock it; the tail
-        # buffer keeps the last lines so a startup failure can report the child's own error.
-        child.drains.append(asyncio.create_task(self._drain_child_stream(process.stdout, env_id, child.tail)))
-        child.drains.append(asyncio.create_task(self._drain_child_stream(process.stderr, env_id, child.tail)))
+        child = VenvChild(
+            env_id=env_id,
+            name=name,
+            process=process,
+            port=port,
+            tmpfile=tmpfile,
+            # Per-live-child, truncated at spawn: keyed by port as well as env id because env
+            # names collide across concurrent runs, and truncating a shared name would clobber
+            # another run's live log. The port is recycled, so this bounds the file count.
+            log_path=os.path.join(tempfile.gettempdir(), f'venv-child-{env_id}-{port}.log'),
+        )
+        try:
+            with open(child.log_path, 'w', encoding='utf-8'):
+                pass
+        except Exception:
+            child.log_path = None
+
+        # Attach the DAP pump BEFORE readiness: it drains stdout/stderr so the child's pipes
+        # never fill and deadlock it (what the raw readline drains used to do), and it is also
+        # what feeds the tail the startup-failure message quotes. Attaching after a successful
+        # probe would look tidier and lose exactly the output that explains a failed one.
+        child.pump = Task.VenvChildStdio(
+            parent_task=self,
+            child=child,
+            id=f'{self.id}.{env_id}',
+            token=self.token,
+            process=process,
+        )
+        await child.pump.connect()
 
         try:
             # Readiness: the resident source's WebServer must be accepting connections before
@@ -806,15 +941,17 @@ class Task(DAPBase):
         except BaseException as e:
             # This child is not yet registered for teardown, so clean it up here or it leaks:
             # a hung child would survive until the server dies (its stdin stays open, so
-            # --autoterm never fires). Let the drains flush the child's last output (for the
-            # message) if it exited, then cancel them, kill+reap the process, drop its file.
-            if process.returncode is not None:
+            # --autoterm never fires). Drain BEFORE disconnecting: the transport's disconnect
+            # cancels its readers rather than letting them finish, which would truncate
+            # exactly the last lines this error message is about to quote.
+            if child.pump is not None:
+                if process.returncode is not None:
+                    await child.pump.drain_pending(1.0)
+                child.stopping = True
                 try:
-                    await asyncio.wait_for(asyncio.gather(*child.drains, return_exceptions=True), timeout=1.0)
+                    await child.pump.disconnect()
                 except Exception:
                     pass
-            for drain in child.drains:
-                drain.cancel()
             try:
                 await kill_process(process, CONST_CANCEL_WAIT_TIMEOUT_SECONDS)
             except Exception:
@@ -829,31 +966,115 @@ class Task(DAPBase):
         self.debug_message(f'venv child "{name}" ({env_id}) ready on port {port} (PID {process.pid})')
         return child
 
-    async def _drain_child_stream(self, stream: Optional[asyncio.StreamReader], env_id: str, tail=None) -> None:
-        """Continuously drain a venv child's stdout/stderr so it never blocks on a full pipe.
+    @staticmethod
+    def _render_child_event(event: Dict[str, Any]) -> str:
+        """One log line for a child event: its own text where it has one, else the shape.
 
-        Each line is mirrored to ``%TEMP%/venv-child-<env>.log`` and, when a ``tail`` ring is
-        given, kept there so a startup failure can quote the child's own error.
+        Used for the tail and the per-child mirror, both read by humans hunting a startup
+        failure. Two rules earned by looking at the output: an ``output`` event renders as
+        the bare line the child printed (this file is meant to read like the child's console,
+        and prefixing every line with the event name buries the banner and the tracebacks);
+        and a blank line stays blank rather than falling back to the event name, or a child
+        that prints spacing would fill the log with the literal word "output".
         """
-        if stream is None:
+        body = event.get('body') if isinstance(event.get('body'), dict) else {}
+        name = event.get('event', '?')
+
+        if name == 'output':
+            value = body.get('output')
+            return value.rstrip() if isinstance(value, str) else ''
+
+        for key in ('message', 'status'):
+            value = body.get(key)
+            if isinstance(value, str) and value.strip():
+                return f'{name}: {value.rstrip()}'
+        return name
+
+    def _mirror_child_line(self, child: VenvChild, text: str) -> None:
+        """Append one rendered line to the child's own log file (best-effort)."""
+        if not child.log_path:
             return
-        log_path = os.path.join(tempfile.gettempdir(), f'venv-child-{env_id}.log')
         try:
-            while True:
-                line = await stream.readline()
-                if not line:
-                    break
-                text = line.decode(errors='replace').rstrip()
-                if tail is not None:
-                    tail.append(text)
-                self.debug_message(f'[venv {env_id}] {text}')
-                try:
-                    with open(log_path, 'a', encoding='utf-8') as f:
-                        f.write(text + '\n')
-                except Exception:
-                    pass
+            with open(child.log_path, 'a', encoding='utf-8') as handle:
+                handle.write(text + '\n')
         except Exception:
             pass
+
+    async def _on_child_event(self, child: VenvChild, event: Dict[str, Any]) -> None:
+        """Fan one venv child's event into the run, per the policy in ``venv_spawn``.
+
+        The routing decision is a pure function so it can be tested without a Task; this
+        method only performs the effects. What a child may touch in the run's shared state is
+        deliberately narrow -- it must never move the billing gate, main's flow accounting or
+        the displayed current object -- and the exceptions are the ones where a child's news
+        genuinely belongs to the run: its errors, its metrics, and its startup progress.
+        """
+        route = classify_child_event(event)
+        text = self._render_child_event(event)
+
+        # The mirror takes everything, rendered: it is the first thing anyone opens when a
+        # child misbehaves, so narrowing it to the tail's subset would degrade the tool
+        # people reach for first.
+        self._mirror_child_line(child, text)
+        self.debug_message(f'[venv {child.env_id}] {text}')
+
+        effects = route.side_effects
+        if SE_TAIL in effects:
+            child.tail.append(text)
+        if SE_EXIT in effects:
+            child.exited = True
+        if SE_STATUS_TRACE in effects:
+            self._status_trace.append(f'[{child.name}] {text}')
+            if len(self._status_trace) > 5000:
+                self._status_trace = self._status_trace[-5000:]
+
+        body = event.get('body') or {}
+        if SE_ERROR in effects:
+            self._status.errors.append(f'[{child.name}] {body.get("message", "")}')
+            if len(self._status.errors) > 50:
+                self._status.errors = self._status.errors[-50:]
+            self._status_updated = True
+        if SE_WARNING in effects:
+            self._status.warnings.append(f'[{child.name}] {body.get("message", "")}')
+            if len(self._status.warnings) > 50:
+                self._status.warnings = self._status.warnings[-50:]
+            self._status_updated = True
+        if SE_METRICS in effects and self._task_metrics:
+            self._task_metrics.merge_subprocess_metrics(body.get('metrics', {}), source=child.env_id)
+
+        # Child startup progress becomes the run's status, but ONLY before the main engine
+        # exists -- that window is exactly child startup, which is what turns a silent
+        # 30-second death into visible install progress. Outside it the child would overwrite
+        # whatever main reports, hundreds of times per run. Nothing broadcasts during the
+        # window either (the periodic loop starts with the main engine), so this also sends.
+        if SE_STATUS_WINDOW in effects and not self._main_engine_started:
+            message = body.get('message', '')
+            if message:
+                self._status.status = f'[{child.name}] {message}'
+                self._status_updated = True
+                await self._send_status_update()
+
+        if route.channel is CH_NONE:
+            return
+        # A child emits >DBG whether or not the run asked for tracing, so forwarding ungated
+        # would deliver trace volume that =0 does not.
+        if route.channel == CH_FLOW and not self._pipelineTraceLevel:
+            return
+
+        event_type = {
+            CH_SSE: EVENT_TYPE.SSE,
+            CH_OUTPUT: EVENT_TYPE.OUTPUT,
+            CH_FLOW: EVENT_TYPE.FLOW,
+            CH_DETAIL: EVENT_TYPE.DETAIL,
+        }[route.channel]
+
+        if route.rename_to:
+            event['event'] = route.rename_to
+        # Tagged here, not in _forward_task_event: that one is shared with main's own events
+        # and has no idea which child anything came from.
+        if isinstance(event.get('body'), dict):
+            event['body']['env'] = {'id': child.env_id, 'name': child.name}
+        await self._forward_task_event(event_type, event)
 
     async def _teardown_venv_children(self) -> None:
         """Kill and reap every venv child, releasing its port and removing its task file.
@@ -864,8 +1085,15 @@ class Task(DAPBase):
         """
         children, self._venv_children = self._venv_children, []
         for child in children:
-            for drain in child.drains:
-                drain.cancel()
+            # Mark before disconnecting: the transport fires on_disconnected from disconnect()
+            # too, and without this every clean run would end by logging N child deaths.
+            child.stopping = True
+            if child.pump is not None:
+                try:
+                    await child.pump.disconnect()
+                except Exception as e:
+                    self.debug_message(f'Error stopping venv child pump {child.env_id}: {e}')
+                child.pump = None
             try:
                 await kill_process(child.process, CONST_CANCEL_WAIT_TIMEOUT_SECONDS)
             except Exception as e:
@@ -2241,6 +2469,10 @@ class Task(DAPBase):
             self._status.completed = False
             self._final_events_sent = False
             self._terminated_called = False
+            # Reopen the venv-child status window for this run. A restart reuses the Task, so
+            # a flag left True would silently suppress every child's startup progress on every
+            # run after the first.
+            self._main_engine_started = False
             self._service_up_notes = []
             self._service_down_notes = []
             self._stop_requested = False
@@ -2406,6 +2638,9 @@ class Task(DAPBase):
                 limit=CONST_SUBPROCESS_BUFFER_LIMIT,
                 env=subprocess_env,
             )
+            # Close the venv-child status window: from here main owns the run's status line,
+            # and a child writing to it would just overwrite whatever main reports.
+            self._main_engine_started = True
 
             # Initialize stdio interface
             try:

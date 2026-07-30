@@ -1370,7 +1370,64 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    `webhook` declares the `json` lane but does not emit it for a `text/plain` send, so a diamond
    wired straight off the source runs vacuously on that side — measured, and the reason the fixture
    exists rather than a convenience.
-   *Remaining:* **8.4** observability fan-in + metrics; **8.5** orphan-safe teardown; **8.6**
+   *Increment 8.4A — **DONE, live-verified**: the child event fan-in.* A child's stdout was drained
+   into a ring buffer and a `%TEMP%` log and nowhere else, so anything a node inside a venv emitted
+   died at the boundary. It now runs through a DAP stdio pump (`Task.VenvChildStdio`), the same
+   parser the main engine's stdio already uses, and each parsed event is routed by a **pure**
+   `classify_child_event` in `venv_spawn.py` returning `(channel, side_effects, rename_to)` —
+   side effects a *set*, because one event can forward, feed the tail and set the status at once.
+   Four rows are decisions rather than mappings. `apaevt_trace` (`>DBG`) is forwarded on the FLOW
+   channel under its **own** name `apaevt_venv_trace`, tagged `body.env`, **not** derived into
+   `apaevt_flow`: a child's pipe indices are its own, so merging them corrupts main's
+   `pipeflow.byPipe`, and emitting them as `apaevt_flow` corrupts the *client's* reconstruction,
+   since the TS log codec keys open-flow stacks by `body.id` — declining to merge fixes only the
+   server, declining to derive fixes both. It stays gated on the run's trace level, or the boundary
+   would deliver trace volume `=0` does not. `apaevt_status_state` (`>SVC`) drops to detail only:
+   `Task.on_event` handles it *before* the `apaevt_status_` prefix branch, where it lifts
+   `_billing_gated`, so a child could otherwise start billing a run that has not started.
+   `apaevt_status_message` (`>JOB`, by far the loudest — 265 per child in one measured chain run)
+   sets the run's status **only while no main engine exists yet**, env-prefixed; that window is
+   child startup, which is the point, since it turns a silent 30-second death into
+   `[v1] Downloading torch (2.7GiB)`. Its predicate is a per-run flag, **not**
+   `_engine_process is None` — that attribute is assigned once at spawn and never nulled, so on a
+   *restarted* task the window would never reopen. And unknown families are logged rather than
+   forwarded to the DEBUGGER channel, which is keyed to main. Errors and warnings join the run's
+   own, env-prefixed.
+   The child also inherits the run's **effective** `--trace=` — the launch request's `args` first,
+   `startup_args()` only as fallback, mirroring what main does; inheriting just the fallback
+   recreates the asymmetry the moment a launch passes its own flag.
+   *Two mechanics the pump does not give for free.* `TransportStdio.disconnect()` **cancels** its
+   stream tasks rather than draining them, which would truncate exactly the last lines step 7's
+   startup diagnostic quotes — so `VenvChildStdio.drain_pending(timeout)` awaits them to natural
+   completion first. And `disconnect()` fires `on_disconnected` itself, so a per-child `stopping`
+   flag gates the "child died" wording; without it every clean run ends by logging N spurious
+   deaths. The `%TEMP%` mirror is now keyed `venv-child-<env>-<port>.log` and truncated at spawn:
+   it was opened `'a'` and keyed by env name alone, so one file accumulated every run of every
+   project that ever used that name (measured: 27577 B vs 3327 B for one run), while a plain
+   truncate under the old key would let two concurrent runs sharing a name (`v1` is every test's
+   favourite) truncate each other's live log.
+   *Live, against a two-child chain at `pipelineTraceLevel='full'`:* 48 `apaevt_venv_trace`, **all**
+   tagged, two distinct envs, and **zero** `apaevt_flow` carrying an env tag — the F7 collision does
+   not occur. The step-7 bogus-provider regression still quotes the child's own error, and now
+   quotes it *parsed* (`apaevt_status_error: InvalidParam*…*pipeline_config.cpp:212`) rather than as
+   a raw `>ERR*` line. All six `venv_live.py` shapes return their known values.
+   *Correction, measured while verifying:* `pipelineTraceLevel` and `--trace=` are **different
+   knobs** — the first is a per-task option (`task/core/execute.cpp`), the second the engine's
+   startup log level (`core/init.cpp`). A control run at `summary` returned identical trace-payload
+   keys for child *and* main, so the payload proves nothing about the inherited flag; the child's
+   command line does. Verified that way with `args=['--trace=debugOut']` — the path the VS Code
+   extension uses — identifying this run's processes by diffing the engine pid set across `use()`,
+   since engines from earlier runs linger and answer the same query: 3 of 3 carried the flag.
+   *Adjacent defect, recorded not fixed:* the main-engine spawn inherits **two** flags from
+   `startup_args()`, `--trace=` and `--node_path=`; the child spawn inherited neither. 8.4 fixes
+   `--trace=` because its own promise depends on it. `--node_path=` is the same root: a developer
+   pointing the engine at workspace-local nodes gets them resolved in main and **not** in any venv
+   child, so a pipeline that runs flat fails once a group is isolated, naming a provider the child
+   cannot find. Whoever hits that will otherwise debug the partitioner.
+   *Remaining:* **8.4B** metrics fan-in (child CPU/RSS is invisible to `TaskMetrics`, which recurses
+   the *main* PID's descendants, and children are its siblings); **8.5** readiness proof +
+   orphan-safe teardown; **8.7** per-environment scoping, which §4.11's correction above shows
+   reaches no child under `=1` and, under the default `auto`, no process at all; **8.6**
    purge/delete with active-run gates.
    *Observed while verifying 8.2, recorded for 8.5 rather than fixed here:* after an in-venv failure
    a **second `send()` on the same token fails fast** — the boundary socket closed cleanly (1000) and

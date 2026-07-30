@@ -29,12 +29,13 @@ import hashlib
 import os
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from ai.constants import CONST_STATUS_HISTORY_LIMIT
 from ai.modules.task.task_engine import CONST_TRACE_PAYLOAD_CAP, CONST_TRACE_PREVIEW_BYTES, Task, cap_trace_payload
+from ai.modules.task.venv_spawn import VENV_TRACE_EVENT, VenvChild
 
 
 # ---------------------------------------------------------------------------
@@ -1175,3 +1176,186 @@ def test_cap_trace_payload_leaves_unserializable_payloads_alone():
     """Unserializable payloads pass through — the transport owns that error."""
     payload = {'bad': object()}
     assert cap_trace_payload(payload) is payload
+
+
+# ---------------------------------------------------------------------------
+# venv child fan-in (step 8.4)
+# ---------------------------------------------------------------------------
+
+
+def _child(env_id='v1', name='v1'):
+    """A VenvChild with no live process -- the fan-in never touches one."""
+    return VenvChild(env_id=env_id, name=name, process=None, port=5601, tmpfile='')
+
+
+def _fanin_task(*, trace_level=None, main_started=False):
+    """A Task seeded with just the state ``_on_child_event`` reads."""
+    t = _task()
+    t._pipelineTraceLevel = trace_level
+    t._main_engine_started = main_started
+    t._status_trace = []
+    t._status = SimpleNamespace(name='', state=0, exitMessage='', status='', errors=[], warnings=[])
+    t._task_metrics = None
+    t._forward_task_event = AsyncMock()
+    t._send_status_update = AsyncMock()
+    return t
+
+
+def test_effective_trace_arg_prefers_the_launch_request():
+    """Main takes --trace= from the launch args first and only falls back to the server's
+    own, so a child inheriting just the fallback would carry a different level than main.
+    """
+    t = _task()
+    t._launch_args = {'args': ['--trace=3']}
+    with patch('ai.modules.task.task_engine.startup_args', return_value=['--trace=1']):
+        assert Task._effective_trace_arg(t) == '--trace=3'
+
+
+def test_effective_trace_arg_splits_combined_launch_args():
+    t = _task()
+    t._launch_args = {'args': ['--verbose --trace=2']}
+    with patch('ai.modules.task.task_engine.startup_args', return_value=[]):
+        assert Task._effective_trace_arg(t) == '--trace=2'
+
+
+def test_effective_trace_arg_falls_back_to_startup_args():
+    t = _task()
+    t._launch_args = {'args': []}
+    with patch('ai.modules.task.task_engine.startup_args', return_value=['--other', '--trace=1']):
+        assert Task._effective_trace_arg(t) == '--trace=1'
+
+
+def test_effective_trace_arg_is_none_when_the_run_set_no_level():
+    t = _task()
+    t._launch_args = {}
+    with patch('ai.modules.task.task_engine.startup_args', return_value=['--port=5566']):
+        assert Task._effective_trace_arg(t) is None
+
+
+@pytest.mark.asyncio
+async def test_child_status_state_does_not_lift_the_billing_gate():
+    """>SVC must never reach set_service_up: a child is not the run's readiness."""
+    t = _fanin_task()
+    t._task_metrics = MagicMock()
+
+    await Task._on_child_event(t, _child(), {'event': 'apaevt_status_state', 'body': {'service': True}})
+
+    t._task_metrics.set_service_up.assert_not_called()
+    assert t._status.state == 0
+
+
+@pytest.mark.asyncio
+async def test_child_status_message_sets_the_run_status_before_the_main_engine():
+    """The window that turns a silent 30-second death into visible install progress."""
+    t = _fanin_task(main_started=False)
+
+    await Task._on_child_event(
+        t, _child(name='v1'), {'event': 'apaevt_status_message', 'body': {'message': 'Downloading torch'}}
+    )
+
+    assert t._status.status == '[v1] Downloading torch'
+    t._send_status_update.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_child_status_message_is_ignored_once_the_main_engine_exists():
+    """Both halves matter: a test of only the first passes on an always-set implementation,
+    which would let a child overwrite main's status hundreds of times per run.
+    """
+    t = _fanin_task(main_started=True)
+    t._status.status = 'main is talking'
+
+    await Task._on_child_event(
+        t, _child(), {'event': 'apaevt_status_message', 'body': {'message': 'Downloading torch'}}
+    )
+
+    assert t._status.status == 'main is talking'
+    t._send_status_update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_child_status_window_reopens_on_restart():
+    """The regression that forced a per-run flag over ``_engine_process is None``: that
+    attribute is never nulled, so on a restarted task the window would never reopen.
+    """
+    t = _fanin_task(main_started=True)
+
+    t._main_engine_started = False  # what start_task does for the next run
+
+    await Task._on_child_event(t, _child(), {'event': 'apaevt_status_message', 'body': {'message': 'again'}})
+
+    assert t._status.status == '[v1] again'
+
+
+@pytest.mark.asyncio
+async def test_child_traces_are_suppressed_without_a_trace_level():
+    """A child emits >DBG whether or not the run asked for tracing, so forwarding ungated
+    would deliver volume that =0 does not.
+    """
+    t = _fanin_task(trace_level=None)
+
+    await Task._on_child_event(t, _child(), {'event': 'apaevt_trace', 'body': {'op': 'enter', 'id': 1}})
+
+    t._forward_task_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_child_traces_forward_renamed_and_tagged_when_tracing():
+    t = _fanin_task(trace_level='full')
+
+    await Task._on_child_event(
+        t, _child(env_id='v1', name='parse'), {'event': 'apaevt_trace', 'body': {'op': 'enter', 'id': 1}}
+    )
+
+    t._forward_task_event.assert_awaited_once()
+    _event_type, message = t._forward_task_event.await_args.args
+    assert message['event'] == VENV_TRACE_EVENT
+    assert message['body']['env'] == {'id': 'v1', 'name': 'parse'}
+
+
+@pytest.mark.asyncio
+async def test_child_error_reaches_the_run_and_the_tail():
+    """>ERR* arrives as apaevt_status_error, NOT as an output event -- a tail built only from
+    output would silently lose the startup diagnostic this feeds.
+    """
+    t = _fanin_task()
+    child = _child(name='v1')
+
+    await Task._on_child_event(t, child, {'event': 'apaevt_status_error', 'body': {'message': 'InvalidParam'}})
+
+    assert t._status.errors == ['[v1] InvalidParam']
+    assert any('InvalidParam' in line for line in child.tail)
+
+
+@pytest.mark.asyncio
+async def test_unknown_child_event_is_logged_but_not_forwarded():
+    t = _fanin_task()
+    child = _child()
+
+    await Task._on_child_event(t, child, {'event': 'apaevt_future_thing', 'body': {}})
+
+    t._forward_task_event.assert_not_awaited()
+    assert child.tail
+
+
+def test_render_child_output_is_the_bare_line():
+    """The mirror is meant to read like the child's console: prefixing every line with the
+    event name buries the banner and any traceback in it.
+    """
+    assert Task._render_child_event({'event': 'output', 'body': {'output': 'Traceback...\n'}}) == 'Traceback...'
+
+
+def test_render_child_blank_output_stays_blank():
+    """Earned from the first live run: falling back to the event name turned every blank line
+    the child printed into the literal word "output" (8 of them in one short run).
+    """
+    assert Task._render_child_event({'event': 'output', 'body': {'output': '\n'}}) == ''
+
+
+def test_render_child_named_event_carries_its_message():
+    rendered = Task._render_child_event({'event': 'apaevt_status_error', 'body': {'message': 'InvalidParam'}})
+    assert rendered == 'apaevt_status_error: InvalidParam'
+
+
+def test_render_child_event_without_text_falls_back_to_the_name():
+    assert Task._render_child_event({'event': 'apaevt_trace', 'body': {'op': 'enter'}}) == 'apaevt_trace'
