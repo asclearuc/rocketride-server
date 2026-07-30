@@ -848,10 +848,18 @@ Findings behind the cost estimate, to re-verify when the question is reopened:
     LRU eviction under disk pressure is a separate, secondary mechanism for still-valid-but-stale envs.
 
 ### 4.11 Overlay mechanism (sys.path; never move the binary)
-The venv child runs the **original `engine.exe`, unmoved**; the bootstrap reads `ROCKETRIDE_VENV_SITE`
-and puts `venv_site` **ahead of base** on `sys.path` for **overlay precedence** (venv `torch` wins;
-appending would let base shadow it). **`PYTHONPATH` won't work** (isolated `PyConfig`); use the
-runtime insert.
+The venv child runs the **original `engine.exe`, unmoved**; the overlay's `site-packages` goes
+**ahead of base** on `sys.path` for **overlay precedence** (venv `torch` wins; appending would let
+base shadow it). **`PYTHONPATH` won't work** (isolated `PyConfig`); use the runtime insert.
+
+**Correction (measured):** this section previously said "the bootstrap reads
+`ROCKETRIDE_VENV_SITE`". It does not, and nothing else does either — searched both as the literal
+string across every `.py`/`.cpp`/`.hpp`/`.ts` in the repo and as the constant `VENV_SITE_ENV` that
+carries it; both return the same two hits, in `venv_spawn.py`, being the definition and the single
+**write** in `build_child_env`. The overlay that actually gets applied is the one
+`ensure_env_scoped` computes for itself and hands to `_apply_overlay_path` via `on_overlay`, so the
+variable is write-only decoration. Retiring the write (rather than adding a reader) is part of the
+per-environment-scoping fix; see the step-8 record.
 
 **It is a swap, not an insert (IMPLEMENTED).** Inserting without removing means applying a second
 environment in one process leaves **both** overlays in front of base: the newer wins for packages
@@ -1237,8 +1245,12 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    `node.require_shared_web_server()` and mounts `/venv/pipe` on it — the migration `webhook` and
    `telegram` already received — and blocks on a `threading.Event` instead of `server.run()`. Two
    consequences worth keeping: the route is appended to an **already-serving** app (fine — Starlette
-   resolves routing per request), and the child now also serves `/task/data`, which is what 8.4's
-   metric fan-in wants. A third is a narrowing: `probe_ready` completes a TCP handshake against the
+   resolves routing per request), and the child now also serves `/task/data`. *Correction: that last
+   point previously read "which is what 8.4's metric fan-in wants" — it is not.* `/task/data` is the
+   DAP channel for pushing objects **into** a pipeline (`_send_data`/`TaskData`) and carries no
+   resource metrics; 8.4's fan-in is psutil over the child PIDs plus the child's own `>MET` frames
+   over its stdio, neither of which needs that route. The child serving it is still useful, just not
+   for this. A third is a narrowing: `probe_ready` completes a TCP handshake against the
    shared server, which binds at bootstrap, so it no longer proves `/venv/pipe` is mounted — the
    child wins that race comfortably today (it only has to finish its own engine init while the
    bridge's first dial waits on a whole main-engine startup), and the symptom if it ever loses is a
@@ -1364,10 +1376,18 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    a **second `send()` on the same token fails fast** — the boundary socket closed cleanly (1000) and
    the SDK raises `PipeException` with its usual "pipeline isn't running" diagnostic. It does not hang
    and does not silently return a stale result, so the failure mode is acceptable as it stands. The
-   child stays resident for the rest of the run and is reaped when the task ends normally; **only an
-   abruptly killed server leaves orphans**, which is exactly the gap 8.5 closes. Worth knowing during
-   development: leaked children keep holding the port and answer later runs with *their* pipeline's
-   results, which reads as "the feature broke" when nothing did.
+   child stays resident for the rest of the run and is reaped when the task ends normally.
+   *Correction, measured before 8.5 was started:* this record previously said "**only an abruptly
+   killed server leaves orphans**". It does not — `--autoterm` handles that case. With a `chain` run
+   live under `=1`, the tree was server → main engine + two children; `taskkill /F /PID <server>`
+   (no `/T`, so no tree kill, and no Python teardown ran) left **zero** `engine.exe` after 8 s. The
+   stdin monitor in `engLib/core/init.cpp` fires as designed. What 8.5 actually closes is
+   **grandchildren** — `subprocess.Popen`'d `ffmpeg` in `ai/common/avi/reader.py`, the audio
+   loaders, `uv`, model servers — which have neither that monitor nor a pipe from the server, and so
+   survive the server's death on every platform. Measured on Windows only; the Linux half is 8.5's
+   own verification. Worth keeping from the original note: leaked processes that *do* survive keep
+   holding their port and answer later runs with *their* pipeline's results, which reads as "the
+   feature broke" when nothing did.
 - **Prerequisites the 2A state uncovers rather than closes** — both cheap, both blocking the moment
   two environments live in one interpreter:
   - `BaseLoader._dependencies_loaded` (`ai/common/models/base.py`) is a **class-level bool**. With
@@ -1445,11 +1465,13 @@ and the conflict is isolated to the venv-scoping mechanism — fast, determinist
 **replace `torch 2.0/2.1`** as the conflict fixture. [created 2A; used by 8.3]
 
 **Not staged by any build step (gap).** The fixtures are read straight from the source tree by the
-automated acceptance (`ProviderIndex` over `nodes/test/fixtures`), but nothing copies them into
-`dist/server/nodes`, so no *pipeline* can reference them without a manual copy and `nodes:test` does
-not exercise them at all. Staging them is the prerequisite for the end-to-end acceptance in §8.3;
-until then, `vtest_alpha` also has nothing to report — it forwards text unchanged, so the version it
-actually imported is not observable from outside the process.
+automated acceptance — `rocketlib-python/tests/test_scoping_acceptance.py`, which points `ast_deps`
+at `nodes/test/fixtures` and is gated on the engine interpreter, on `uv` being bootstrapped, and
+skipped when offline — but nothing copies them into `dist/server/nodes`, so no *pipeline* can
+reference them without a manual copy and `nodes:test` does not exercise them at all. Staging them
+is the prerequisite for the end-to-end acceptance in §8.3; until then, `vtest_alpha` also has
+nothing to report — it forwards text unchanged, so the version it actually imported is not
+observable from outside the process.
 
 ### 8.3 Integration / acceptance
 
