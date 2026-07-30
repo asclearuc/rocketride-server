@@ -290,3 +290,40 @@ class EVENT_FLOW(TypedDict, total=False):
     type: Literal['event']
     event: Literal['apaevt_flow']
     body: TASK_EVENT_FLOW
+
+
+class EVENT_ENV(TypedDict, total=False):
+    """The virtual environment a forwarded event came from.
+
+    Present on events produced by a node running inside an isolated environment, which
+    executes in a separate engine process. Absent on everything the main engine emits.
+    """
+
+    id: str  # REQUIRED - Environment id as declared in the pipeline
+    name: str  # REQUIRED - Display name for the environment
+
+
+class TASK_EVENT_VENV_TRACE(TASK_EVENT_FLOW, total=False):
+    """
+    Flow trace emitted by a node inside an isolated virtual environment.
+
+    Same shape as TASK_EVENT_FLOW plus ``env``. It is deliberately a SEPARATE event
+    rather than an ``apaevt_flow``: ``id`` is a pipe index private to the emitting
+    process, so a child's ids collide with the main engine's. Consumers that key
+    open-flow state by ``id`` must therefore keep one keyspace per ``env``, and must
+    not merge these frames into the main pipeline's flow reconstruction.
+    """
+
+    env: EVENT_ENV  # REQUIRED - Environment that emitted this trace
+
+
+class EVENT_VENV_TRACE(TypedDict, total=False):
+    """Full DAP event for a flow trace from inside a virtual environment.
+
+    Delivered on the FLOW subscription and gated on the run's ``pipelineTraceLevel``,
+    exactly like ``apaevt_flow``.
+    """
+
+    type: Literal['event']
+    event: Literal['apaevt_venv_trace']
+    body: TASK_EVENT_VENV_TRACE

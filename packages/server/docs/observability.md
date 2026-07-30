@@ -115,6 +115,7 @@ definitions live in the SDK type modules
 | `apaevt_task`          | `TASK`       | Lifecycle: `running` / `begin` / `end` / `restart`|
 | `apaevt_status_update` | `SUMMARY`    | Periodic full `TASK_STATUS` snapshot              |
 | `apaevt_flow`          | `FLOW`       | Component entry / exit, per pipe, per op          |
+| `apaevt_venv_trace`    | `FLOW`       | The same, from inside an isolated environment     |
 | `output`              | `OUTPUT`     | Engine stdout/stderr-style log lines              |
 | `apaevt_sse`           | `SSE`        | Node-emitted custom messages (`monitorSSE()`)     |
 | `apaevt_status_upload` | `SUMMARY`    | File-upload progress                              |
@@ -151,7 +152,13 @@ map.
 - **Pipeline flow:** `pipeflow.{totalPipes, byPipe}`, where `byPipe` maps each pipe
   id to its currently-active component stack (a live snapshot of what is running).
 - **Resource metrics:** `metrics.{cpu_percent, cpu_memory_mb, gpu_memory_mb}` plus
-  `peak_*` and `avg_*` variants of each.
+  `peak_*` and `avg_*` variants of each. These cover the whole run, including any
+  isolated environments: each runs in its own process, and all of them are sampled
+  and billed together. Under a flat pipeline the same work runs in one process and
+  is billed there, so isolating a group changes where the work happens, not what it
+  costs. One consequence to read correctly: an environment's dependency **install**
+  is not sampled, so `peak_cpu_memory_mb` is a peak over the run, not over the life
+  of every process it used.
 - **Billing tokens:** `tokens.{cpu_utilization, cpu_memory, gpu_memory, total}`
   (100 tokens = $1).
 
@@ -189,6 +196,29 @@ appear as siblings under the control node, once per invocation. To confirm each 
 its lifecycle exactly once per pass, count `open`/`closing`/`close` `enter` frames per
 `component` within one dispatch pass — each appears once (a control node's sub-pipeline
 repeats once per invocation, each invocation being its own pass).
+
+### `apaevt_venv_trace`: traces from inside a virtual environment
+
+A pipeline group marked `isolated` runs in its own engine process. Traces from nodes
+inside it arrive under this event rather than `apaevt_flow`, with the same body plus
+an `env` tag:
+
+```ts
+{
+  ...TASK_EVENT_FLOW,                      // identical shape to apaevt_flow
+  env: { id: string, name: string }        // the environment that emitted it
+}
+```
+
+It is a separate event on purpose. `id` is a **pipe index private to the emitting
+process**, so a child's ids collide with the main engine's. If you key open-flow state
+by `id` — as the reference decoders do — keep one keyspace per `env` and do not merge
+these frames into the main pipeline's reconstruction: two processes' `enter`/`leave`
+pairs interleaved under one key reconstruct to the wrong tree.
+
+Subscribe via `FLOW`, the same subscription as `apaevt_flow`, and note it obeys the
+same trace-level gate. Clients that do not know the event simply ignore it; a run with
+no isolated group never emits it.
 
 ### `apaevt_sse`: node-to-UI messages
 

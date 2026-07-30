@@ -2730,6 +2730,17 @@ class Task(DAPBase):
                     source_name=self._status.name or self.source or '',
                     on_update_callback=self._on_metrics_updated,
                 )
+                # Venv children are SIBLINGS of the main engine, so the recursive children()
+                # walk inside TaskMetrics cannot see them. Register here rather than at spawn:
+                # children are spawned before the main engine, when _task_metrics is still None.
+                # The cost of that ordering is that a child's startup -- including a long
+                # overlay install -- is not sampled, which matches the serviceUp billing gate
+                # (install time is not billed either) but does mean "peak memory" is a peak over
+                # the run, not over the process's life.
+                for child in self._venv_children:
+                    if child.process and child.process.pid:
+                        self._task_metrics.register_extra_pid(child.env_id, child.process.pid)
+
                 self._task_metrics.start_monitoring()
                 self.debug_message(f'Started metrics monitoring for PID {self._engine_process.pid}')
             except Exception as e:

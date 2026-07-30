@@ -154,9 +154,23 @@ class TaskMetrics:
         # (peaks, averages) are still tracked so the dashboard shows live usage.
         self._billing_gated: bool = True
 
-        # Subprocess-reported metrics (absolute snapshots from >MET* protocol)
+        # Subprocess-reported metrics (absolute snapshots from >MET* protocol).
+        # These two are the SUMMED view across sources, which is what _update_tokens and
+        # external readers consume; the per-source snapshots behind them live in
+        # _subprocess_by_source and are recombined on every merge.
         self._subprocess_counters: dict[str, float] = {}
         self._subprocess_timers: dict[str, float] = {}
+
+        # Per-source snapshots: {source: {'timers': {...}, 'counters': {...}}}. A venv run has
+        # more than one engine reporting >MET -- the main engine plus one child per isolated
+        # group -- and a snapshot REPLACES rather than adds, so without keying by source the
+        # last child to report would erase main's timers and counters.
+        self._subprocess_by_source: dict[str, dict[str, dict[str, float]]] = {}
+
+        # Sibling processes sampled in addition to the main tree, keyed by environment id.
+        # Venv children are spawned by the server, not by the engine, so they are siblings of
+        # self._process and its recursive children() walk cannot see them.
+        self._extra_processes: dict[str, psutil.Process] = {}
 
         # Detect GPU capabilities using pynvml
         self._detect_gpu()
@@ -223,13 +237,47 @@ class TaskMetrics:
             debug('[TaskMetrics] Pipeline ready — billing accumulation started')
         self._billing_gated = not value
 
+    def register_extra_pid(self, env_id: str, pid: int) -> None:
+        """
+        Sample a process outside the main tree, in addition to it.
+
+        Venv children are spawned by the server rather than by the engine, so they are
+        *siblings* of ``self.pid`` and the recursive ``children()`` walk in
+        ``_sample_cpu_memory`` never reaches them. Their CPU and RSS are billed: under
+        ``ROCKETRIDE_SERVER_USE_VENV=0`` the same work runs inside the main engine and is
+        billed there already, so excluding it would be an unintended discount for using a venv.
+
+        Keyed by ``env_id`` rather than appended to a list: a restarted task re-registers the
+        same environment, and a duplicated handle would silently double that environment's
+        billed CPU and memory rather than fail.
+
+        A dead or unreachable PID is ignored — sampling is best-effort and must never be able
+        to break the run.
+        """
+        try:
+            self._extra_processes[env_id] = psutil.Process(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            debug(f'[TaskMetrics] cannot sample venv child {env_id} (pid {pid}) - skipping')
+
+    def _extra_process_tree(self) -> list:
+        """Every registered sibling plus its own recursive children, skipping the dead."""
+        collected = []
+        for process in self._extra_processes.values():
+            try:
+                collected.append(process)
+                collected.extend(process.children(recursive=True))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return collected
+
     def _sample_cpu_memory(self) -> None:
         """
         Sample current CPU and memory usage for process tree.
 
         Uses psutil to get process CPU percentage and memory usage for the
-        main process and all its children (recursive). Updates metrics dict
-        directly with aggregated values.
+        main process and all its children (recursive), plus any sibling
+        processes registered via ``register_extra_pid`` and their own children.
+        Updates metrics dict directly with aggregated values.
         """
         try:
             # Start with main process
@@ -250,6 +298,14 @@ class TaskMetrics:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 # Main process died while getting children
                 pass
+
+            # Add registered siblings (venv children) and their own subtrees
+            for extra in self._extra_process_tree():
+                try:
+                    cpu_percent += extra.cpu_percent(interval=None)
+                    memory_mb += extra.memory_info().rss / (1024 * 1024)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
 
             # Normalize CPU to 0-100% by dividing by number of cores
             # (raw value can exceed 100% on multi-core systems)
@@ -295,6 +351,14 @@ class TaskMetrics:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 # Main process died while getting children
                 pass
+
+            # Registered siblings (venv children) use GPUs too -- a model loaded inside an
+            # isolated environment is exactly the case this feature exists for.
+            for extra in self._extra_process_tree():
+                try:
+                    pids_to_track.add(extra.pid)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
 
             # Query all GPUs and sum memory for our process tree
             total_gpu_memory_mb = 0.0
@@ -469,20 +533,39 @@ class TaskMetrics:
             1,
         )
 
-    def merge_subprocess_metrics(self, metrics_dict: dict) -> None:
+    def merge_subprocess_metrics(self, metrics_dict: dict, source: str = 'main') -> None:
         """
         Ingest a subprocess billing snapshot received via the >MET* protocol.
 
         The payload is an **absolute snapshot** of the subprocess task metrics
         (accumulated across all pipes).  Each call replaces the previous
-        snapshot rather than adding to it — the subprocess owns the running
-        totals and the parent consumes them.
+        snapshot **for that source** rather than adding to it — the subprocess
+        owns the running totals and the parent consumes them.
+
+        Snapshots are kept per source and summed. A venv run has several engines
+        reporting independently — the main engine plus one child per isolated group —
+        so a single slot would let whichever reported last erase the others' timers
+        and counters. The default keeps every existing caller reporting as ``'main'``.
 
         Args:
             metrics_dict: ``{"timers": {name: ms, ...}, "counters": {name: value, ...}, ...}``
+            source: Reporting engine — ``'main'`` or a venv environment id.
         """
-        self._subprocess_timers = {str(k): float(v) for k, v in metrics_dict.get('timers', {}).items()}
-        self._subprocess_counters = {str(k): float(v) for k, v in metrics_dict.get('counters', {}).items()}
+        self._subprocess_by_source[source] = {
+            'timers': {str(k): float(v) for k, v in metrics_dict.get('timers', {}).items()},
+            'counters': {str(k): float(v) for k, v in metrics_dict.get('counters', {}).items()},
+        }
+
+        summed_timers: dict[str, float] = {}
+        summed_counters: dict[str, float] = {}
+        for snapshot in self._subprocess_by_source.values():
+            for name, value in snapshot['timers'].items():
+                summed_timers[name] = summed_timers.get(name, 0.0) + value
+            for name, value in snapshot['counters'].items():
+                summed_counters[name] = summed_counters.get(name, 0.0) + value
+
+        self._subprocess_timers = summed_timers
+        self._subprocess_counters = summed_counters
         self._update_tokens()
 
         # Notify that metrics were updated

@@ -565,3 +565,185 @@ def test_stop_monitoring_on_idle_is_a_noop(fake_psutil, no_gpu):
         await tm.stop_monitoring()
 
     asyncio.run(run())  # absence of exception is the assertion
+
+
+# ---------------------------------------------------------------------------
+# register_extra_pid + per-source >MET — the venv fan-in (increment 8.4B)
+# ---------------------------------------------------------------------------
+
+
+def _sibling(cpu, rss_mb, children=()):
+    """A psutil-shaped process mock standing in for a venv child."""
+    proc = MagicMock()
+    proc.cpu_percent.return_value = cpu
+    proc.memory_info.return_value = SimpleNamespace(rss=rss_mb * 1024 * 1024)
+    proc.children.return_value = list(children)
+    return proc
+
+
+def test_extra_pid_rss_is_added_to_the_run(fake_psutil, no_gpu):
+    """A venv child is a SIBLING of the main engine, so children() never reaches it.
+
+    Without register_extra_pid the child's CPU and RSS are invisible to the run entirely --
+    which under =0 would be billed inside the main engine, so omitting it is a discount for
+    using a venv rather than a neutral omission.
+    """
+    proc = _sibling(80.0, 100)
+    proc.children.return_value = []
+    fake_psutil.Process.return_value = proc
+
+    tm, status = _make_metrics(fake_psutil)
+
+    child = _sibling(40.0, 50)
+    fake_psutil.Process.return_value = child
+    tm.register_extra_pid('v1', 4321)
+
+    tm._sample_cpu_memory()
+
+    assert status.metrics.cpu_memory_mb == pytest.approx(150.0)
+    assert tm._cpu_percent_raw == pytest.approx(120.0)
+
+
+def test_extra_pid_subtree_is_sampled_too(fake_psutil, no_gpu):
+    """A child's own grandchildren count: a model server under a venv child is the point."""
+    proc = _sibling(0.0, 100)
+    proc.children.return_value = []
+    fake_psutil.Process.return_value = proc
+
+    tm, status = _make_metrics(fake_psutil)
+
+    grandchild = _sibling(5.0, 25)
+    fake_psutil.Process.return_value = _sibling(10.0, 50, children=[grandchild])
+    tm.register_extra_pid('v1', 4321)
+
+    tm._sample_cpu_memory()
+
+    assert status.metrics.cpu_memory_mb == pytest.approx(175.0)
+
+
+def test_registering_the_same_env_twice_does_not_double_count(fake_psutil, no_gpu):
+    """The restart path re-registers the same environment.
+
+    Keyed by env_id, a second registration REPLACES. Appended to a list it would double that
+    environment's billed CPU and memory -- an overcharge, not a crash, so nothing else fails.
+    """
+    proc = _sibling(0.0, 100)
+    proc.children.return_value = []
+    fake_psutil.Process.return_value = proc
+
+    tm, status = _make_metrics(fake_psutil)
+
+    fake_psutil.Process.return_value = _sibling(10.0, 50)
+    tm.register_extra_pid('v1', 4321)
+    fake_psutil.Process.return_value = _sibling(10.0, 50)
+    tm.register_extra_pid('v1', 4321)
+
+    tm._sample_cpu_memory()
+
+    assert len(tm._extra_processes) == 1
+    assert status.metrics.cpu_memory_mb == pytest.approx(150.0)
+
+
+def test_dead_extra_pid_is_skipped_without_raising(fake_psutil, no_gpu):
+    """A child that died between spawn and registration must not break the run."""
+    proc = _sibling(0.0, 100)
+    proc.children.return_value = []
+    fake_psutil.Process.return_value = proc
+
+    tm, status = _make_metrics(fake_psutil)
+
+    fake_psutil.Process.side_effect = _NoSuchProcess()
+    tm.register_extra_pid('v1', 999999)
+
+    tm._sample_cpu_memory()
+
+    assert tm._extra_processes == {}
+    assert status.metrics.cpu_memory_mb == pytest.approx(100.0)
+
+
+def test_extra_pid_dying_mid_sample_is_skipped(fake_psutil, no_gpu):
+    """Registered, then gone by the next sample -- the main tree's total still lands.
+
+    A dead process raises from every accessor, not just one: enumerating its children and
+    reading its cpu both fail. Modelling only the first would describe a process that cannot
+    exist and would pass against code that samples a corpse.
+    """
+    proc = _sibling(0.0, 100)
+    proc.children.return_value = []
+    fake_psutil.Process.return_value = proc
+
+    tm, status = _make_metrics(fake_psutil)
+
+    dead = MagicMock()
+    dead.children.side_effect = _NoSuchProcess()
+    dead.cpu_percent.side_effect = _NoSuchProcess()
+    dead.memory_info.side_effect = _NoSuchProcess()
+    fake_psutil.Process.return_value = dead
+    tm.register_extra_pid('v1', 4321)
+
+    tm._sample_cpu_memory()
+
+    assert status.metrics.cpu_memory_mb == pytest.approx(100.0)
+
+
+def test_one_dead_sibling_does_not_hide_a_live_one(fake_psutil, no_gpu):
+    """Enumeration must not abort on the first corpse -- the other environment still bills."""
+    proc = _sibling(0.0, 100)
+    proc.children.return_value = []
+    fake_psutil.Process.return_value = proc
+
+    tm, status = _make_metrics(fake_psutil)
+
+    dead = MagicMock()
+    dead.children.side_effect = _NoSuchProcess()
+    dead.cpu_percent.side_effect = _NoSuchProcess()
+    dead.memory_info.side_effect = _NoSuchProcess()
+    fake_psutil.Process.return_value = dead
+    tm.register_extra_pid('v1', 4321)
+
+    fake_psutil.Process.return_value = _sibling(10.0, 50)
+    tm.register_extra_pid('v2', 4322)
+
+    tm._sample_cpu_memory()
+
+    assert status.metrics.cpu_memory_mb == pytest.approx(150.0)
+
+
+def test_two_sources_met_snapshots_coexist(fake_psutil, no_gpu):
+    """A snapshot replaces per SOURCE, not globally.
+
+    Children already emit >MET today, so a single slot means whichever engine reports last
+    erases the others' timers -- a live defect independent of the fan-in.
+    """
+    fake_psutil.Process.return_value = _sibling(0.0, 0)
+    tm, _ = _make_metrics(fake_psutil)
+
+    tm.merge_subprocess_metrics({'timers': {'gpu_compute': 100.0}, 'counters': {'objects': 5}})
+    tm.merge_subprocess_metrics({'timers': {'gpu_compute': 40.0}, 'counters': {'objects': 2}}, source='v1')
+
+    assert tm._subprocess_timers['gpu_compute'] == pytest.approx(140.0)
+    assert tm._subprocess_counters['objects'] == pytest.approx(7.0)
+
+
+def test_resending_one_source_replaces_only_its_own_snapshot(fake_psutil, no_gpu):
+    """The payload is an absolute snapshot, so a re-report must not accumulate."""
+    fake_psutil.Process.return_value = _sibling(0.0, 0)
+    tm, _ = _make_metrics(fake_psutil)
+
+    tm.merge_subprocess_metrics({'timers': {'gpu_compute': 100.0}})
+    tm.merge_subprocess_metrics({'timers': {'gpu_compute': 40.0}}, source='v1')
+    tm.merge_subprocess_metrics({'timers': {'gpu_compute': 60.0}}, source='v1')
+
+    assert tm._subprocess_timers['gpu_compute'] == pytest.approx(160.0)
+
+
+def test_default_source_keeps_existing_callers_intact(fake_psutil, no_gpu):
+    """Every pre-8.4B caller passes no source and must keep replacing its own slot."""
+    fake_psutil.Process.return_value = _sibling(0.0, 0)
+    tm, _ = _make_metrics(fake_psutil)
+
+    tm.merge_subprocess_metrics({'timers': {'gpu_compute': 100.0}})
+    tm.merge_subprocess_metrics({'timers': {'gpu_compute': 30.0}})
+
+    assert tm._subprocess_timers['gpu_compute'] == pytest.approx(30.0)
+    assert list(tm._subprocess_by_source) == ['main']

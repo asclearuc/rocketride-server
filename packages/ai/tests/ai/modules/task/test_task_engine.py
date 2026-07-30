@@ -29,12 +29,13 @@ import hashlib
 import os
 import sys
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 
 from ai.constants import CONST_STATUS_HISTORY_LIMIT
 from ai.modules.task.task_engine import CONST_TRACE_PAYLOAD_CAP, CONST_TRACE_PREVIEW_BYTES, Task, cap_trace_payload
+from ai.modules.task.task_metrics import TaskMetrics
 from ai.modules.task.venv_spawn import VENV_TRACE_EVENT, VenvChild
 
 
@@ -1233,10 +1234,38 @@ def test_effective_trace_arg_is_none_when_the_run_set_no_level():
 
 
 @pytest.mark.asyncio
+async def test_child_metrics_are_merged_under_the_env_as_source():
+    """A child's >MET must land in its OWN slot, or it erases main's timers and counters.
+
+    Autospec, not a bare MagicMock: the defect this covers was a call to a keyword the real
+    signature did not have, and a bare mock accepts any keyword at all -- so the route was
+    exercised live and the TypeError went to the stdout reader unnoticed.
+    """
+    t = _fanin_task()
+    t._task_metrics = create_autospec(TaskMetrics, instance=True)
+
+    payload = {'timers': {'gpu_compute': 12.0}}
+    await Task._on_child_event(
+        t, _child(env_id='v2', name='v2'), {'event': 'apaevt_status_metrics', 'body': {'metrics': payload}}
+    )
+
+    t._task_metrics.merge_subprocess_metrics.assert_called_once_with(payload, source='v2')
+
+
+@pytest.mark.asyncio
+async def test_child_metrics_without_a_metrics_object_are_dropped():
+    """Children are spawned before TaskMetrics exists, so the route must tolerate None."""
+    t = _fanin_task()
+    t._task_metrics = None
+
+    await Task._on_child_event(t, _child(), {'event': 'apaevt_status_metrics', 'body': {'metrics': {}}})
+
+
+@pytest.mark.asyncio
 async def test_child_status_state_does_not_lift_the_billing_gate():
     """>SVC must never reach set_service_up: a child is not the run's readiness."""
     t = _fanin_task()
-    t._task_metrics = MagicMock()
+    t._task_metrics = create_autospec(TaskMetrics, instance=True)
 
     await Task._on_child_event(t, _child(), {'event': 'apaevt_status_state', 'body': {'service': True}})
 
