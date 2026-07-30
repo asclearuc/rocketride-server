@@ -1406,6 +1406,17 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    project that ever used that name (measured: 27577 B vs 3327 B for one run), while a plain
    truncate under the old key would let two concurrent runs sharing a name (`v1` is every test's
    favourite) truncate each other's live log.
+   *What the new event name costs the run log, checked and accepted rather than discovered later.*
+   `RunLogWriter.append` has **deliberately no type filter** ("every event delivered to clients is
+   recorded"), so child traces become part of replay with no registration needed — intended, but a
+   volume *and* content change to the persisted artifact, not just a wire change. The catch is one
+   level down: the v2 codec's keyframe/delta encoding branches on the literal name
+   (`run_log.py:840`, `if event == 'apaevt_flow'`), so `apaevt_venv_trace` skips it and child
+   traces are stored **raw where main's are delta-compressed**. At `full` with two children that is
+   a real multiplier, softened only by `truncate_event`'s payload cap. Accepted for v1 — the volume
+   sits behind an opt-in trace level — and left in 2C rather than fixed here, because the fix is
+   two-sided: `run_log.py`'s encoder and `log-codec.ts`'s decoder must learn the name **in
+   lockstep**, or replay breaks in a way no test in this plan would catch.
    *Live, against a two-child chain at `pipelineTraceLevel='full'`:* 48 `apaevt_venv_trace`, **all**
    tagged, two distinct envs, and **zero** `apaevt_flow` carrying an env tag — the F7 collision does
    not occur. The step-7 bogus-provider regression still quotes the child's own error, and now
@@ -1487,7 +1498,11 @@ the local-IPC transport seam (UDS/named-pipe/shared-mem, §4.5); the **bridge-ba
 unification** (move `remote/base` onto the shared bridge base = **A1**, and extract a shared lane-write
 dispatch in `packages/ai` used by both `data_conn` and `venv_server` = **D1**, §4.4 Step-6 decisions) —
 both behavior-preserving refactors deferred out of 2B to run under the green test baseline; v2
-optimizations (direct venv↔venv mesh, shared-memory for AV).
+optimizations (direct venv↔venv mesh, shared-memory for AV). Added by 8.4: teaching the run-log
+codec to delta-compress `apaevt_venv_trace` the way it already does `apaevt_flow` (a two-sided
+change — `run_log.py`'s encoder and `log-codec.ts`'s decoder in lockstep — worth doing only if the
+log volume actually bites), and a per-environment renderer for those traces, which the tagged
+`body.env` now makes possible but which no client has yet.
 
 ---
 
