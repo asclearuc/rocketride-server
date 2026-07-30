@@ -1424,11 +1424,36 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    pointing the engine at workspace-local nodes gets them resolved in main and **not** in any venv
    child, so a pipeline that runs flat fails once a group is isolated, naming a provider the child
    cannot find. Whoever hits that will otherwise debug the partitioner.
-   *Remaining:* **8.4B** metrics fan-in (child CPU/RSS is invisible to `TaskMetrics`, which recurses
-   the *main* PID's descendants, and children are its siblings); **8.5** readiness proof +
-   orphan-safe teardown; **8.7** per-environment scoping, which §4.11's correction above shows
-   reaches no child under `=1` and, under the default `auto`, no process at all; **8.6**
-   purge/delete with active-run gates.
+   *Increment 8.4B — **DONE, live-verified**: metrics.* `TaskMetrics` samples the main PID and its
+   *recursive descendants*; venv children are spawned by the server, so they are **siblings** and
+   the walk never reached them. `register_extra_pid(env_id, pid)` adds each child and its own
+   subtree to both `_sample_cpu_memory` and `_sample_gpu`. Keyed by env id rather than appended to
+   a list: a restarted task re-registers the same environment, and a duplicated handle would
+   silently *double* that environment's billed CPU and memory — an overcharge, not a crash.
+   Registration happens right after the `TaskMetrics` constructor, **not** at spawn, where
+   `_task_metrics` is still `None` because children are spawned before the main engine. The cost of
+   that ordering, accepted rather than engineered around: a child's startup — including a long
+   overlay install — is not sampled, which matches the `serviceUp` billing gate (install time is
+   not billed either) but does mean "peak memory" is a peak over the *run*, not over each
+   process's life.
+   *Child load is billed, not report-only:* under `=0` the same work runs inside the main engine
+   and is billed there, so excluding it would be an unintended discount for using a venv.
+   *A live defect fixed alongside, independent of the fan-in:* `merge_subprocess_metrics` kept one
+   snapshot slot, and a snapshot **replaces**. Children already emit `>MET` today, so whichever
+   engine reported last erased the others' timers and counters. Snapshots are now per source and
+   summed; the `source='main'` default leaves every existing caller unchanged.
+   *Defect found in 8.4A's own commit while starting this one:* the fan-in already called
+   `merge_subprocess_metrics(..., source=...)` against a signature that had no such parameter — a
+   `TypeError` on a route with no unit test, whose only live symptom was a child's `>MET` (one per
+   run, arriving near the end) failing silently inside the stdout reader. The route now has a test,
+   written with `create_autospec` rather than a bare `MagicMock`: a bare mock accepts any keyword,
+   which is exactly why the original slipped through.
+   *Live:* a two-child chain reports `peak_cpu_memory_mb` **546.1** against a measured
+   178.0 + 178.6 + 187.2 = 543.8 for the three engines. Asserted as "greater than the largest
+   single engine", since main is itself one of them — so main-tree-only sampling cannot pass it.
+   *Remaining:* **8.5** readiness proof + orphan-safe teardown; **8.7** per-environment scoping,
+   which §4.11's correction above shows reaches no child under `=1` and, under the default `auto`,
+   no process at all; **8.6** purge/delete with active-run gates.
    *Observed while verifying 8.2, recorded for 8.5 rather than fixed here:* after an in-venv failure
    a **second `send()` on the same token fails fast** — the boundary socket closed cleanly (1000) and
    the SDK raises `PipeException` with its usual "pipeline isn't running" diagnostic. It does not hang
