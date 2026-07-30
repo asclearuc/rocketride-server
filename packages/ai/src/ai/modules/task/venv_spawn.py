@@ -2,10 +2,11 @@
 
 A venv child is a per-run sibling ``engine`` subprocess that runs one isolated pipeline
 group. It is kept alive by a resident ``venv_source_stub`` source hosting a loopback
-``/venv/pipe`` WebServer; the main engine's ``venv`` client nodes dial it. These are the
-side-effect-light, unit-testable pieces (env construction, url injection, the two-phase
-kill); the ``Task``-bound orchestration (assign ports, write task files, spawn, readiness,
-teardown) lives in ``task_engine.py`` and reuses these.
+``/venv/pipe`` WebServer; the main engine's ``venv`` client nodes dial it. This module holds
+the pieces that are decidable without a ``Task``: env construction, url injection, the
+two-phase kill, and the pure routing table for a child's events. The ``Task``-bound
+orchestration (assign ports, write task files, spawn, readiness, teardown, and acting on
+that routing table) lives in ``task_engine.py`` and reuses these.
 
 Reliability is the main engine's, extended to N children: children are spawned with
 ``--autoterm`` (a C++ stdin monitor exits the child if the server process dies) and torn
@@ -17,7 +18,7 @@ import asyncio
 import os
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, FrozenSet, List, NamedTuple, Optional
 
 # Per-run shared bridge secret. Delivered to the main engine and every child via an
 # inherited env var (never argv, never the on-disk task file); the child's /venv/pipe
@@ -26,6 +27,117 @@ VENV_TOKEN_ENV = 'ROCKETRIDE_VENV_TOKEN'
 # Points a child at its per-environment ``sys.path`` overlay (§4.11); consumed by the
 # engine bootstrap in ``depends.py``. Unset -> the child runs on the base runtime.
 VENV_SITE_ENV = 'ROCKETRIDE_VENV_SITE'
+
+# ---------------------------------------------------------------------------
+# child event routing (pure; the Task acts on the result)
+# ---------------------------------------------------------------------------
+
+# A child's traces travel under their own name rather than being derived into
+# ``apaevt_flow``. Two reasons, and the second is the decisive one: a child's pipe indices
+# are its own, so merging them into main's ``pipeflow`` corrupts its accounting, AND
+# emitting them as ``apaevt_flow`` corrupts the *client's* -- the TS log codec keys its
+# open-flow stacks by ``body.id``, so two processes' enter/leave pairs interleave under one
+# key. Declining to merge fixes only the server; declining to derive fixes both. The name is
+# new rather than reused because main's raw ``apaevt_trace`` never reaches the wire (it is
+# consumed into ``apaevt_flow``), so reusing it would create a channel that carries child
+# traces and silently never main's.
+VENV_TRACE_EVENT = 'apaevt_venv_trace'
+
+# Delivery channels, as plain strings: ``EVENT_TYPE`` lives in the ``rocketride`` SDK
+# package and this module deliberately imports nothing from it. ``task_engine`` maps these
+# onto the real flags at the call site.
+CH_SSE = 'sse'
+CH_OUTPUT = 'output'
+CH_FLOW = 'flow'
+CH_DETAIL = 'detail'
+CH_NONE = None  # log only -- not forwarded to any subscriber
+
+# Side effects a route may additionally carry. More than one can apply to a single event,
+# which is why this is a set: ``output`` both forwards and appends to the run's trace, and a
+# status message forwards, feeds the tail and (from 8.5) resolves readiness.
+SE_TAIL = 'tail'  # append rendered text to the child's tail ring
+SE_STATUS_TRACE = 'status_trace'  # append to the run's _status_trace
+SE_ERROR = 'error'  # append to _status.errors, env-prefixed
+SE_WARNING = 'warning'  # append to _status.warnings, env-prefixed
+SE_METRICS = 'metrics'  # merge into the per-source >MET slot
+SE_STATUS_WINDOW = 'status_window'  # may set the run status, but only pre-main-engine
+SE_EXIT = 'exit'  # record the child's exit; never terminates the run
+
+
+class ChildRoute(NamedTuple):
+    """Where one child event goes, and what else it touches."""
+
+    channel: Optional[str]
+    side_effects: FrozenSet[str]
+    # Set when the event is forwarded under a different name than it arrived with.
+    rename_to: Optional[str] = None
+
+
+_STATUS_ROUTES: Dict[str, ChildRoute] = {
+    # >SVC. Handled in Task.on_event *before* the apaevt_status_ prefix branch, where it
+    # sets serviceUp and lifts the billing gate -- so "never _update_status" does not cover
+    # it and it has to be named. A child must never move the run's billing gate.
+    'apaevt_status_state': ChildRoute(CH_DETAIL, frozenset()),
+    # >OBJ. Sets currentObject/currentSize; letting a child through makes the run's
+    # displayed current object flicker between two processes.
+    'apaevt_status_object': ChildRoute(CH_DETAIL, frozenset()),
+    # >ERR / >WRN. A child's error belongs to the run, so these are the exceptions that do
+    # reach _status -- and they feed the tail, since >ERR* is NOT an ``output`` event and a
+    # tail built only from ``output`` would lose the startup diagnostic entirely.
+    'apaevt_status_error': ChildRoute(CH_DETAIL, frozenset({SE_ERROR, SE_TAIL})),
+    'apaevt_status_warning': ChildRoute(CH_DETAIL, frozenset({SE_WARNING, SE_TAIL})),
+    # >MET. Routed explicitly to the per-source metric slot rather than through
+    # _update_status, which would let a child's snapshot overwrite main's wholesale.
+    'apaevt_status_metrics': ChildRoute(CH_DETAIL, frozenset({SE_METRICS})),
+    # >JOB, by far the loudest (265 in one measured child-run). Sets the run status only
+    # while no main engine exists yet -- that window is child startup, which is what turns a
+    # silent 30-second death into visible install progress.
+    'apaevt_status_message': ChildRoute(CH_DETAIL, frozenset({SE_STATUS_WINDOW, SE_TAIL})),
+}
+
+
+def classify_child_event(event: Dict[str, Any]) -> ChildRoute:
+    """Decide where a venv child's event goes. Pure -- the caller performs the effects.
+
+    The whole policy lives here so it can be tested without a ``Task``: what a child may
+    influence in the run's shared state is a security-of-accounting question more than a
+    plumbing one, and the two events that must NOT flow through (``apaevt_status_state``,
+    ``apaevt_status_metrics`` via ``_update_status``) are invisible in any happy-path test.
+
+    Args:
+        event: A parsed DAP event from the child's stdio pump.
+
+    Returns:
+        The route: delivery channel (``None`` = log only), the set of side effects, and an
+        optional replacement event name.
+    """
+    name = event.get('event', '')
+
+    if name == 'apaevt_sse':
+        return ChildRoute(CH_SSE, frozenset())
+
+    if name == 'output':
+        return ChildRoute(CH_OUTPUT, frozenset({SE_STATUS_TRACE, SE_TAIL}))
+
+    if name == 'apaevt_trace':
+        # Gated on the run's trace level by the caller: a child emits >DBG whether or not
+        # the run asked for tracing, so forwarding ungated would deliver volume that =0
+        # does not.
+        return ChildRoute(CH_FLOW, frozenset(), VENV_TRACE_EVENT)
+
+    if name == 'apaevt_exit':
+        return ChildRoute(CH_NONE, frozenset({SE_EXIT}))
+
+    route = _STATUS_ROUTES.get(name)
+    if route is not None:
+        return route
+
+    if name.startswith('apaevt_status_'):
+        return ChildRoute(CH_DETAIL, frozenset())
+
+    # Default row. Main's on_event sends unmatched events to the DEBUGGER channel, but a
+    # child is not the debug target -- an unknown family from a child belongs in the log.
+    return ChildRoute(CH_NONE, frozenset({SE_TAIL}))
 
 
 @dataclass
@@ -37,9 +149,25 @@ class VenvChild:
     process: 'asyncio.subprocess.Process'
     port: int
     tmpfile: str
-    drains: List['asyncio.Task'] = field(default_factory=list)
-    # Ring of the child's most recent stdout/stderr lines, so a startup failure can report
-    # the child's own error (e.g. a dependency conflict) instead of only its exit code.
+    # DAP stdio pump over the child's stdout/stderr (a Task.VenvChildStdio). Replaces the
+    # raw readline drains: the transport already parses the engine's '>' protocol, so the
+    # tail, the mirror and the event fan-in all feed from parsed events instead of lines.
+    pump: Optional[Any] = None
+    # Set before a deliberate disconnect. The transport fires on_disconnected from
+    # disconnect() as well as from a real exit, so without this every clean run would end by
+    # logging N spurious child deaths -- the noise that makes a real one easy to miss.
+    stopping: bool = False
+    # True once the child's stdio closed or it reported apaevt_exit.
+    exited: bool = False
+    # Per-live-child log path. Keyed by port as well as env id: env names collide across
+    # concurrent runs ('v1' is every test's favourite), and truncate-at-spawn on a shared
+    # name would clobber another run's live log. The port is unique per live child and
+    # recycled afterwards, so this bounds the file count instead of growing it forever.
+    log_path: Optional[str] = None
+    # Ring of the child's most recent rendered output, so a startup failure can report the
+    # child's own error (e.g. a dependency conflict) instead of only its exit code. Fed from
+    # more than 'output' events: '>ERR*' arrives as apaevt_status_error, so a tail built
+    # only from output would silently lose the startup diagnostic.
     tail: Deque[str] = field(default_factory=lambda: deque(maxlen=25))
 
 
