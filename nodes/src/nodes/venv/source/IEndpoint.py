@@ -63,6 +63,14 @@ class IEndpoint(IEndpointBase):
         # resolves per request, so a route added at runtime is picked up by later connects.
         server.use('venv')
 
+        # CONTRACT with the parent (packages/ai/.../venv_spawn.py, VENV_READY_STATUS): this exact
+        # text is how the spawning Task learns /venv/pipe is mounted. It is emitted HERE, after
+        # server.use('venv') above, precisely because the ordering inside this function is the
+        # proof -- a TCP handshake cannot give one, since the shared subprocess server binds at
+        # bootstrap and answers long before this route is added. Reword it and the parent falls
+        # back to the old TCP-only evidence: the run still works, it just loses the proof and waits
+        # out a silence window first. If you change the text, change the constant in the same
+        # commit.
         try:
             monitorStatus('Venv child ready - listening for bridged lane data')
         except Exception as e:

@@ -4,8 +4,9 @@ A venv child is a per-run sibling ``engine`` subprocess that runs one isolated p
 group. It is kept alive by a resident ``venv_source_stub`` source hosting a loopback
 ``/venv/pipe`` WebServer; the main engine's ``venv`` client nodes dial it. This module holds
 the pieces that are decidable without a ``Task``: env construction, url injection, the
-two-phase kill, and the pure routing table for a child's events. The ``Task``-bound
-orchestration (assign ports, write task files, spawn, readiness, teardown, and acting on
+two-phase kill, the pure routing table for a child's events, and the readiness contract (the
+status line a child emits once its route is mounted, plus the wait that consumes it). The
+``Task``-bound orchestration (assign ports, write task files, spawn, teardown, and acting on
 that routing table) lives in ``task_engine.py`` and reuses these.
 
 Reliability is the main engine's, extended to N children: children are spawned with
@@ -16,6 +17,7 @@ processes are reaped via ``wait()`` so no zombies are left.
 
 import asyncio
 import os
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, FrozenSet, List, NamedTuple, Optional
@@ -31,6 +33,16 @@ VENV_SITE_ENV = 'ROCKETRIDE_VENV_SITE'
 # ---------------------------------------------------------------------------
 # child event routing (pure; the Task acts on the result)
 # ---------------------------------------------------------------------------
+
+# The child's own readiness announcement, emitted by the resident venv source strictly AFTER
+# ``server.use('venv')`` mounts ``/venv/pipe`` (nodes/venv/source/IEndpoint.py). That ordering --
+# mount, then report -- is the proof the route exists; a TCP handshake against the shared
+# subprocess web server cannot give it, because that server binds at bootstrap and answers long
+# before the route is added. This literal is therefore a contract between two trees: keep it in
+# sync with the ``monitorStatus(...)`` call at the emitting site, which carries a pointer comment
+# back here. A reworded line costs latency (readiness degrades to the old TCP-only proof), not
+# correctness.
+VENV_READY_STATUS = 'Venv child ready - listening for bridged lane data'
 
 # A child's traces travel under their own name rather than being derived into
 # ``apaevt_flow``. Two reasons, and the second is the decisive one: a child's pipe indices
@@ -62,6 +74,13 @@ SE_WARNING = 'warning'  # append to _status.warnings, env-prefixed
 SE_METRICS = 'metrics'  # merge into the per-source >MET slot
 SE_STATUS_WINDOW = 'status_window'  # may set the run status, but only pre-main-engine
 SE_EXIT = 'exit'  # record the child's exit; never terminates the run
+SE_READY = 'ready'  # the child announced /venv/pipe is mounted; resolves the readiness wait
+
+# Outcomes of await_child_ready. Named rather than bare bools because the difference matters to the
+# log: CONFIRMED means the mount was proved, DEGRADED means we fell back to the pre-8.5 TCP-only
+# evidence and are proceeding anyway.
+READY_CONFIRMED = 'ready'
+READY_DEGRADED = 'degraded'
 
 
 class ChildRoute(NamedTuple):
@@ -94,6 +113,20 @@ _STATUS_ROUTES: Dict[str, ChildRoute] = {
     # silent 30-second death into visible install progress.
     'apaevt_status_message': ChildRoute(CH_DETAIL, frozenset({SE_STATUS_WINDOW, SE_TAIL})),
 }
+
+
+def is_ready_line(event: Dict[str, Any]) -> bool:
+    """Whether this event is the child's readiness announcement (:data:`VENV_READY_STATUS`).
+
+    Compared after ``strip()`` so trailing whitespace from the monitor channel cannot make a
+    correct child look silent; anything else about the text must match exactly, because the whole
+    value of the signal is that it is emitted at one specific point in the child's startup.
+    """
+    body = event.get('body')
+    if not isinstance(body, dict):
+        return False
+    message = body.get('message')
+    return isinstance(message, str) and message.strip() == VENV_READY_STATUS
 
 
 def classify_child_event(event: Dict[str, Any]) -> ChildRoute:
@@ -130,6 +163,11 @@ def classify_child_event(event: Dict[str, Any]) -> ChildRoute:
 
     route = _STATUS_ROUTES.get(name)
     if route is not None:
+        if name == 'apaevt_status_message' and is_ready_line(event):
+            # Readiness rides the existing route instead of a parallel path: the line still feeds
+            # the tail and the pre-main-engine status window, and additionally resolves the spawn's
+            # wait. Keyed on the body, not the event name, which is why it cannot live in the table.
+            return route._replace(side_effects=route.side_effects | {SE_READY})
         return route
 
     if name.startswith('apaevt_status_'):
@@ -169,6 +207,15 @@ class VenvChild:
     # more than 'output' events: '>ERR*' arrives as apaevt_status_error, so a tail built
     # only from output would silently lose the startup diagnostic.
     tail: Deque[str] = field(default_factory=lambda: deque(maxlen=25))
+    # Set when the child announces VENV_READY_STATUS. An Event because it must be STICKY: the pump
+    # attaches before the readiness wait starts, so a fast child can announce into the void -- an
+    # already-set Event returns immediately, whereas a one-shot callback or a future resolved with
+    # nobody listening would hang the spawn until the ceiling.
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    # monotonic() of the last event received from this child, whatever its family. The readiness
+    # wait treats its budget as a ceiling on SILENCE rather than on total time, so a child that is
+    # visibly compiling and installing is waited for instead of killed at a fixed deadline.
+    last_event_at: float = field(default_factory=time.monotonic)
 
 
 def overlay_site(exe_dir: str, project_id: Optional[str], env_id: str) -> Optional[str]:
@@ -240,34 +287,67 @@ def inject_venv_urls(main_components: List[Dict[str, Any]], port_by_env: Dict[st
         component['config'] = config
 
 
-async def probe_ready(
+async def await_child_ready(
+    child: VenvChild,
     host: str,
     port: int,
     process: 'asyncio.subprocess.Process',
-    attempts: int = 120,
+    silence_ceiling: float = 30.0,
     interval: float = 0.25,
-) -> None:
-    """Wait until the child's WebServer accepts TCP connections (default ~30s).
+) -> str:
+    """Wait until the child proves ``/venv/pipe`` is mounted; return how well it was proved.
 
-    A transport-level probe, not a ``/venv/pipe`` WS connect: that route rejects
-    unauthenticated peers before accepting, and an unmatched path is refused the same way, so
-    a handshake cannot tell "route mounted" from "route missing".
+    Two phases under **one** budget:
 
-    **What it proves, since #912:** the shared subprocess WebServer (bootstrapped by
-    ``ai/node.py`` from ``--data_port``, before the engine runs) is listening and the child is
-    alive. It no longer proves ``/venv/pipe`` is mounted -- the resident source adds that route
-    later, from ``scanObjects``. In practice the child wins that race comfortably: it only has
-    to finish its own engine init, while the bridge's first dial waits on the rest of the spawn
-    loop, the main task file, and a whole main-engine startup that begins afterwards. If it ever
-    loses, the symptom is a refused first dial rather than a hang -- fix it then, with the
-    evidence, rather than guessing at a readiness protocol now.
+    1. **TCP accept** against the shared subprocess WebServer. Since #912 this proves only that
+       the child is alive and its bootstrap server is listening -- the resident venv source adds
+       ``/venv/pipe`` later -- so it is a liveness pre-check, not the proof.
+    2. **The child's own announcement** (:data:`VENV_READY_STATUS`), delivered by the stdio pump
+       into ``child.ready``. The emitting site reports it strictly after ``server.use('venv')``,
+       so the ordering inside that one function is what makes it proof of mount.
 
-    Bails immediately if the child has already exited.
+    An already-set ``child.ready`` short-circuits phase 1 outright: the line cannot be emitted
+    before the listener exists, so re-proving it by TCP could only add a failure mode.
+
+    **The budget is a ceiling on silence, not on total time.** Every event from the child (any
+    family) refreshes ``child.last_event_at``, so a child that is compiling and installing
+    dependencies -- talking all the while, via ``depends``' 5-second install heartbeat -- is
+    waited for, while a wedged one still fails inside ``silence_ceiling``. That is the whole
+    change: the old fixed ~30 s deadline killed slow-but-healthy children.
+
+    Args:
+        child: The child being waited for; supplies the sticky ready Event and the liveness clock.
+        host: Loopback host to probe.
+        port: The child's ``--data_port``.
+        process: The child process, so a death is detected instead of waited out.
+        silence_ceiling: Seconds of total quiet tolerated in either phase (default matches the
+            old 120 x 0.25 s budget). Injectable so tests do not sleep out real ceilings.
+        interval: Poll period for both phases.
+
+    Returns:
+        ``READY_CONFIRMED`` when the child announced itself; ``READY_DEGRADED`` when the socket
+        accepted but the announcement never came and the child then fell silent -- the caller
+        proceeds, because that is exactly the pre-8.5 behaviour and a reworded status line must
+        cost latency, not the run.
+
+    Raises:
+        RuntimeError: the child exited during startup, or nothing ever accepted on ``port``
+            while the child stayed silent.
     """
-    last: Optional[BaseException] = None
-    for _ in range(attempts):
+    started = time.monotonic()
+
+    def quiet_for() -> float:
+        """Seconds since the last sign of life (the wait's own start counts as one)."""
+        return time.monotonic() - max(child.last_event_at, started)
+
+    def _bail_if_dead() -> None:
         if process.returncode is not None:
             raise RuntimeError(f'venv child exited during startup with code {process.returncode}')
+
+    # Phase 1 -- socket accepts, or the announcement beats us to it.
+    last: Optional[BaseException] = None
+    while not child.ready.is_set():
+        _bail_if_dead()
         try:
             _reader, writer = await asyncio.open_connection(host, port)
             writer.close()
@@ -275,11 +355,24 @@ async def probe_ready(
                 await writer.wait_closed()
             except Exception:
                 pass
-            return
+            break
         except OSError as e:
             last = e
-            await asyncio.sleep(interval)
-    raise RuntimeError(f'venv child on port {port} did not become ready: {last}')
+        if quiet_for() > silence_ceiling:
+            raise RuntimeError(f'venv child on port {port} did not become ready: {last}')
+        await asyncio.sleep(interval)
+
+    # Phase 2 -- the mount proof itself.
+    while not child.ready.is_set():
+        _bail_if_dead()
+        if quiet_for() > silence_ceiling:
+            return READY_DEGRADED
+        try:
+            await asyncio.wait_for(asyncio.shield(child.ready.wait()), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+    return READY_CONFIRMED
 
 
 async def kill_process(process: 'asyncio.subprocess.Process', timeout: float) -> None:

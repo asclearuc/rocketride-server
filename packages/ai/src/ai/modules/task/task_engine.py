@@ -77,18 +77,20 @@ from .venv_spawn import (
     CH_NONE,
     CH_OUTPUT,
     CH_SSE,
+    READY_DEGRADED,
     SE_ERROR,
     SE_EXIT,
     SE_METRICS,
+    SE_READY,
     SE_STATUS_TRACE,
     SE_STATUS_WINDOW,
     SE_TAIL,
     SE_WARNING,
+    await_child_ready,
     build_child_env,
     classify_child_event,
     inject_venv_urls,
     overlay_site,
-    probe_ready,
     kill_process,
 )
 from .types import LAUNCH_TYPE, TaskError
@@ -933,11 +935,22 @@ class Task(DAPBase):
         await child.pump.connect()
 
         try:
-            # Readiness: the resident source's WebServer must be accepting connections before
-            # the main engine (whose venv clients dial it) starts. Transport-level probe (the
-            # /venv/pipe route rejects unauthenticated peers pre-accept, so a WS connect can't
-            # confirm readiness).
-            await probe_ready('127.0.0.1', port, process)
+            # Readiness: /venv/pipe must be mounted before the main engine (whose venv clients
+            # dial it) starts. Proved by the child's own announcement, which it emits strictly
+            # after mounting the route -- a TCP handshake cannot prove it, because the shared
+            # bootstrap server answers long before the route is added. The budget is a ceiling on
+            # SILENCE, so a child that is installing dependencies is waited for rather than killed.
+            readiness = await await_child_ready(child, '127.0.0.1', port, process)
+            if readiness == READY_DEGRADED:
+                # Socket up, announcement never arrived, child then quiet. Proceed on the same
+                # evidence the pre-8.5 probe accepted, but say so: the most likely cause is that
+                # the status line was reworded on the node side, and the next symptom would be a
+                # refused first dial with nothing pointing here.
+                self.debug_message(
+                    f'venv child "{name}" ({env_id}) never announced readiness; proceeding on the '
+                    f'TCP probe alone (is the status line in nodes/venv/source/IEndpoint.py still '
+                    f'the one venv_spawn.VENV_READY_STATUS expects?)'
+                )
         except BaseException as e:
             # This child is not yet registered for teardown, so clean it up here or it leaks:
             # a hung child would survive until the server dies (its stdin stays open, so
@@ -1009,6 +1022,11 @@ class Task(DAPBase):
         the displayed current object -- and the exceptions are the ones where a child's news
         genuinely belongs to the run: its errors, its metrics, and its startup progress.
         """
+        # Liveness first, for EVERY event and before any routing decision: the readiness wait
+        # treats its budget as a ceiling on silence, so what keeps a slow-but-healthy child alive
+        # is that it is talking at all -- not what it happens to be saying.
+        child.last_event_at = time.monotonic()
+
         route = classify_child_event(event)
         text = self._render_child_event(event)
 
@@ -1021,6 +1039,10 @@ class Task(DAPBase):
         effects = route.side_effects
         if SE_TAIL in effects:
             child.tail.append(text)
+        if SE_READY in effects:
+            # Sticky by construction: the pump attaches before the readiness wait starts, so a
+            # fast child sets this before anyone waits, and the waiter then returns immediately.
+            child.ready.set()
         if SE_EXIT in effects:
             child.exited = True
         if SE_STATUS_TRACE in effects:

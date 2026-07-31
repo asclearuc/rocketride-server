@@ -830,6 +830,14 @@ Findings behind the cost estimate, to re-verify when the question is reopened:
   drift detected by `requirements.hash`.
 - **Install timing:** lazy on first run + opt-in deploy-time pre-warm; reuse `depends.py`'s existing
   install-progress reporting verbatim (`updateProgress` / heartbeat / sidecar), tagged per env.
+  **Readiness is proved by the child, and the spawn's patience is bounded by silence (8.5A).** A
+  child announces `/venv/pipe` after mounting it, and the parent's budget resets on any event from
+  that child, so a first run that compiles and installs is waited for rather than killed at a fixed
+  deadline. **First-run cost, stated because it is real:** `_spawn_venv_children` awaits each child
+  to readiness before spawning the next, so N cold environments cost *install₁ + … + installₙ* of
+  wall clock, not the maximum. Accepted for v1 — before 8.7 the overlap would be fake anyway, since
+  every child contends on the same `install.lock` over `venvs/<proj>/main` — and parallel spawn is
+  deliberately out of scope until each environment owns its lock.
 - **Concurrent-install lock (race fix):** process-per-run + a shared cached env dir + install-on-drift
   could let two concurrent runs both `uv install --target` into the same `site-packages` → corruption.
   `depends.py` **already** has the `FileLock`/`install.lock` mechanism — **scope it per env dir** (one
@@ -1462,7 +1470,44 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    *Live:* a two-child chain reports `peak_cpu_memory_mb` **546.1** against a measured
    178.0 + 178.6 + 187.2 = 543.8 for the three engines. Asserted as "greater than the largest
    single engine", since main is itself one of them — so main-tree-only sampling cannot pass it.
-   *Remaining:* **8.5** readiness proof + orphan-safe teardown; **8.7** per-environment scoping,
+   *Increment 8.5A — **DONE, live-verified**: readiness proved by the child, not by a socket.*
+   `probe_ready` completed a TCP handshake against the **shared** subprocess WebServer, which
+   `ai/node.py` binds at bootstrap — so since #912 it proved only "the child is alive", never
+   "`/venv/pipe` is mounted", and it gave up at a fixed ~30 s (120 × 0.25 s) that is the wrong
+   deadline for a child compiling and installing dependencies. It is replaced by
+   `await_child_ready`, which consumes the announcement the child **already emits**
+   (`>JOB*Venv child ready - listening for bridged lane data`, `nodes/venv/source/IEndpoint.py`)
+   strictly *after* `server.use('venv')`: the ordering inside that one function is the proof of
+   mount, so no new HTTP route, no Bearer probe and no hand-written handshake were needed. The
+   signal rides the existing 8.4 routing table as one more side effect (`SE_READY`, keyed on the
+   message body rather than the event name) instead of a parallel path.
+   Two properties earn their keep. The flag is a **sticky `asyncio.Event`**: the stdio pump
+   attaches before the wait starts, so a fast child announces into the void — an already-set Event
+   returns immediately, whereas a one-shot callback would hang the spawn to the ceiling. And the
+   budget becomes a ceiling on **silence**, not on total time: every event of any family refreshes
+   `VenvChild.last_event_at`, so a child that is visibly working is waited for while a wedged one
+   still fails inside the old budget. If the socket accepts but the line never arrives and the
+   child then goes quiet, readiness **degrades** to the pre-8.5 TCP-only evidence and the spawn
+   proceeds with a log line naming the likely cause — a reworded status line must cost latency,
+   not the run. The literal is now a named constant on the parent side with a pointer comment at
+   the emitting site, marking it as a contract between two trees.
+   *Live A/B, and it reproduced the #912 race rather than merely the timeout.* A one-isolated-group
+   pipeline whose node talks on the monitor channel for ~45 s during module import (throwaway
+   fixture; the real-world equivalent is a cold `uv` install, which `depends` narrates every 5 s):
+   **with 8.5A** `use()` took **56.0 s** — well past the old 30 s — and the pipeline returned its
+   payload. **Against `HEAD` with the same fixture**, `use()` returned in **13.2 s** and the run was
+   already dead: the TCP probe accepted early (the bootstrap server was up), the main engine
+   started, and its bridge dialled a route the child had not mounted yet, so `send()` came back
+   `HTTP 403` on a terminated task. That is exactly the failure `probe_ready`'s own docstring
+   predicted — "the symptom is a refused first dial rather than a hang" — observed instead of
+   assumed. All six `venv_live.py` shapes return their known values, and `venv_badchild.py` still
+   quotes the child's own parsed `>ERR` (`InvalidParam*…*pipeline_config.cpp:212`), which matters
+   because the step-7 diagnostic rides the bail-on-exit branch this commit rewrote.
+   *Cost inherited, not introduced:* children are still spawned sequentially, each awaited to
+   readiness before the next, so two cold environments now **sum** rather than dying at 30 s.
+   Strictly better than before (that run did not complete at all), and the overlap is fake until
+   8.7 gives each child its own `install.lock` — see §4.10.
+   *Remaining:* **8.5B** orphan-safe teardown (`ProcessGuard`); **8.7** per-environment scoping,
    which §4.11's correction above shows reaches no child under `=1` and, under the default `auto`,
    no process at all; **8.6** purge/delete with active-run gates.
    *Observed while verifying 8.2, recorded for 8.5 rather than fixed here:* after an in-venv failure
