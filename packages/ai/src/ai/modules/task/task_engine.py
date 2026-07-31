@@ -86,6 +86,7 @@ from .venv_spawn import (
     SE_STATUS_WINDOW,
     SE_TAIL,
     SE_WARNING,
+    ProcessGuard,
     await_child_ready,
     build_child_env,
     classify_child_event,
@@ -436,6 +437,13 @@ class Task(DAPBase):
         # Per-run venv child subprocesses (one per isolated group), spawned before the main
         # engine and torn down with it in _terminated. Empty unless venv scoping is active.
         self._venv_children: List[VenvChild] = []
+        # OS-level binding for this run's engine processes and everything they spawn (8.5B).
+        # PER RUN, not per Task: close() invalidates the Windows job handle, so a restarted task
+        # must build a fresh one -- a "create if None" lazy guard would assign the new children to
+        # a closed handle, every assign would fail into the deliberate no-op degradation, and
+        # orphan safety would vanish silently on exactly the runs that already bit us once.
+        # None on the legacy path, which is what keeps the =0 spawn untouched.
+        self._venv_guard: Optional[ProcessGuard] = None
         # The per-run bridge token, shared (via inherited env) by the main engine and every
         # venv child; None unless venv scoping is active this run.
         self._run_venv_token: Optional[str] = None
@@ -813,6 +821,11 @@ class Task(DAPBase):
         project_id = result.environments['main'].get('project_id')
         avoid_mocks = bool(self._pipeline.get('avoidMocks'))
 
+        # Always a fresh guard: this runs before the main-engine spawn and only on the scoped
+        # path, so "a guard exists" is exactly "this run is scoped" -- the main-engine spawn below
+        # needs no second condition, and the legacy path never sees one.
+        self._venv_guard = ProcessGuard.create()
+
         port_by_env: Dict[str, int] = {}
         for env_id, child_doc in result.environments.items():
             if env_id == 'main':
@@ -903,7 +916,14 @@ class Task(DAPBase):
             stderr=asyncio.subprocess.PIPE,
             limit=CONST_SUBPROCESS_BUFFER_LIMIT,
             env=child_env,
+            # Paired with the assign below -- on POSIX these kwargs are what make the assign
+            # valid at all (without a new session the child sits in the SERVER's process group).
+            **(self._venv_guard.spawn_kwargs() if self._venv_guard else {}),
         )
+        # Bind before readiness, not after: the case the guard exists for is a child that hangs
+        # or dies during startup, and by then it must already be in the job.
+        if self._venv_guard and not self._venv_guard.assign(process):
+            self.debug_message(f'venv child "{name}" ({env_id}) could not be bound to the process guard')
         child = VenvChild(
             env_id=env_id,
             name=name,
@@ -1128,6 +1148,30 @@ class Task(DAPBase):
                 os.remove(child.tmpfile)
             except OSError:
                 pass
+
+        # The guard is torn down OUTSIDE the loop and unconditionally on the list being empty.
+        # That is not tidiness: a child is appended to _venv_children only after
+        # _spawn_one_venv_child returns, while assign happens before the readiness wait -- so the
+        # one case the guard exists for, a child that hung or died during startup, is exactly the
+        # case where the list is empty and the loop body never ran. Getting this wrong leaks the
+        # handle AND skips the backstop on the only path that needed it.
+        if self._venv_guard:
+            # Report when the cooperative phase left work for the backstop. Without this the job
+            # silently masks a defect in the path that is supposed to do the job's work.
+            survivors = [c.env_id for c in children if c.process and c.process.returncode is None]
+            if survivors:
+                self.debug_message(f'process guard had to finish off venv children: {survivors}')
+            try:
+                groups = self._venv_guard.terminate_all()
+                if groups:
+                    self.debug_message(f'process guard killed {groups} lingering process group(s)')
+            except Exception as e:
+                self.debug_message(f'Error terminating the process guard: {e}')
+            try:
+                self._venv_guard.close()
+            except Exception as e:
+                self.debug_message(f'Error closing the process guard: {e}')
+            self._venv_guard = None
 
     def _file_checksum(self, path: str) -> str:
         """
@@ -2659,7 +2703,14 @@ class Task(DAPBase):
                 stderr=asyncio.subprocess.PIPE,
                 limit=CONST_SUBPROCESS_BUFFER_LIMIT,
                 env=subprocess_env,
+                # Only on a scoped run (a guard exists only then), so the legacy =0 spawn keeps
+                # its exact kwargs. The main engine is held too, not just the children: under =0
+                # its load runs in this same process tree, and whatever it spawns -- ffmpeg, uv,
+                # a model server -- is precisely the class --autoterm cannot reach.
+                **(self._venv_guard.spawn_kwargs() if self._venv_guard else {}),
             )
+            if self._venv_guard and not self._venv_guard.assign(self._engine_process):
+                self.debug_message('main engine could not be bound to the process guard')
             # Close the venv-child status window: from here main owns the run's status line,
             # and a child writing to it would just overwrite whatever main reports.
             self._main_engine_started = True

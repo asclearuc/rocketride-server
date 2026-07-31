@@ -36,7 +36,7 @@ import pytest
 from ai.constants import CONST_STATUS_HISTORY_LIMIT
 from ai.modules.task.task_engine import CONST_TRACE_PAYLOAD_CAP, CONST_TRACE_PREVIEW_BYTES, Task, cap_trace_payload
 from ai.modules.task.task_metrics import TaskMetrics
-from ai.modules.task.venv_spawn import VENV_TRACE_EVENT, VenvChild
+from ai.modules.task.venv_spawn import VENV_TRACE_EVENT, ProcessGuard, VenvChild
 
 
 # ---------------------------------------------------------------------------
@@ -1388,3 +1388,67 @@ def test_render_child_named_event_carries_its_message():
 
 def test_render_child_event_without_text_falls_back_to_the_name():
     assert Task._render_child_event({'event': 'apaevt_trace', 'body': {'op': 'enter'}}) == 'apaevt_trace'
+
+
+# ---------------------------------------------------------------------------
+# _teardown_venv_children — the 8.5B guard wiring
+# ---------------------------------------------------------------------------
+
+
+def _teardown_task(children=None, guard=None):
+    t = _task()
+    t._venv_children = list(children or [])
+    t._venv_guard = guard
+    t._server = MagicMock()
+    t.debug_message = MagicMock()
+    return t
+
+
+@pytest.mark.asyncio
+async def test_teardown_closes_the_guard_when_there_are_no_children():
+    """The case the guard exists for is precisely the case the per-child loop cannot cover.
+
+    A child is appended to ``_venv_children`` only after ``_spawn_one_venv_child`` returns, while
+    ``assign`` happens before the readiness wait — so a child that hung or died during startup
+    leaves an EMPTY list and a live job. Tearing the guard down inside the loop would leak the
+    handle and skip the backstop on the only path that needed it.
+    """
+    guard = create_autospec(ProcessGuard, instance=True)
+    guard.terminate_all.return_value = 0
+    t = _teardown_task(children=[], guard=guard)
+
+    await Task._teardown_venv_children(t)
+
+    guard.terminate_all.assert_called_once()
+    guard.close.assert_called_once()
+    assert t._venv_guard is None, 'a stale guard would be reused by a restarted task'
+
+
+@pytest.mark.asyncio
+async def test_teardown_tolerates_no_guard_at_all():
+    """The legacy path never creates one, and teardown runs on every _terminated path."""
+    t = _teardown_task(children=[], guard=None)
+
+    await Task._teardown_venv_children(t)  # must not raise
+
+    assert t._venv_guard is None
+
+
+@pytest.mark.asyncio
+async def test_teardown_reports_children_the_cooperative_phase_failed_to_reap():
+    """If the job has to finish someone off, that is logged — otherwise the backstop silently
+    masks a defect in the cooperative path it is supposed to be a backstop for.
+    """
+    guard = create_autospec(ProcessGuard, instance=True)
+    guard.terminate_all.return_value = 0
+    survivor = MagicMock()
+    survivor.returncode = None  # kill_process did not reap it
+    child = VenvChild(env_id='v1', name='v1', process=survivor, port=1, tmpfile='t.json')
+    child.pump = None
+    t = _teardown_task(children=[child], guard=guard)
+
+    with patch('ai.modules.task.task_engine.kill_process', new=AsyncMock()):
+        await Task._teardown_venv_children(t)
+
+    logged = ' '.join(str(c) for c in t.debug_message.call_args_list)
+    assert 'had to finish off' in logged and 'v1' in logged

@@ -3,16 +3,21 @@
 Covers ``inject_venv_urls`` -- turning the partitioner's per-child ``venv`` node into a live
 loopback URL, including the ``&return=`` binding when the venv returns data (step 8.1, Arch-1:
 one bridge node per child carries all its lanes over one socket) -- ``classify_child_event``,
-the routing table the 8.4 fan-in acts on, and ``await_child_ready``, the 8.5A readiness wait.
+the routing table the 8.4 fan-in acts on, ``await_child_ready`` (the 8.5A readiness wait) and
+``ProcessGuard`` (the 8.5B OS-level process-tree binding).
 
-The readiness cases use a real loopback listener rather than a mocked socket: the whole point of
-the two-phase wait is how it behaves against an accepting vs. a refusing port, which a mock would
-simply assert away. They pass tiny ``silence_ceiling``/``interval`` values instead of sleeping out
-the real ~30 s budget.
+Two kinds of case here deliberately avoid mocks, because a mock would assert away the only thing
+worth testing. The readiness cases use a real loopback listener: the whole point of the two-phase
+wait is how it behaves against an accepting vs. a refusing port. The guard cases bind a real
+throwaway subprocess and check it actually dies -- "orphan safety" mocked is not orphan safety.
+Both pass tiny timeouts instead of sleeping out the real ~30 s budget.
 """
 
 import asyncio
+import os
 import socket
+import subprocess
+import sys
 import time
 
 import pytest
@@ -35,11 +40,15 @@ from ai.modules.task.venv_spawn import (
     SE_WARNING,
     VENV_READY_STATUS,
     VENV_TRACE_EVENT,
+    ProcessGuard,
     VenvChild,
     await_child_ready,
     classify_child_event,
     inject_venv_urls,
 )
+
+_POSIX_ONLY = pytest.mark.skipif(os.name == 'nt', reason='process groups are POSIX-only')
+_WINDOWS_ONLY = pytest.mark.skipif(os.name != 'nt', reason='Job Objects are Windows-only')
 
 
 def _venv_node(node_id, config):
@@ -325,3 +334,127 @@ async def test_an_exited_child_bails_immediately():
         await await_child_ready(child, '127.0.0.1', _closed_port(), child.process, silence_ceiling=5.0, interval=0.01)
 
     assert time.monotonic() - started < 1.0, 'bailed on the exit, not on the ceiling'
+
+
+# ---------------------------------------------------------------------------
+# ProcessGuard -- the 8.5B OS-level binding
+# ---------------------------------------------------------------------------
+
+_SLEEPER = 'import time; time.sleep(60)'
+# A grandchild that outlives its parent's own exit -- the class --autoterm cannot reach and the
+# only reason 8.5B exists (killing the direct child was already handled).
+_SPAWNS_A_GRANDCHILD = (
+    'import subprocess, sys, time; '
+    "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+    'print(p.pid, flush=True); time.sleep(60)'
+)
+
+
+def _throwaway(guard, code=_SLEEPER, **kwargs):
+    """Spawn a real process THROUGH the guard's own spawn_kwargs.
+
+    Through them, not beside them: on POSIX the kwargs are what make ``assign`` valid at all, so a
+    test that spawned a bare ``Popen`` would exercise a pairing the production wiring never uses.
+    ``sys.executable`` rather than a hard-coded name, so this same test runs under the Windows
+    engine here and a Linux engine elsewhere.
+    """
+    return subprocess.Popen([sys.executable, '-c', code], **guard.spawn_kwargs(), **kwargs)
+
+
+def _dead_within(process, seconds=10.0):
+    try:
+        process.wait(timeout=seconds)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def test_assign_then_terminate_all_kills_the_process():
+    guard = ProcessGuard.create()
+    process = _throwaway(guard)
+    try:
+        assert guard.assign(process)
+        guard.terminate_all()
+        assert _dead_within(process)
+    finally:
+        guard.close()
+        if process.poll() is None:
+            process.kill()
+
+
+@_WINDOWS_ONLY
+def test_closing_the_job_kills_what_is_left():
+    """The orphan-safety property itself: the server holds this handle, so however the server
+    dies the OS closes it and KILL_ON_JOB_CLOSE takes the tree. Asserted here rather than only
+    live, because live it is indistinguishable from --autoterm doing the work.
+    """
+    guard = ProcessGuard.create()
+    process = _throwaway(guard)
+    try:
+        assert guard.assign(process)
+        guard.close()
+        assert _dead_within(process)
+    finally:
+        if process.poll() is None:
+            process.kill()
+
+
+def test_a_degraded_guard_still_yields_working_kwargs_and_a_no_op_terminate():
+    """A guard whose OS calls failed must never break the spawn path -- it is on the critical
+    path of every scoped run. Built directly rather than via create(), which is exactly the state
+    a failed CreateJobObjectW/OpenProcess leaves behind.
+    """
+    guard = ProcessGuard()
+
+    assert guard.spawn_kwargs() == ({} if os.name == 'nt' else {'start_new_session': True})
+    assert guard.terminate_all() == 0
+    guard.close()  # must not raise
+    guard.close()  # idempotent
+
+
+@_POSIX_ONLY
+def test_assign_refuses_a_process_in_the_servers_own_group():
+    """The bug this prevents destroys the server, and nobody would attribute that to teardown.
+
+    Without start_new_session a child inherits the SERVER's process group, so recording its pgid
+    would arm terminate_all() to killpg the server itself along with the run.
+    """
+    guard = ProcessGuard.create()
+    # Deliberately NOT through spawn_kwargs: this is the mistake being guarded against.
+    process = subprocess.Popen([sys.executable, '-c', _SLEEPER])
+    try:
+        assert guard.assign(process) is False
+        assert os.getpgrp() not in guard._pgids
+    finally:
+        process.kill()
+        process.wait(timeout=10)
+        guard.close()
+
+
+@_POSIX_ONLY
+def test_terminate_all_reaches_a_grandchild():
+    """Killing only the direct child is the failure mode process groups exist to prevent -- and it
+    passes any test that checks one process, which is why the grandchild is asserted explicitly.
+    """
+    guard = ProcessGuard.create()
+    process = _throwaway(guard, _SPAWNS_A_GRANDCHILD, stdout=subprocess.PIPE, text=True)
+    try:
+        grandchild_pid = int(process.stdout.readline().strip())
+        assert guard.assign(process)
+
+        guard.terminate_all()
+
+        assert _dead_within(process)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(grandchild_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(f'grandchild {grandchild_pid} survived terminate_all')
+    finally:
+        if process.poll() is None:
+            process.kill()
+        guard.close()
