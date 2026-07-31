@@ -897,6 +897,16 @@ carries it; both return the same two hits, in `venv_spawn.py`, being the definit
 variable is write-only decoration. Retiring the write (rather than adding a reader) is part of the
 per-environment-scoping fix; see the step-8 record.
 
+**And the consequence is visible on disk, not only in the code (measured while building 8.5).**
+`dist/server/venvs/` on the development machine holds **152 project directories, and every one of
+them contains only `main`** — not a single per-group overlay, across a history that includes dozens
+of `chain`/`diamond`/`two_merges` runs with isolated groups under `=1`. So the scoping layer has
+never once produced the thing it exists to produce. Two things follow. The isolation promise is
+unfulfilled in fact and not merely in theory, which is what makes 8.7 the increment that matters
+most here; and those 152 directories are unreclaimable today — nothing deletes them — which is the
+disk debt §4.10's purge/delete operations exist to settle and the reason 2A-R's per-node test
+environments need an eviction story before they multiply it further.
+
 **It is a swap, not an insert (IMPLEMENTED).** Inserting without removing means applying a second
 environment in one process leaves **both** overlays in front of base: the newer wins for packages
 they share, while everything unique to the older stays importable — the cross-environment leak
@@ -1298,6 +1308,23 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    all children up before the main engine, whose `venv` nodes dial them. The token rides the inherited env
    (§4.5), never the config. Teardown (`_terminated`, universal exit path): two-phase `terminate→kill→wait`
    per child + `release_port` + remove task file; children are resident and never self-stop.
+
+   **Corrections, measured while building 8.5 — this paragraph describes step 7 as shipped and is
+   superseded on three points.** Kept rather than rewritten, because the third one is a prediction
+   this document made and the measurement falsified.
+   1. *"the child wins that race comfortably today … the symptom if it ever loses is a refused dial
+      rather than a hang"* — **the child does not always win, and the loss was reproduced.** With a
+      child that takes ~45 s to mount its route, the TCP probe accepted early (the shared server was
+      up), the main engine started, and its bridge dialled a route the child had not mounted yet:
+      `use()` returned in 13.2 s and `send()` came back `HTTP 403` on an already-dead task. The
+      predicted symptom was exactly right; the reassurance around it was not. 8.5A replaces the
+      probe with the child's own announcement — same scenario, `use()` 56.0 s, run completes.
+   2. *"drain stdio"* — replaced in 8.4A by a DAP stdio pump per child; there are no raw readline
+      drains any more.
+   3. *"TCP-probe readiness"* and the teardown sentence — readiness is now `await_child_ready`
+      (announcement + liveness-extended silence ceiling, 8.5A), and teardown is cooperative
+      `terminate→kill→wait` **plus** a `ProcessGuard` backstop that binds the whole process tree at
+      the OS level (8.5B). The cooperative phase alone never reached grandchildren.
 
    **Startup-failure handling (verified).** A main-engine error surfaces exactly as under `=0` (its spawn
    path is unchanged). A child that fails readiness fails the run synchronously (the `use()` call raises →
