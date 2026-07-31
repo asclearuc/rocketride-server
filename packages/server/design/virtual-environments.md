@@ -828,6 +828,34 @@ Findings behind the cost estimate, to re-verify when the question is reopened:
   pipeline) → separate processes → no interference.
 - **On-disk env reused across runs** (only the process is per-run): installed once, keyed by stable IDs,
   drift detected by `requirements.hash`.
+- **Orphan safety is OS-level, and the two platforms do NOT deliver the same guarantee (8.5B).**
+  Written as two claims on purpose; one sentence covering both would be false.
+  - **Windows: kernel-enforced, whole tree, unconditional.** The server holds an **anonymous** Job
+    Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; every venv child *and* the main engine are
+    assigned to it. However the server dies — `kill -9` included — the OS closes the handle and the
+    kernel takes the whole tree, grandchildren with it. No cooperation required. *Anonymous
+    matters:* `CreateJobObjectW` returns the **existing** job for a name already in use, so any
+    naming scheme that can collide (two concurrent runs, a restart racing a dying job) would
+    silently merge two runs into one job and `close()` on the first would kill the second's
+    children.
+  - **POSIX: grandchildren on graceful teardown only.** `start_new_session=True` puts each child in
+    its own process group and teardown `killpg`s it, which reaches grandchildren that
+    `terminate`→`kill` on the direct child never touches. But there is **no equivalent of
+    KILL_ON_JOB_CLOSE**: `killpg` needs someone alive to call it, and a SIGKILLed server calls
+    nothing, so abrupt server death still leaves the group. That residual stays covered only by
+    `--autoterm`, which engines have and `ffmpeg`/`uv` do not.
+  - **No `PR_SET_PDEATHSIG`** (would close the POSIX residual): `preexec_fn` forking from a
+    multi-threaded server is a documented deadlock hazard, and pdeathsig keys on the *forking
+    thread*, so a future `asyncio.to_thread` spawn would kill live children when that thread ended.
+  - **Consequence on POSIX:** a new session detaches the engine from the controlling terminal, so an
+    interactive Ctrl-C no longer reaches it. Teardown and `--autoterm` cover it; a developer used to
+    Ctrl-C killing everything will notice.
+  - **Coverage, honestly.** The Windows branch — the one carrying the hard guarantee — is exercised
+    by **no CI, ever**: there is no `runs-on: windows-*` in `.github/workflows` and no per-PR
+    workflow runs Python tests at all. The POSIX branch is measured on WSL against the shipped
+    module (loaded by path, since `venv_spawn.py` is stdlib-only and `packages/ai` needs the
+    engine); the `packages/ai` suite itself has never run on Linux for this branch. **macOS is
+    unexercised by anything.**
 - **Install timing:** lazy on first run + opt-in deploy-time pre-warm; reuse `depends.py`'s existing
   install-progress reporting verbatim (`updateProgress` / heartbeat / sidecar), tagged per env.
   **Readiness is proved by the child, and the spawn's patience is bounded by silence (8.5A).** A
@@ -1507,7 +1535,48 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    readiness before the next, so two cold environments now **sum** rather than dying at 30 s.
    Strictly better than before (that run did not complete at all), and the overlap is fake until
    8.7 gives each child its own `install.lock` — see §4.10.
-   *Remaining:* **8.5B** orphan-safe teardown (`ProcessGuard`); **8.7** per-environment scoping,
+   *Increment 8.5B — **DONE, live-verified**: orphan-safe teardown (`ProcessGuard`).* Teardown was
+   cooperative, so anything a run spawned that is **not itself an engine** outlived the server.
+   That class is the whole increment: F1 measured that killing the server leaves **zero**
+   `engine.exe` behind, because `--autoterm`'s stdin monitor handles every engine — so "kill the
+   server, assert no engines" passes on HEAD and proves nothing. What survives is `subprocess.Popen`
+   work with neither that monitor nor a pipe from the server: `ffmpeg` in `ai/common/avi/reader.py`,
+   the audio loaders, `uv`, model servers.
+   `ProcessGuard` (in `venv_spawn.py`) binds the run's processes to the OS instead — an anonymous
+   Windows Job Object with `KILL_ON_JOB_CLOSE`, POSIX process groups via `start_new_session=True`
+   plus `killpg`. It holds the **main engine as well as** the children: under `=0` that same load
+   runs inside the main engine, so excluding it would leave the commonest case uncovered. The guard
+   is created only on the scoped path, which is what keeps the legacy spawn's kwargs untouched, and
+   it is **per run, not per Task** — `close()` invalidates the job handle, so a "create if None"
+   lazy guard would assign a restarted task's children to a closed handle, every `assign` would
+   fail into the deliberate no-op degradation, and orphan safety would vanish silently.
+   Two wiring details that are correctness, not style. On POSIX `assign` **refuses a pgid equal to
+   `os.getpgrp()`**: without `start_new_session` a subprocess inherits the *server's* group, so
+   recording it would arm `terminate_all()` to kill the server along with the run — a defensive
+   check that should never fire is right when the failure it prevents is "the server vanished
+   mid-run". And teardown of the guard sits **outside** the per-child loop and does not depend on
+   `_venv_children` being non-empty: a child is appended to that list only after
+   `_spawn_one_venv_child` returns, while `assign` happens before the readiness wait, so the one
+   case the guard exists for — a child that hung or died during startup — is exactly the case where
+   the list is empty and the loop body never runs.
+   *Live A/B on Windows, with a purpose-built fixture.* `nodes/src/nodes/text_grandchild` spawns a
+   plain `subprocess.Popen` sleeper inside a venv child and emits its PID through the pipeline, so
+   the assertion can be made from outside the tree. Killing the server hard (`taskkill /F`, no `/T`
+   — a tree kill would prove nothing): **with 8.5B the grandchild was gone 1.0 s later; on the
+   parent commit it was still alive after 20 s.** That is the orphan class F1 identified, closed and
+   measured rather than argued.
+   *POSIX measured on WSL against the shipped module.* `e:\tmp\venv-drivers\posix_guard_check.py`
+   loads `venv_spawn.py` **by path** (it is stdlib-only, unlike anything under `packages/ai`, which
+   needs the engine), so Linux exercises the real `ProcessGuard` rather than a re-implementation of
+   what it should do: 8/8 — own process group, `assign` accepted, child dead, **grandchild dead**,
+   server-group process refused, server pgid never recorded, the script itself alive. *Rake found
+   there:* a killed direct child stays a **zombie** until reaped, and `os.kill(pid, 0)` succeeds for
+   zombies — the first version of that script reported the child alive and the grandchild dead,
+   which is backwards and was the clue. The orphaned grandchild needs no such care: init reaps it.
+   *Guarantees differ per platform and §4.10 states them as two claims, not one* — Windows
+   kernel-enforced and unconditional, POSIX grandchildren-on-graceful-teardown only, with the
+   `PR_SET_PDEATHSIG` refusal, the Ctrl-C consequence and the honest coverage line recorded there.
+   *Remaining:* **8.7** per-environment scoping,
    which §4.11's correction above shows reaches no child under `=1` and, under the default `auto`,
    no process at all; **8.6** purge/delete with active-run gates.
    *Observed while verifying 8.2, recorded for 8.5 rather than fixed here:* after an in-venv failure

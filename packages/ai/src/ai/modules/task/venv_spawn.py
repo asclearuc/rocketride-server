@@ -4,19 +4,26 @@ A venv child is a per-run sibling ``engine`` subprocess that runs one isolated p
 group. It is kept alive by a resident ``venv_source_stub`` source hosting a loopback
 ``/venv/pipe`` WebServer; the main engine's ``venv`` client nodes dial it. This module holds
 the pieces that are decidable without a ``Task``: env construction, url injection, the
-two-phase kill, the pure routing table for a child's events, and the readiness contract (the
-status line a child emits once its route is mounted, plus the wait that consumes it). The
+two-phase kill, the pure routing table for a child's events, the readiness contract (the
+status line a child emits once its route is mounted, plus the wait that consumes it), and
+:class:`ProcessGuard`, the OS-level binding that bounds the run's whole process tree. The
 ``Task``-bound orchestration (assign ports, write task files, spawn, teardown, and acting on
 that routing table) lives in ``task_engine.py`` and reuses these.
 
-Reliability is the main engine's, extended to N children: children are spawned with
-``--autoterm`` (a C++ stdin monitor exits the child if the server process dies) and torn
-down explicitly by the owning ``Task`` (they are resident and never self-stop); the child
-processes are reaped via ``wait()`` so no zombies are left.
+Reliability has two layers, and they cover different things. **Cooperative:** children are
+spawned with ``--autoterm`` (a C++ stdin monitor exits the child if the server process dies)
+and torn down explicitly by the owning ``Task`` (they are resident and never self-stop); the
+child processes are reaped via ``wait()`` so no zombies are left. That reaches every *engine*
+— measured: killing the server leaves zero of them behind. **What it does not reach is
+grandchildren**: a ``subprocess.Popen``'d ``ffmpeg``, an audio loader, ``uv``, a model server.
+Those have neither the stdin monitor nor a pipe from the server, which is what
+:class:`ProcessGuard` is for.
 """
 
 import asyncio
+import ctypes
 import os
+import signal
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -373,6 +380,239 @@ async def await_child_ready(
             pass
 
     return READY_CONFIRMED
+
+
+# ---------------------------------------------------------------------------
+# OS-level process-tree binding (8.5B)
+# ---------------------------------------------------------------------------
+
+_IS_WINDOWS = os.name == 'nt'
+
+# Windows Job Object constants. Spelled out rather than imported because ctypes has no header.
+_JobObjectExtendedLimitInformation = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_SET_QUOTA = 0x0100
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ('ReadOperationCount', ctypes.c_ulonglong),
+        ('WriteOperationCount', ctypes.c_ulonglong),
+        ('OtherOperationCount', ctypes.c_ulonglong),
+        ('ReadTransferCount', ctypes.c_ulonglong),
+        ('WriteTransferCount', ctypes.c_ulonglong),
+        ('OtherTransferCount', ctypes.c_ulonglong),
+    ]
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ('PerProcessUserTimeLimit', ctypes.c_int64),
+        ('PerJobUserTimeLimit', ctypes.c_int64),
+        ('LimitFlags', ctypes.c_uint32),
+        ('MinimumWorkingSetSize', ctypes.c_size_t),
+        ('MaximumWorkingSetSize', ctypes.c_size_t),
+        ('ActiveProcessLimit', ctypes.c_uint32),
+        ('Affinity', ctypes.c_size_t),  # ULONG_PTR
+        ('PriorityClass', ctypes.c_uint32),
+        ('SchedulingClass', ctypes.c_uint32),
+    ]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ('BasicLimitInformation', _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ('IoInfo', _IO_COUNTERS),
+        ('ProcessMemoryLimit', ctypes.c_size_t),
+        ('JobMemoryLimit', ctypes.c_size_t),
+        ('PeakProcessMemoryUsed', ctypes.c_size_t),
+        ('PeakJobMemoryUsed', ctypes.c_size_t),
+    ]
+
+
+class ProcessGuard:
+    """Bind a run's engine processes to the OS so nothing of theirs outlives the run.
+
+    **The two platforms do not deliver the same guarantee, and the difference is the point.**
+
+    - *Windows* is kernel-enforced and unconditional. The server holds a Job Object handle with
+      ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``; however the server dies — including ``kill -9`` —
+      the OS closes the handle and the kernel takes the **whole tree**, grandchildren included.
+      No cooperation required from anyone.
+    - *POSIX* has **no equivalent for parent death**. ``killpg`` needs someone alive to call it,
+      and a SIGKILLed server calls nothing, so the group survives. What process groups buy is the
+      *graceful* path: teardown reaches grandchildren that ``terminate`` → ``kill`` on the direct
+      child never touches. Abrupt server death stays covered only by ``--autoterm``, which engines
+      have and ``ffmpeg``/``uv`` do not.
+
+    Treat "the POSIX branch is the Windows branch with different calls" as the mistake to avoid:
+    it shows up twice in the code below — there is nothing to ``close()``, and the state is a
+    *list* of per-child groups rather than one container.
+
+    Every OS call degrades to a documented no-op on failure. This object sits on the spawn path
+    of every scoped run; it must never be able to break one.
+    """
+
+    def __init__(self):
+        """Use :meth:`create` -- the constructor deliberately acquires nothing."""
+        self._job = None  # Windows: HANDLE to the job object
+        self._pgids: List[int] = []  # POSIX: one process-group id per assigned process
+        self._closed = False
+
+    @classmethod
+    def create(cls) -> 'ProcessGuard':
+        """Build a guard, acquiring the Job Object on Windows (a holder only on POSIX)."""
+        guard = cls()
+        if not _IS_WINDOWS:
+            return guard
+        try:
+            kernel32 = ctypes.windll.kernel32
+            # Anonymous on purpose: a NAME can collide -- CreateJobObjectW returns the EXISTING
+            # job for a name already in use, so two concurrent runs (or a restart racing a dying
+            # job) would silently share one job, and close() on the first would kill the second's
+            # children. Nothing needs to open this job from outside; membership is asserted in the
+            # unit tests, where the handle is in hand.
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return guard
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            ok = kernel32.SetInformationJobObject(
+                job, _JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info)
+            )
+            if not ok:
+                kernel32.CloseHandle(job)
+                return guard
+            guard._job = job
+        except Exception:
+            guard._job = None
+        return guard
+
+    def spawn_kwargs(self) -> Dict[str, Any]:
+        """Extra ``create_subprocess_exec`` kwargs every guarded process MUST be spawned with.
+
+        POSIX: ``start_new_session=True``, so the process leads its own group and ``killpg``
+        reaches its grandchildren *without* reaching the server. This is not optional decoration —
+        :meth:`assign` is only valid for a process spawned this way (see its refusal below).
+
+        Deliberately **no** ``preexec_fn`` and therefore no ``PR_SET_PDEATHSIG``: forking with
+        ``preexec_fn`` from a multi-threaded server is a documented deadlock hazard, and pdeathsig
+        keys on the *forking thread* rather than the process, so a future ``asyncio.to_thread``
+        spawn would kill live children when that thread ended. Parent death is already covered by
+        ``--autoterm`` for engines; the residual gap for grandchildren is recorded in §4.10 rather
+        than papered over here.
+
+        One consequence worth knowing on POSIX: a new session detaches the child from the
+        controlling terminal, so an interactive Ctrl-C no longer reaches it. Teardown and
+        ``--autoterm`` cover it; a developer used to Ctrl-C killing everything will notice.
+        """
+        return {} if _IS_WINDOWS else {'start_new_session': True}
+
+    def assign(self, process) -> bool:
+        """Bind one already-spawned process to the guard. Returns whether it took.
+
+        The process **must** have been spawned with :meth:`spawn_kwargs`. On POSIX that is a
+        correctness requirement, not style: without ``start_new_session`` the child inherits the
+        *server's* process group, so this would record the server's own pgid and
+        :meth:`terminate_all` would take the server down with the run. The check below refuses
+        that outright rather than trusting the caller — a defensive check that should never fire
+        is the right shape when the failure it prevents is "the server vanished mid-run".
+
+        Windows has a spawn-to-assign race: a grandchild created between ``CreateProcess`` and
+        ``AssignProcessToJobObject`` escapes the job. ``CREATE_SUSPENDED`` + assign + resume
+        cannot be expressed through ``asyncio.create_subprocess_exec`` (no main-thread handle; it
+        would need ``NtResumeProcess``), so the window is accepted — a child's grandchildren
+        appear well after engine init.
+        """
+        pid = getattr(process, 'pid', None)
+        if pid is None:
+            return False
+
+        if _IS_WINDOWS:
+            if not self._job:
+                return False
+            try:
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid)
+                if not handle:
+                    return False
+                try:
+                    return bool(kernel32.AssignProcessToJobObject(self._job, handle))
+                finally:
+                    kernel32.CloseHandle(handle)
+            except Exception:
+                return False
+
+        try:
+            pgid = os.getpgid(pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+        if pgid == os.getpgrp():
+            # The process was NOT spawned with spawn_kwargs(); recording this would arm
+            # terminate_all() to kill the server itself.
+            return False
+        # Per child, not one shared value: start_new_session gives each its OWN group, so a
+        # single stored pgid would tear down one child and leave the rest.
+        if pgid not in self._pgids:
+            self._pgids.append(pgid)
+        return True
+
+    def terminate_all(self, grace: float = 0.5) -> int:
+        """Kill everything bound to the guard. Returns how many POSIX groups were still alive.
+
+        Windows: one ``TerminateJobObject`` call takes the whole job. The return value is 0 there
+        — counting survivors would need a variable-length ``QueryInformationJobObject`` buffer,
+        and the caller already knows which children the cooperative phase failed to reap, which is
+        the number worth logging.
+
+        POSIX: ``SIGTERM`` each recorded group, wait ``grace``, then ``SIGKILL``, tolerating
+        ``ProcessLookupError`` for groups the cooperative phase already emptied.
+        """
+        if _IS_WINDOWS:
+            if self._job:
+                try:
+                    ctypes.windll.kernel32.TerminateJobObject(self._job, 1)
+                except Exception:
+                    pass
+            return 0
+
+        alive = 0
+        for pgid in self._pgids:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+                alive += 1
+            except (ProcessLookupError, PermissionError, OSError):
+                continue
+        if alive:
+            time.sleep(grace)
+            for pgid in self._pgids:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    continue
+        return alive
+
+    def close(self) -> None:
+        """Release the guard. On Windows this IS the orphan-safety property.
+
+        Closing the last handle to a ``KILL_ON_JOB_CLOSE`` job makes the kernel kill everything
+        still in it — which is exactly why the server holding this handle protects the tree
+        however the server itself dies. POSIX has nothing to close, and that asymmetry is the
+        whole story in one line: there, :meth:`terminate_all` is the only thing that ever reaps a
+        group, so a teardown path that skips it leaks silently instead of being caught by handle
+        closure.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if _IS_WINDOWS and self._job:
+            try:
+                ctypes.windll.kernel32.CloseHandle(self._job)
+            except Exception:
+                pass
+            self._job = None
+        self._pgids = []
 
 
 async def kill_process(process: 'asyncio.subprocess.Process', timeout: float) -> None:
