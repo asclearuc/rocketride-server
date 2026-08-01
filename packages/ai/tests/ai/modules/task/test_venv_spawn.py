@@ -274,11 +274,12 @@ async def test_a_chatty_child_is_waited_past_the_silence_ceiling():
     """
     server, port = await _listener()
     child = _child()
-    ceiling = 0.1
+    # Generous on purpose: under gate concurrency a stall once read 0.1 s as silence.
+    ceiling = 0.4
 
     async def chatter():
-        for _ in range(10):
-            await asyncio.sleep(ceiling / 4)
+        for _ in range(15):
+            await asyncio.sleep(ceiling / 8)
             child.last_event_at = time.monotonic()
         child.ready.set()
 
