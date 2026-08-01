@@ -23,6 +23,38 @@ def test_use_venv_mode_states():
     assert V.use_venv_mode({'ROCKETRIDE_SERVER_USE_VENV': 'yes'}) == V.USE_AUTO
 
 
+def test_mode_is_frozen_against_a_mid_process_rewrite(monkeypatch):
+    # The attack: a node rewrites the switch before another node's depends() re-reads it.
+    monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', '1')
+    assert V.use_venv_mode() == V.USE_ON
+    monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', '0')
+    assert V.use_venv_mode() == V.USE_ON
+
+
+def test_unset_freezes_to_auto(monkeypatch):
+    # Freezing the absence matters as much: a later export must not turn scoping on mid-process.
+    monkeypatch.delenv('ROCKETRIDE_SERVER_USE_VENV', raising=False)
+    assert V.use_venv_mode() == V.USE_AUTO
+    monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', '1')
+    assert V.use_venv_mode() == V.USE_AUTO
+
+
+def test_explicit_env_is_never_cached(monkeypatch):
+    monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', '1')
+    assert V.use_venv_mode() == V.USE_ON
+    assert V.use_venv_mode({'ROCKETRIDE_SERVER_USE_VENV': '0'}) == V.USE_OFF
+    assert V.use_venv_mode({}) == V.USE_AUTO
+    assert V.use_venv_mode() == V.USE_ON
+
+
+def test_reset_restores_first_read_behaviour(monkeypatch):
+    monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', '1')
+    assert V.use_venv_mode() == V.USE_ON
+    monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', '0')
+    V._reset_venv_env_cache()
+    assert V.use_venv_mode() == V.USE_OFF
+
+
 def test_scoping_enabled_semantics():
     assert V.scoping_enabled(V.USE_OFF, has_isolated_group=True) is False
     assert V.scoping_enabled(V.USE_ON, has_isolated_group=False) is True

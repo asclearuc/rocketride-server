@@ -59,10 +59,22 @@ def _has_node_path(paths):
     return any(os.path.abspath(p).startswith(root + os.sep) for p in paths)
 
 
+# The cases below measure the requirement-file glob, not the switch. venv_env freezes the mode
+# at first read, so each one relies on conftest's autouse reset to get one.
+
+
 def test_forced_scoping_drops_node_requirements(monkeypatch):
     # With scoping forced on, node deps come from each env's scoped install; folding them
     # into the startup compile would make two conflicting nodes unable to coexist at all.
     monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', '1')
+    assert not _has_node_path(D._find_requirement_files())
+
+
+def test_the_glob_does_not_follow_a_mid_process_flip(monkeypatch):
+    # A node flipping the switch must not put nodes/** back into the base compile.
+    monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', '1')
+    assert not _has_node_path(D._find_requirement_files())
+    monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', '0')
     assert not _has_node_path(D._find_requirement_files())
 
 
@@ -74,6 +86,7 @@ def test_legacy_and_auto_keep_node_requirements(monkeypatch, value):
         monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', value)
     unscoped = D._find_requirement_files()
     monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', '1')
+    V._reset_venv_env_cache()  # without this the frozen set comes back and the case passes vacuously
     assert set(D._find_requirement_files()) <= set(unscoped)
     # Only meaningful while the installation actually ships node requirement files.
     if os.path.isdir(os.path.join(D._get_executable_dir(), 'nodes')):
