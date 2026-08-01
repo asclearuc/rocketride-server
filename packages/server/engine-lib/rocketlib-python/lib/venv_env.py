@@ -47,8 +47,31 @@ USE_OFF = 'off'  # '0': never partition/scope — today's global-glob behavior (
 USE_ON = 'on'  # '1': force the scoped/venv machinery on
 
 
+# First real-environment resolution, kept for the life of the process. See use_venv_mode.
+_MODE_CACHE: Optional[str] = None
+
+
+def _resolve_mode(env) -> str:
+    raw = env.get('ROCKETRIDE_SERVER_USE_VENV')
+    if raw is None:
+        return USE_AUTO
+    raw = raw.strip()
+    if raw == '0':
+        return USE_OFF
+    if raw == '1':
+        return USE_ON
+    return USE_AUTO
+
+
 def use_venv_mode(env: Optional[dict] = None) -> str:
     """Resolve the ``ROCKETRIDE_SERVER_USE_VENV`` switch to ``auto`` / ``off`` / ``on``.
+
+    A process-init input, not a live control channel: the first resolution over the real
+    environment is cached and every later call returns it. Without that, node code running
+    inside the engine could rewrite ``os.environ`` before another node's ``depends()`` and
+    move the startup glob -- reaching the base runtime, which outlives the run.
+
+    An explicitly passed ``env`` bypasses the cache and is resolved fresh every time.
 
     Args:
         env: Environment mapping to read (defaults to ``os.environ``); injectable
@@ -58,15 +81,21 @@ def use_venv_mode(env: Optional[dict] = None) -> str:
         ``USE_OFF`` for ``'0'``, ``USE_ON`` for ``'1'``, ``USE_AUTO`` otherwise
         (unset / any other value).
     """
-    raw = (env if env is not None else os.environ).get('ROCKETRIDE_SERVER_USE_VENV')
-    if raw is None:
-        return USE_AUTO
-    raw = raw.strip()
-    if raw == '0':
-        return USE_OFF
-    if raw == '1':
-        return USE_ON
-    return USE_AUTO
+    global _MODE_CACHE
+    if env is not None:
+        return _resolve_mode(env)
+    if _MODE_CACHE is None:
+        _MODE_CACHE = _resolve_mode(os.environ)
+    return _MODE_CACHE
+
+
+def _reset_venv_env_cache() -> None:
+    """Drop the process-init caches so the next call reads the environment again.
+
+    Tests only -- production resolves once by design.
+    """
+    global _MODE_CACHE
+    _MODE_CACHE = None
 
 
 def scoping_enabled(mode: str, has_isolated_group: bool) -> bool:

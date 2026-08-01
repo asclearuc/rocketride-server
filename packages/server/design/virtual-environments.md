@@ -462,6 +462,26 @@ env/handle, never argv.
   ~1 MB chunking is a non-issue for small frames). The interim caveat still holds — before the store
   migration, raw AV crosses these lanes and the throughput gate above applies. (The child's store fetch
   needs account/store context — ties into secrets/`ROCKETRIDE_CLIENT_ID` propagation, §6.)
+- **Environment variables are process-init inputs, not a live control channel (8.7S).** The venv
+  variables are resolved once per process and frozen. The switch is additionally **never popped**
+  (the server itself reads it, and stripping it would degrade every later run to `auto`), while
+  the bridge token is **never consumed at all** (node code is its legitimate reader). The threat
+  chain, the rule, and the reason each variable is treated differently live in **§4.15**; the
+  pointer is here because this is the section a reader opens looking for the threat model.
+- **`${ROCKETRIDE_*}` substitution is *not* a second channel — and the tempting reason is the
+  wrong one.** `resolve_pipeline_env` allowlists the whole `ROCKETRIDE_` prefix, so a
+  sub-document reading `${ROCKETRIDE_VENV_TOKEN}` would exfiltrate the bridge token — and "the
+  resolve runs in the server, the token only exists in children" does **not** answer it, because
+  a child engine both holds the token and hosts node code. The real barrier does not depend on
+  which process resolves: **neither production call site passes `os.environ`.** `cmd_misc`
+  resolves against a purpose-built `merged_env` (server `RR_*` keys remapped for `sys.admin`,
+  plus org/team/user secrets from the account store), and the `Task` side against an injected
+  `self._env` that defaults to `{}`. A variable sitting in a process environment is therefore not
+  substitutable **in any process**, popped or not.
+  Do not be alarmed by `packages/ai/tests/ai/modules/task/test_env_var_exfil.py`: it feeds
+  `dict(os.environ)` deliberately, to pin the prefix allowlist and the `AWS_*` redaction. That is
+  the harness, not the production wiring — and it is the first file to check if anyone ever
+  changes what the resolve is handed.
 - **Hardening (deferred to 2C):** OS-access-controlled local IPC so the kernel rejects other-user
   processes *before* any token check — **named pipe + user-SID ACL** (Windows), **Unix domain socket**
   `0700` + `SO_PEERCRED`/`LOCAL_PEERCRED` (Linux/macOS). Matters for **multi-tenant** hosts (Linux
@@ -1062,6 +1082,32 @@ self-consistent. Clients need nothing: an SDK client does not import `rocketlib`
 `client-python`'s `dap_base` is guarded by `except ImportError`) and so never enters dependency
 resolution at all.
 
+**The switch is a process-init input, read once — enforced since 8.7S.** `use_venv_mode()` caches
+its first resolution over the real environment for the life of the process; only an explicitly
+passed mapping is re-resolved on every call. Until then the "self-consistent" claim above was
+aspirational, and the gap was reachable: the endpoint hook reads the environment before
+`buildGlobalPipe()` imports node modules, but nodes call `depends()` at their **own** global
+init, and `depends()` reaches `_find_requirement_files()` → `use_venv_mode()`, which re-read
+`os.environ` fresh on every call. A node could set `ROCKETRIDE_SERVER_USE_VENV=0` before another
+node's `depends()` and move the startup glob: under `=1` that puts `nodes/**` back into the
+**base** compile, and the base runtime is then recompiled from requirement files the node itself
+ships. A node running Python inside the engine is already fully privileged there — what this
+channel added was **persistence** (a monkeypatch dies with the process; a mutated base runtime
+outlives the run and reaches every later pipeline on the machine) and **defeating `=0` from
+inside a document**, which this section sells as a permanent escape hatch.
+
+**Frozen but never popped, and the asymmetry is deliberate.** The mode is *designed* to reach the
+task subprocess by inheritance, and `use_venv_mode()` is also called in the **server** process
+(`Task._venv_scoping_enabled`). A `pop` there would strip the operator's setting from the
+server's own `os.environ`, and `subprocess_env = os.environ.copy()` would then omit it —
+silently degrading every later run to `auto`, the operator's `=1` lost after the first pipeline.
+Per-run venv variables carry no such exposure, since their resolvers run only inside engine
+processes; the rule for those is to consume them — frozen **and** popped — so that neither node
+code nor anything a node spawns can observe or change them. `ROCKETRIDE_VENV_TOKEN` is consumed
+by neither: node code is its legitimate reader at connect time, so popping it would take the
+bridge down in every scoped run. Three variables, three treatments, one principle — inputs are
+read once, and only the ones nothing legitimately reads later are removed.
+
 **Known gap.** `<exe>/.env` is loaded by `ai/web/server.py` inside `WebServer.__init__`, but
 `ai/__init__.py` calls `depends()` at import — so a value placed in `.env` is read **after** the
 resolution it would govern and silently has no effect. Putting the switch there therefore does not work
@@ -1603,7 +1649,29 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    *Guarantees differ per platform and §4.10 states them as two claims, not one* — Windows
    kernel-enforced and unconditional, POSIX grandchildren-on-graceful-teardown only, with the
    `PR_SET_PDEATHSIG` refusal, the Ctrl-C consequence and the honest coverage line recorded there.
-   *Remaining:* **8.7** per-environment scoping,
+   *Increment 8.7S — **DONE**: the venv switch became a read-once process-init input.* Not scoping
+   work — it closes a channel that 8.7A/B would otherwise widen. `use_venv_mode()` re-read
+   `os.environ` on every call, and nodes call `depends()` at their own global init, i.e. **after**
+   the endpoint hook has read the environment; so a node could move the startup glob and, under
+   `=1`, push `nodes/**` back into the **base** compile — recompiling the base runtime from
+   requirement files it ships itself, which outlives the run. The mode now resolves once per
+   process and is cached; only an explicitly passed mapping is re-resolved. Frozen but deliberately
+   **not** popped, because the server reads it too (§4.15 carries the full rule and the asymmetry).
+   *Measured rather than assumed, and the measurement corrected the plan twice.* The freeze breaks
+   **no** existing test in isolation — every failure is cross-test cache pollution, which is why
+   the repair is one autouse fixture in `rocketlib-python/tests/conftest.py` and not a line per
+   case. And `test_legacy_and_auto_keep_node_requirements` does **not** fail without an explicit
+   reset between its two reads: it **passes vacuously**, because the frozen set reduces
+   `set(scoped) <= set(unscoped)` to comparing a set with itself. A green test that had quietly
+   stopped measuring was the real hazard here, not a red one.
+   *Coverage:* four new cases in `test_venv_env.py` (frozen across a mid-process rewrite, unset
+   frozen to `auto`, explicit dict never cached, reset restores first-read behaviour) and one in
+   `test_depends_scoping.py` pinning that the **glob** does not follow a mid-process flip. The
+   directory runs 80 green; with the reset disabled **4 fail**, which is the evidence the freeze
+   is real rather than inert. The gating regression is itself an `auto` run, so every process in
+   it resolves through the frozen path — that, not the units, is this increment's breadth.
+   Checked on WSL Python **3.10.12** by smoke script, that interpreter having no pytest installed.
+   *Remaining:* **8.7A/8.7B** per-environment scoping,
    which §4.11's correction above shows reaches no child under `=1` and, under the default `auto`,
    no process at all; **8.6** purge/delete with active-run gates.
    *Observed while verifying 8.2, recorded for 8.5 rather than fixed here:* after an in-venv failure
