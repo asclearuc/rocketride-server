@@ -37,6 +37,10 @@ VENV_TOKEN_ENV = 'ROCKETRIDE_VENV_TOKEN'
 # overlay path from this; it is never told the path. Mirrors venv_env.VENV_ENV_ID_ENV, which
 # this module cannot import (engine sys.path only) -- keep in sync.
 VENV_ENV_ID_ENV = 'ROCKETRIDE_VENV_ENV_ID'
+# The raw document fact "this run has an isolated group", not a resolved scoping decision --
+# scoping_enabled still decides, so a stale value cannot switch scoping on under =0. Mirrors
+# venv_env.VENV_ISOLATED_ENV -- keep in sync.
+VENV_ISOLATED_ENV = 'ROCKETRIDE_VENV_ISOLATED'
 
 # ---------------------------------------------------------------------------
 # child event routing (pure; the Task acts on the result)
@@ -247,6 +251,10 @@ def build_child_env(
     env['ROCKETRIDE_CLIENT_ID'] = client_id
     env[VENV_TOKEN_ENV] = run_token
     env[VENV_ENV_ID_ENV] = env_id
+    # Unconditional, and not a parameter: a venv child IS an isolated group -- one child per group
+    # and never otherwise -- so threading the computed value in would add an argument whose only
+    # possible value is True. Main's stamp is conditional because main's document may have none.
+    env[VENV_ISOLATED_ENV] = '1'
     if avoid_mocks:
         env.pop('ROCKETRIDE_MOCK', None)
     return env

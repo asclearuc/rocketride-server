@@ -40,6 +40,7 @@ from ai.modules.task.venv_spawn import (
     SE_WARNING,
     VENV_READY_STATUS,
     VENV_ENV_ID_ENV,
+    VENV_ISOLATED_ENV,
     VENV_TOKEN_ENV,
     VENV_TRACE_EVENT,
     ProcessGuard,
@@ -475,6 +476,8 @@ def test_child_env_carries_the_env_id_and_the_token():
     assert env[VENV_TOKEN_ENV] == 'tok-1'
     assert env['ROCKETRIDE_CLIENT_ID'] == 'client-1'
     assert env['PATH'] == '/x'
+    # Unconditional: a venv child IS an isolated group, so there is no false case to test.
+    assert env[VENV_ISOLATED_ENV] == '1'
 
 
 def test_child_env_overwrites_an_inherited_env_id():

@@ -1259,23 +1259,29 @@ resolution it would govern and silently has no effect. Putting the switch there 
 today. Closing this properly means moving the engine's `load_dotenv` ahead of dependency resolution, not
 teaching `venv_env` to parse the file.
 
-- **Unset (default) = auto.** *Target state:* the partitioner inspects the *resolved* pipeline — an
-  `isolated` group present → venv runtime + per-env scoping; none present → today's single-process /
-  global-glob behavior. **Today `auto` is byte-equivalent to `=0` for every pipeline**, isolated
-  group or not: the only producer of the isolated-group signal is the partitioner, which arrives in
-  2B, and the engine hook calls `ensure_env_scoped(projectId, "main", providers)` with three
-  positional arguments, so `has_isolated_group` keeps its `False` default. **Only `=1` scopes
-  anything at all right now** — the §8.3 measurement (auto = 130 sources = exactly the legacy set)
-  follows from this, not merely from the test pipeline lacking a group.
-  **Two of the three sentences above are already out of date, and this bullet is rewritten whole in
-  8.7B — read it against §4.11 and §7 step 8 meanwhile.** "`auto` is byte-equivalent to `=0`"
-  stopped being true when the partitioner was wired in step 8: `auto` **plus** an isolated group
-  already cuts the document and spawns children; what those children then fail to do is *scope*.
-  And the "three positional arguments" clause is now only half the story — the arity is unchanged
-  and `has_isolated_group` does still default to `False`, but since **8.7A** the `"main"` literal no
-  longer decides anything: an inherited `ROCKETRIDE_VENV_ENV_ID` wins over it, which is how children
-  reached their own overlays without the C++ signature moving. What survives intact is the last
-  claim — **only `=1` scopes**, because 8.7A is deliberately `auto`-inert. 8.7B is what ends that.
+- **Unset (default) = auto — IMPLEMENTED as of 8.7B.** The partitioner inspects the *resolved*
+  pipeline: an `isolated` group present → venv runtime **and** per-environment scoping; none
+  present → today's single-process / global-glob behaviour, byte for byte.
+  **How the fact reaches every process, since it is a document property and only the server holds
+  the document:** the server computes `has_isolated_group(resolved)` once and stamps the **raw**
+  fact into each engine's environment as `ROCKETRIDE_VENV_ISOLATED` — set when true, **popped when
+  false**, because `subprocess_env` is a copy of the server's own environment and a stale export
+  would otherwise scope pipelines that have no isolated group. A child's copy is unconditional: a
+  venv child *is* an isolated group, one per group and never otherwise. `ensure_env_scoped` **ORs**
+  the variable with its parameter, so the C++ hook keeps calling it with three positional arguments
+  and no engine rebuild is needed.
+  **Why the raw fact and not the resolved decision** — a broadcast *answer* would move the `=0`
+  floor from a function every process calls onto the discipline of whoever stamps the variable.
+  `scoping_enabled(USE_OFF, True)` is `False` by its first branch, so the raw form cannot switch
+  anything on under `=0`, however stale it gets. The consequence to state plainly rather than hide:
+  under `=0` a document **with** an isolated group still gets the variable stamped, and it is inert.
+  *Three claims this bullet used to make, all now false, kept named because each was load-bearing
+  somewhere:* "`auto` is byte-equivalent to `=0` for every pipeline" (it stopped being true when the
+  partitioner was wired in step 8 — `auto` plus an isolated group already cut the document and
+  spawned children; what those children failed to do was *scope*); "`has_isolated_group` keeps its
+  `False` default" (it still defaults to `False`, but the default no longer decides — the variable
+  ORs into it); and "**only `=1` scopes anything at all right now**", which is exactly what 8.7B
+  ends.
 - **`=0` = force off (legacy mode).** Never partition: any `isolated` group is **demoted to a plain
   organizational group** (flattened into one process), and dependencies resolve via the **global-glob
   `constraints.txt` path**. Byte-for-byte today's behavior; **never an error**, even if the document
@@ -1285,11 +1291,17 @@ teaching `venv_env` to parse the file.
   `nodes/**` from the global startup compile** (§4.9), which is what actually lets nodes with
   conflicting pins coexist in one installation.
 
-**Known limit of `auto` (honest).** The startup compile happens at process init, before any pipeline is
-known, so `auto` cannot decide the node-glob question per pipeline: it keeps the legacy union and
-therefore keeps the conflicting-nodes failure. In Phase 2A **only `=1` delivers conflict isolation**.
-Removing the limit means taking node dependencies out of the startup path entirely (resolving them
-per-env on first use) — the same work as the base-runtime-only residual in §4.9.
+**Known limit of `auto` (honest) — restated after 8.7B, because its old reason stopped being
+true.** It used to blame **timing**: "the startup compile happens at process init, before any
+pipeline is known". After 8.7B a process *does* know its isolated flag at init — the flag arrives
+in its environment — so timing is no longer what blocks it. The surviving constraint is
+**structural**: the startup compile is installation-wide, behind **one** base hash file, and no
+per-run flag can lift that. So `auto` still keeps the legacy node-glob union and therefore still
+keeps the conflicting-nodes failure, and **only `=1` delivers conflict isolation** — the same
+conclusion, now for the right reason. Removing the limit means taking node dependencies out of the
+startup path entirely (resolving them per-env on first use) — the same work as the base-runtime-only
+residual in §4.9. The fixtures' side of the same fact is in §8.3: the conflict acceptance is
+structurally `=1`-only until they live where the startup glob does not reach.
 
 A second consequence of `=1`: nodes whose imports the AST walk cannot resolve statically (flagged
 `dynamic_imports`) no longer get their dependencies from the startup glob and fall back to the runtime
@@ -1871,8 +1883,31 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    needs the flag and not just the server; and staging into `dist/server/nodes/` alone is
    insufficient — that path is the glob root, while providers register from `nodes/src/nodes/`
    (§7 phase 2A carries both halves).
-   *Remaining:* **8.7B** per-environment scoping under the default `auto`, which today still
-   reaches no process at all; **8.6** purge/delete with active-run gates.
+   *Increment 8.7B — **DONE, live-verified**: scoping under the default mode.* 8.7A fixed *where* a
+   scoped child installs; it was deliberately `auto`-inert, so F6 stayed open for everyone who had
+   not opted into `=1` — the configuration nobody actually runs. The missing input was the
+   document's isolated-group fact, which only the server holds. It now travels as the **raw fact**
+   `ROCKETRIDE_VENV_ISOLATED`, computed once in `start_task` (while `resolved` still exists; the
+   stamp happens long after it is deleted) and consumed on first read like the env id.
+   `ensure_env_scoped` **ORs** it with its parameter, so the C++ call site is untouched again.
+   *Raw fact, not a resolved decision (§4.15)* — a broadcast answer would move the `=0` floor onto
+   whoever stamps the variable, whereas `scoping_enabled(USE_OFF, True)` is `False` by its first
+   branch. Stamped **both directions** for main (set when true, popped when false, since
+   `subprocess_env` copies the server's environment), and **unconditionally** for a child, which
+   *is* an isolated group by construction.
+   *Live.* Under **`auto`, flag unset** — the default — a `chain` run produced
+   `venvs/<proj>/` holding `main`, `v1`, `v2`, with the same shape `=1` gives: one `# Source:` per
+   child against main's four. That is the first per-environment scoping this feature has ever done
+   in the configuration consumers actually use.
+   *Legacy control, run last under `=0` on a document that **does** carry isolated groups:* four
+   shapes returned their documented values, **no** new `venvs/` directory appeared, and a held run
+   showed **3** engine processes — server, driver, main — where two children would have made it 5.
+   The groups were demoted, not errored, which discharges the last item §8.3 still owed for 2B.
+   *Rake worth keeping:* a mid-run **DNS outage** made a child fail at `Compiling constraints` with
+   `No such host is known`, and the message reads like a scoping defect. It is not — and the same
+   log proved the increment working, because the child only reached a compile *at all* under `auto`
+   because 8.7B had already turned scoping on for it.
+   *Remaining:* **8.6** purge/delete with active-run gates.
    *Observed while verifying 8.2, recorded for 8.5 rather than fixed here:* after an in-venv failure
    a **second `send()` on the same token fails fast** — the boundary socket closed cleanly (1000) and
    the SDK raises `PipeException` with its usual "pipeline isn't running" diagnostic. It does not hang
@@ -2032,10 +2067,18 @@ remove afterwards: `nodes/src` is a committed tree.
   (`venv-detect`, objectId returned) with **no `venvs/` directory created**, every install carrying
   `-c cache/constraints.txt` and **no `--target`**. The switch is fully reversible, measured on the
   startup compile: `=1` → 29 sources, **0** of them node paths; `=0` and auto → **130** sources, **101**
-  of them node paths, i.e. exactly the pre-change set. Auto matches legacy **for every pipeline**, not
-  merely for this one: nothing produces the isolated-group signal until the partitioner lands (§4.15).
-  Still owed for 2B: a pipeline that **does** contain an isolated group must run single-process under
-  `=0`, no error — the permanent opt-out (§4.15).
+  of them node paths, i.e. exactly the pre-change set.
+  *The "auto matches legacy for every pipeline" clause was true only while nothing produced the
+  isolated-group signal. It is not true after 8.7B, by design:* `auto` **plus** an isolated group now
+  scopes exactly as `=1` does. Auto still matches legacy for a document **without** one, which is
+  what the compatibility promise actually covers.
+  **The `=0` opt-out is DISCHARGED (8.7B), and it was the last thing owed for 2B here.** Measured on
+  a `chain` document that *does* carry two isolated groups, server under `=0`: all four data shapes
+  returned their documented values (`linear`/`chain` → `olleh\n\n`, `diamond` → both lanes,
+  `two_merges` → both values v1 first); **no new `venvs/` directory**; and during a *held* run the
+  process count was **3** — server, driver, main engine — where two children would have made it 5.
+  So the isolated groups were **demoted, not errored**: the permanent opt-out works on exactly the
+  documents it exists for (§4.15).
 - **A node's own pin beats the base — AUTOMATED at two levels, end-to-end still owed.** The other
   cases prove two nodes conflict *with each other*; this one proves a node gets **its** version
   whatever base holds. `tests/test_scoping_acceptance.py` (engine interpreter, real `uv`; skips
