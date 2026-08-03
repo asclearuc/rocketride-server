@@ -1138,3 +1138,56 @@ def test_build_task_account_info_populates_organization():
     # The task's own team is present with the granted permissions, so a pk_
     # subscriber resolves to a non-empty permission list for its own task.
     assert resolve_task_permissions(info, 'team-1') == ['task.data']
+
+
+# ---------------------------------------------------------------------------
+# has_active_project_run (the rrext_venv gate, 8.6)
+# ---------------------------------------------------------------------------
+
+
+def _project_control(project_id, *, complete):
+    """A control carrying a project id and a completion state."""
+    control = _make_control()
+    control.project_id = project_id
+    control.task.is_task_complete = MagicMock(return_value=complete)
+    return control
+
+
+def test_active_run_of_that_project_blocks():
+    ts = _make_server()
+    ts._task_control['tk_1'] = _project_control('chain-daa01f80', complete=False)
+    assert ts.has_active_project_run('chain-daa01f80') is True
+
+
+def test_a_completed_run_does_not_block():
+    # Registry entries outlive completion (ttl-resident tasks stay listed), so a presence-only
+    # scan would refuse purges on any machine where a finished run is still registered --
+    # unusable exactly where the command is most wanted.
+    ts = _make_server()
+    ts._task_control['tk_1'] = _project_control('chain-daa01f80', complete=True)
+    assert ts.has_active_project_run('chain-daa01f80') is False
+
+
+def test_another_project_does_not_block():
+    ts = _make_server()
+    ts._task_control['tk_1'] = _project_control('other-proj', complete=False)
+    assert ts.has_active_project_run('chain-daa01f80') is False
+
+
+def test_the_shortened_form_of_a_live_project_id_also_blocks():
+    # control.project_id is the RAW document id, while rrext_venv accepts on-disk names so a
+    # name from `list` can be fed straight back in. Comparing only the raw form lets a purge
+    # addressed by the shortened name sail past this gate into a live overlay.
+    import venv_env
+
+    ts = _make_server()
+    ts._task_control['tk_1'] = _project_control('chain-daa01f80', complete=False)
+    on_disk = venv_env.short_id('chain-daa01f80')
+    assert on_disk != 'chain-daa01f80', 'this case is pointless unless the id actually hashed'
+    assert ts.has_active_project_run(on_disk) is True
+
+
+def test_a_control_without_a_project_id_is_skipped():
+    ts = _make_server()
+    ts._task_control['tk_1'] = _project_control(None, complete=False)
+    assert ts.has_active_project_run('chain-daa01f80') is False

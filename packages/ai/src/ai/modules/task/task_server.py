@@ -656,6 +656,49 @@ class TaskServer(DAPBase):
         # Not a task key — delegate to account layer
         return None
 
+    def has_active_project_run(self, project_id: str) -> bool:
+        """
+        Whether any registered task of ``project_id`` is still running.
+
+        Gates the destructive ``rrext_venv`` subcommands (§4.10): an overlay must not be
+        reclaimed while a run of that project may be installing into it.
+
+        **Matches both id forms, and that is not a nicety.** ``control.project_id`` is the
+        **raw** document id, while ``rrext_venv`` accepts on-disk names (which are
+        ``short_id`` of the raw id) so that a name from ``list`` can be fed straight back in.
+        Comparing only the raw form would let a purge addressed by the shortened name sail past
+        this gate into a live overlay.
+
+        **Not a presence scan:** registry entries outlive completion — ``ttl``-resident tasks
+        stay registered — so a presence-only check would refuse purges on any machine where a
+        finished run is still listed, making the command unusable exactly where it is most
+        wanted.
+
+        Args:
+            project_id: Raw document id or the on-disk (shortened) name.
+
+        Returns:
+            True if a task of that project exists and is not complete.
+        """
+        try:
+            import venv_env  # engine sys.path only; same guarded idiom as Task._venv_scoping_enabled
+
+            shorten = venv_env.short_id
+        except ImportError:
+            shorten = None
+
+        given = (project_id or '').strip()
+        for control in list(self._task_control.values()):
+            if not control or not control.project_id:
+                continue
+            if control.task.is_task_complete():
+                continue
+            if given == control.project_id:
+                return True
+            if shorten is not None and given == shorten(control.project_id):
+                return True
+        return False
+
     def get_task_control_by_project(
         self,
         project_id: str,

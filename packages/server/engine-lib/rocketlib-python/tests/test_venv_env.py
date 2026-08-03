@@ -472,3 +472,122 @@ def test_run_scoped_install_skips_when_no_requirements(tmp_path):
     )
     assert site is None
     assert installed == []
+
+
+# --- reclamation: purge / delete / list (8.6) -------------------------------
+
+
+def _make_env(exe_dir, project_id, env_id, files=('a.py', 'pkg/b.py')):
+    """Fabricate one installed overlay and return its EnvPaths."""
+    paths = V.env_paths(V.env_dir(str(exe_dir), project_id, env_id))
+    os.makedirs(paths.site_packages, exist_ok=True)
+    for rel in files:
+        target = os.path.join(paths.site_packages, rel)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, 'w', encoding='utf-8') as fh:
+            fh.write('x')
+    for path in (paths.combined, paths.constraints, paths.hash_file):
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write('marker')
+    return paths
+
+
+def test_purge_empties_site_packages_and_keeps_the_inputs(tmp_path):
+    paths = _make_env(tmp_path, 'proj', 'main')
+    assert V.purge_env(str(tmp_path), 'proj', 'main') is True
+    assert os.listdir(paths.site_packages) == []
+    assert os.path.isfile(paths.combined)
+    assert os.path.isfile(paths.constraints)
+    assert not os.path.exists(paths.hash_file)
+
+
+def test_purge_absent_target_is_idempotent_success(tmp_path):
+    assert V.purge_env(str(tmp_path), 'nope', 'main') is False
+
+
+def test_purge_drops_the_hash_before_wiping(tmp_path, monkeypatch):
+    # The invariant is invisible on every happy path and is exactly what a refactor reorders:
+    # hash-last would leave a half-wiped env still marked installed, which the next run imports.
+    paths = _make_env(tmp_path, 'proj', 'main')
+
+    def _boom(*_a, **_k):
+        raise OSError('wipe failed midway')
+
+    monkeypatch.setattr(V, '_empty_dir', _boom)
+    with pytest.raises(OSError):
+        V.purge_env(str(tmp_path), 'proj', 'main')
+    assert not os.path.exists(paths.hash_file), 'hash must already be gone when the wipe fails'
+
+
+def test_delete_env_removes_the_whole_overlay(tmp_path):
+    paths = _make_env(tmp_path, 'proj', 'v1')
+    assert V.delete_env(str(tmp_path), 'proj', 'v1') is True
+    assert not os.path.isdir(paths.env_dir)
+
+
+def test_delete_project_removes_every_env_and_the_project_dir(tmp_path):
+    # 'chain-daa01f80' hashes, so this also covers the non-idempotent short_id path.
+    _make_env(tmp_path, 'chain-daa01f80', 'main')
+    _make_env(tmp_path, 'chain-daa01f80', 'v-1')
+    root = V.resolve_project_dir(str(tmp_path), 'chain-daa01f80')
+    assert V.delete_project(str(tmp_path), 'chain-daa01f80') == 2
+    assert not os.path.isdir(root), 'operation C deletes the subtree, not just its contents'
+
+
+def test_delete_project_absent_is_zero(tmp_path):
+    assert V.delete_project(str(tmp_path), 'nope') == 0
+
+
+def test_resolver_takes_an_on_disk_name_literally(tmp_path):
+    # 'v-1' hashes (short but not equal to its cleaned form), so the round trip is real: the
+    # name list_envs reports must address the same directory the raw id created.
+    paths = _make_env(tmp_path, 'proj', 'v-1')
+    on_disk = os.path.basename(paths.env_dir)
+    assert on_disk != 'v-1', 'this case is pointless unless the id actually hashed'
+    assert V.resolve_env_dir(str(tmp_path), 'proj', on_disk) == paths.env_dir
+    assert V.resolve_env_dir(str(tmp_path), 'proj', 'v-1') == paths.env_dir
+
+
+def test_purge_round_trips_through_a_listed_name(tmp_path):
+    paths = _make_env(tmp_path, 'proj', 'v-1')
+    rows = V.list_envs(str(tmp_path), 'proj')
+    assert len(rows) == 1
+    assert V.purge_env(str(tmp_path), rows[0]['projectId'], rows[0]['envId']) is True
+    assert os.listdir(paths.site_packages) == []
+
+
+def test_list_envs_reports_installed_and_filters_by_project(tmp_path):
+    _make_env(tmp_path, 'p1', 'main')
+    _make_env(tmp_path, 'p2', 'main')
+    os.remove(V.env_paths(V.env_dir(str(tmp_path), 'p2', 'main')).hash_file)
+    assert [r['projectId'] for r in V.list_envs(str(tmp_path))] == ['p1', 'p2']
+    assert V.list_envs(str(tmp_path), 'p1')[0]['installed'] is True
+    assert V.list_envs(str(tmp_path), 'p2')[0]['installed'] is False
+
+
+def test_list_envs_skips_a_childless_project_dir(tmp_path):
+    # Must agree with delete_project, which removes the directory: otherwise the closing "list
+    # shows them gone" is ambiguous between a bug and an empty shell.
+    os.makedirs(os.path.join(V.venv_root(str(tmp_path)), 'empty-one'), exist_ok=True)
+    assert V.list_envs(str(tmp_path)) == []
+
+
+def test_list_envs_sizes_are_opt_in(tmp_path):
+    _make_env(tmp_path, 'p1', 'main')
+    assert 'bytes' not in V.list_envs(str(tmp_path))[0]
+    assert V.list_envs(str(tmp_path), sizes=True)[0]['bytes'] > 0
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='fcntl is POSIX-only')
+def test_purge_reports_busy_against_a_foreign_flock(tmp_path):
+    # flock and lockf do not see each other on Linux, so the wrong primitive evaporates the gate
+    # on exactly one platform, invisibly. Imported inside the test: a module-level `import fcntl`
+    # would take this whole file down on Windows.
+    import fcntl
+
+    paths = _make_env(tmp_path, 'proj', 'main')
+    with open(paths.lock_file, 'a+b') as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(V.EnvBusy):
+            V.purge_env(str(tmp_path), 'proj', 'main')
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)

@@ -77,6 +77,7 @@ from .commands.cmd_deploy import DeployCommands
 from .commands.cmd_pipe import DeployPipeCommands
 from .commands.cmd_log import LogCommands
 from .commands.cmd_store import StoreCommands
+from .commands.cmd_venv import VenvCommands
 from ai.account.models import (
     AccountInfo,
     RequestContext,
@@ -115,6 +116,7 @@ class TaskConn(
     DeployPipeCommands,
     LogCommands,
     StoreCommands,
+    VenvCommands,
     DAPConn,
 ):
     """
@@ -207,6 +209,12 @@ class TaskConn(
         DeployPipeCommands.__init__(self, connection_id, server, transport, **kwargs)
         LogCommands.__init__(self, connection_id, server, transport, **kwargs)
         StoreCommands.__init__(self, connection_id, server, transport, **kwargs)
+        # Needed because VenvCommands builds its handler map here. Omit it and the class still
+        # imports and still constructs -- the map is simply never built, and the first
+        # rrext_venv dies on AttributeError at connection time, far from the cause.
+        # (Counting bases against calls does NOT detect that: PublicCommands legitimately has
+        # no call, its __init__ being a documented no-op, so the count is short by one anyway.)
+        VenvCommands.__init__(self, connection_id, server, transport, **kwargs)
 
         # Store connection identifier for tracking and logging
         self._connection_id = connection_id

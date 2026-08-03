@@ -249,6 +249,38 @@ Besides `rrext_monitor`, sent the same way over the socket:
 | `rrext_get_task_status` | `token`                               | `TASK_STATUS` | Fetch current status synchronously               |
 | `rrext_get_token`       | `projectId` + `source` (+ `teamId`)   | `{ token }`   | Resolve a running task's token — `teamId` addresses the team's deployed run, omitted = your dev run |
 | `execute`               | `{ pipeline, pipelineTraceLevel?, … }`| `{ token }`   | Start a pipeline; sets the trace level that gates `FLOW` |
+| `rrext_venv`            | `subcommand` + ids below (+ `teamId`) | varies        | Reclaim per-environment overlays — see below |
+
+### `rrext_venv`
+
+Enumerates and reclaims the per-environment `site-packages` overlays under `<exe>/venvs/`.
+
+| `subcommand`     | Arguments                              | Permission     | Returns                    |
+| ---------------- | -------------------------------------- | -------------- | -------------------------- |
+| `list`           | `projectId?`, `sizes?`                 | `task.monitor` | `{ environments: [...] }`  |
+| `purge`          | `projectId`, `envId`                   | `task.control` | `{ purged: bool }`         |
+| `delete_env`     | `projectId`, `envId`                   | `task.control` | `{ deleted: bool }`        |
+| `delete_project` | `projectId`                            | `task.control` | `{ deletedEnvironments: n }` |
+
+- **`purge`** empties an environment's `site-packages` and keeps `combined.txt` /
+  `constraints.txt`. It drops `requirements.hash` first, so the next run reinstalls from a
+  full recompile rather than importing from a half-emptied overlay.
+- **Ids resolve literal-first.** A name returned by `list` is what is on disk (already
+  shortened); a raw project id from a pipeline document also resolves. Both address the same
+  directory, so `list → purge` round-trips.
+- **`envId` is rejected, not ignored**, by `list` and `delete_project` — it means nothing
+  there, and a silently ignored filter would make a one-row answer read as "that is the only
+  environment there is". A missing `projectId` is refused for every destructive subcommand
+  rather than resolving to the shared `default` bucket.
+- **`teamId` is optional.** Present, the permission resolves against that team; absent, against
+  the caller's default context. It is a caller-asserted scope check — overlays are machine-local
+  disk state and are **not** team-owned.
+- **Gated on "no active run for this project"**, matched against both the raw and the shortened
+  id form. The gate is per *project*, not per environment. Two residuals, accepted for v1: the
+  check-then-act race between the gate and the wipe, and — the one that will look like a bug
+  report — a `ttl`-resident engine that still holds an overlay's `.pyd`/`.dll` open makes the
+  wipe fail with a named busy error on Windows. Completion is not the same as "the process is
+  gone"; stop the engines first.
 
 ## Notes
 
