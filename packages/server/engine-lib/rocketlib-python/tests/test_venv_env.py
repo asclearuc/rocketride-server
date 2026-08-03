@@ -62,6 +62,50 @@ def test_scoping_enabled_semantics():
     assert V.scoping_enabled(V.USE_AUTO, has_isolated_group=False) is False
 
 
+# --- ROCKETRIDE_VENV_ENV_ID (which environment this process installs into) --
+
+
+def test_resolve_env_id_inherited_beats_the_literal(monkeypatch):
+    # The C++ hook hard-codes 'main' for every process, so the inherited value has to win.
+    monkeypatch.setenv('ROCKETRIDE_VENV_ENV_ID', 'v1')
+    assert V.resolve_env_id('main') == 'v1'
+
+
+def test_resolve_env_id_falls_through_when_absent(monkeypatch):
+    monkeypatch.delenv('ROCKETRIDE_VENV_ENV_ID', raising=False)
+    assert V.resolve_env_id('main') == 'main'
+    assert V.resolve_env_id(None) is None
+
+
+@pytest.mark.parametrize('raw', ['', '   '])
+def test_resolve_env_id_empty_is_absent(monkeypatch, raw):
+    # Otherwise an exported-but-empty value would name an env whose directory is 'default'.
+    monkeypatch.setenv('ROCKETRIDE_VENV_ENV_ID', raw)
+    assert V.resolve_env_id('main') == 'main'
+
+
+def test_resolve_env_id_is_consumed_on_first_read(monkeypatch):
+    monkeypatch.setenv('ROCKETRIDE_VENV_ENV_ID', 'v1')
+    assert V.resolve_env_id('main') == 'v1'
+    assert 'ROCKETRIDE_VENV_ENV_ID' not in os.environ
+    monkeypatch.setenv('ROCKETRIDE_VENV_ENV_ID', 'v2')
+    assert V.resolve_env_id('main') == 'v1'
+
+
+def test_resolve_env_id_freezes_the_value_not_the_result(monkeypatch):
+    # Only the inherited half is frozen; `passed` still resolves on every call.
+    monkeypatch.delenv('ROCKETRIDE_VENV_ENV_ID', raising=False)
+    assert V.resolve_env_id('main') == 'main'
+    assert V.resolve_env_id('other') == 'other'
+
+
+def test_resolve_env_id_explicit_env_is_neither_cached_nor_popped():
+    env = {'ROCKETRIDE_VENV_ENV_ID': 'v1'}
+    assert V.resolve_env_id('main', env) == 'v1'
+    assert env['ROCKETRIDE_VENV_ENV_ID'] == 'v1'
+    assert V.resolve_env_id('main', {}) == 'main'
+
+
 # --- id shortening + layout -------------------------------------------------
 
 

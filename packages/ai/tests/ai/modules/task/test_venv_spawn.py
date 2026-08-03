@@ -39,10 +39,13 @@ from ai.modules.task.venv_spawn import (
     SE_TAIL,
     SE_WARNING,
     VENV_READY_STATUS,
+    VENV_ENV_ID_ENV,
+    VENV_TOKEN_ENV,
     VENV_TRACE_EVENT,
     ProcessGuard,
     VenvChild,
     await_child_ready,
+    build_child_env,
     classify_child_event,
     inject_venv_urls,
 )
@@ -459,3 +462,35 @@ def test_terminate_all_reaches_a_grandchild():
         if process.poll() is None:
             process.kill()
         guard.close()
+
+
+# ---------------------------------------------------------------------------
+# the child's subprocess environment (step 8.7A)
+# ---------------------------------------------------------------------------
+
+
+def test_child_env_carries_the_env_id_and_the_token():
+    env = build_child_env({'PATH': '/x'}, 'client-1', 'tok-1', 'v1', avoid_mocks=False)
+    assert env[VENV_ENV_ID_ENV] == 'v1'
+    assert env[VENV_TOKEN_ENV] == 'tok-1'
+    assert env['ROCKETRIDE_CLIENT_ID'] == 'client-1'
+    assert env['PATH'] == '/x'
+
+
+def test_child_env_overwrites_an_inherited_env_id():
+    # The assignment IS the child's protection -- a clean base_env would prove only that the
+    # key gets written, not that a stale inherited one loses.
+    env = build_child_env({VENV_ENV_ID_ENV: 'stale'}, 'c', 't', 'v2', avoid_mocks=False)
+    assert env[VENV_ENV_ID_ENV] == 'v2'
+
+
+def test_child_env_has_no_overlay_path():
+    # ROCKETRIDE_VENV_SITE is retired: the child resolves its own overlay from the env id.
+    env = build_child_env({}, 'c', 't', 'v1', avoid_mocks=False)
+    assert 'ROCKETRIDE_VENV_SITE' not in env
+
+
+def test_child_env_strips_mocks_only_under_avoid_mocks():
+    base = {'ROCKETRIDE_MOCK': '/mocks'}
+    assert 'ROCKETRIDE_MOCK' in build_child_env(base, 'c', 't', 'v1', avoid_mocks=False)
+    assert 'ROCKETRIDE_MOCK' not in build_child_env(base, 'c', 't', 'v1', avoid_mocks=True)

@@ -72,6 +72,7 @@ from .pipeline import partition_pipeline, resolve_pipeline_env, has_isolated_gro
 from .venv_spawn import (
     VenvChild,
     VENV_TOKEN_ENV,
+    VENV_ENV_ID_ENV,
     CH_DETAIL,
     CH_FLOW,
     CH_NONE,
@@ -91,7 +92,6 @@ from .venv_spawn import (
     build_child_env,
     classify_child_event,
     inject_venv_urls,
-    overlay_site,
     kill_process,
 )
 from .types import LAUNCH_TYPE, TaskError
@@ -108,6 +108,30 @@ CONST_TRACE_PAYLOAD_CAP = 1_000_000
 # little headroom for the marker fields themselves — an over-cap payload
 # still ships (just under) the full megabyte, clipped rather than shrunk.
 CONST_TRACE_PREVIEW_BYTES = CONST_TRACE_PAYLOAD_CAP - 1_024
+
+
+def build_main_env(base_env: Dict[str, str], run_token: Optional[str], avoid_mocks: bool) -> Dict[str, str]:
+    """Build the main engine's subprocess environment.
+
+    Identity travels in the TASK FILE (see ``_build_task``'s 'identity' block), never the
+    environment -- the ``ROCKETRIDE_*`` namespace is caller-influenced by design. Only the
+    per-run bridge token is added, so main's venv client nodes can present it to the children
+    (§4.5).
+
+    Pure and separate from the spawn so the negative is assertable: main must carry **no**
+    environment id. ``base_env`` is the SERVER's environment as ``_build_subprocess_env`` leaves
+    it -- scrubbed of the DB broker credentials, carrying the resolved per-tenant DSN -- so an
+    operator-exported ``ROCKETRIDE_VENV_ENV_ID`` would otherwise send the main engine installing
+    into another environment's overlay. The child's ``venv_spawn.build_child_env`` is the mirror
+    image -- it assigns, because a child must carry exactly one.
+    """
+    env = dict(base_env)
+    if run_token:
+        env[VENV_TOKEN_ENV] = run_token
+    env.pop(VENV_ENV_ID_ENV, None)
+    if avoid_mocks:
+        env.pop('ROCKETRIDE_MOCK', None)  # so node.py loads real libraries
+    return env
 
 
 def cap_trace_payload(trace: Any) -> Any:
@@ -818,7 +842,6 @@ class Task(DAPBase):
         fails and _terminated tears down whatever was spawned.
         """
         exec_dir = os.path.dirname(sys.executable)
-        project_id = result.environments['main'].get('project_id')
         avoid_mocks = bool(self._pipeline.get('avoidMocks'))
 
         # Always a fresh guard: this runs before the main-engine spawn and only on the scoped
@@ -833,7 +856,7 @@ class Task(DAPBase):
             port = self._server.assign_port()
             try:
                 child = await self._spawn_one_venv_child(
-                    env_id, child_doc, port, run_token, exec_dir, project_id, avoid_mocks, result.groups
+                    env_id, child_doc, port, run_token, exec_dir, avoid_mocks, result.groups
                 )
             except Exception:
                 self._server.release_port(port)
@@ -866,7 +889,6 @@ class Task(DAPBase):
         port: int,
         run_token: str,
         exec_dir: str,
-        project_id: Optional[str],
         avoid_mocks: bool,
         groups: Dict[str, Dict[str, Any]],
     ) -> VenvChild:
@@ -903,7 +925,7 @@ class Task(DAPBase):
             os.environ,
             self.client_id,
             run_token,
-            overlay_site(exec_dir, project_id, env_id),
+            env_id,
             avoid_mocks,
         )
 
@@ -2678,21 +2700,16 @@ class Task(DAPBase):
 
             await self._send_status_update()
 
-            # Launch subprocess. Identity travels in the TASK FILE (see
-            # _build_task's 'identity' block), never the environment — the
-            # ROCKETRIDE_* env namespace is caller-influenced by design.
-            # _build_subprocess_env additionally scrubs the RocketRide DB
-            # broker credentials and injects the resolved per-tenant DSN.
-            subprocess_env = await self._build_subprocess_env()
-
-            # Share the per-run bridge token with the main engine so its venv client nodes
-            # present it to the children (inherited env, never argv/disk; §4.5).
-            if self._run_venv_token:
-                subprocess_env[VENV_TOKEN_ENV] = self._run_venv_token
-
-            # avoidMocks: strip ROCKETRIDE_MOCK so node.py loads real libraries
-            if self._pipeline.get('avoidMocks'):
-                subprocess_env.pop('ROCKETRIDE_MOCK', None)
+            # Launch subprocess. Identity travels in the TASK FILE (see _build_task's 'identity'
+            # block), never the environment — the ROCKETRIDE_* namespace is caller-influenced by
+            # design. Two steps, both load-bearing: _build_subprocess_env scrubs the DB broker
+            # credentials and injects the resolved per-tenant DSN; build_main_env then adds the
+            # per-run bridge token and strips the environment id main must never carry (§4.5).
+            subprocess_env = build_main_env(
+                await self._build_subprocess_env(),
+                self._run_venv_token,
+                bool(self._pipeline.get('avoidMocks')),
+            )
 
             self._engine_process = await asyncio.create_subprocess_exec(
                 exec_path,

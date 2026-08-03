@@ -34,9 +34,15 @@ from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 import pytest
 
 from ai.constants import CONST_STATUS_HISTORY_LIMIT
-from ai.modules.task.task_engine import CONST_TRACE_PAYLOAD_CAP, CONST_TRACE_PREVIEW_BYTES, Task, cap_trace_payload
+from ai.modules.task.task_engine import (
+    CONST_TRACE_PAYLOAD_CAP,
+    CONST_TRACE_PREVIEW_BYTES,
+    Task,
+    build_main_env,
+    cap_trace_payload,
+)
 from ai.modules.task.task_metrics import TaskMetrics
-from ai.modules.task.venv_spawn import VENV_TRACE_EVENT, ProcessGuard, VenvChild
+from ai.modules.task.venv_spawn import VENV_ENV_ID_ENV, VENV_TOKEN_ENV, VENV_TRACE_EVENT, ProcessGuard, VenvChild
 
 
 # ---------------------------------------------------------------------------
@@ -1452,3 +1458,43 @@ async def test_teardown_reports_children_the_cooperative_phase_failed_to_reap():
 
     logged = ' '.join(str(c) for c in t.debug_message.call_args_list)
     assert 'had to finish off' in logged and 'v1' in logged
+
+
+# ---------------------------------------------------------------------------
+# main engine subprocess environment (step 8.7A)
+# ---------------------------------------------------------------------------
+
+
+def test_main_env_never_carries_an_environment_id():
+    # Pre-set on purpose: over a clean base a set-only implementation passes too, proving no pop.
+    env = build_main_env({'PATH': '/x', VENV_ENV_ID_ENV: 'v1'}, None, avoid_mocks=False)
+    assert VENV_ENV_ID_ENV not in env
+
+
+def test_main_env_differs_from_its_base_in_the_venv_keys_only():
+    # avoidMocks held fixed across the comparison -- it legitimately removes a third key.
+    base = {'PATH': '/x', 'ROCKETRIDE_MOCK': '/m', VENV_ENV_ID_ENV: 'v1'}
+    env = build_main_env(base, 'tok-1', avoid_mocks=False)
+    assert set(base) - set(env) == {VENV_ENV_ID_ENV}
+    assert set(env) - set(base) == {VENV_TOKEN_ENV}
+    assert env['PATH'] == '/x'
+    assert env['ROCKETRIDE_MOCK'] == '/m'
+
+
+def test_main_env_without_a_run_token_adds_nothing():
+    env = build_main_env({'PATH': '/x', VENV_ENV_ID_ENV: 'v1'}, None, avoid_mocks=False)
+    assert set(env) == {'PATH'}
+
+
+def test_main_env_strips_mocks_only_under_avoid_mocks():
+    base = {'ROCKETRIDE_MOCK': '/m'}
+    assert 'ROCKETRIDE_MOCK' in build_main_env(base, None, avoid_mocks=False)
+    assert 'ROCKETRIDE_MOCK' not in build_main_env(base, None, avoid_mocks=True)
+
+
+def test_main_env_does_not_mutate_the_base():
+    # The call site passes os.environ itself, so a missing copy would pop the variable out of
+    # the SERVER's own environment and degrade every later run.
+    base = {VENV_ENV_ID_ENV: 'v1', 'ROCKETRIDE_MOCK': '/m'}
+    build_main_env(base, 'tok', avoid_mocks=True)
+    assert base == {VENV_ENV_ID_ENV: 'v1', 'ROCKETRIDE_MOCK': '/m'}

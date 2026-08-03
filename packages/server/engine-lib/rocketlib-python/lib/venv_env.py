@@ -89,15 +89,6 @@ def use_venv_mode(env: Optional[dict] = None) -> str:
     return _MODE_CACHE
 
 
-def _reset_venv_env_cache() -> None:
-    """Drop the process-init caches so the next call reads the environment again.
-
-    Tests only -- production resolves once by design.
-    """
-    global _MODE_CACHE
-    _MODE_CACHE = None
-
-
 def scoping_enabled(mode: str, has_isolated_group: bool) -> bool:
     """Whether per-environment scoping applies for this run.
 
@@ -109,6 +100,47 @@ def scoping_enabled(mode: str, has_isolated_group: bool) -> bool:
     if mode == USE_ON:
         return True
     return has_isolated_group
+
+
+# ---------------------------------------------------------------------------
+# which environment this process installs into
+# ---------------------------------------------------------------------------
+
+# Mirrored in ai/modules/task/venv_spawn.py (which cannot import this module) -- keep in sync.
+VENV_ENV_ID_ENV = 'ROCKETRIDE_VENV_ENV_ID'
+
+_UNREAD = object()
+# The INHERITED value, frozen at first read -- not the resolved result, which depends on
+# ``passed`` and must stay a fresh resolution on every call.
+_ENV_ID_CACHE = _UNREAD
+
+
+def resolve_env_id(passed: Optional[str], env: Optional[dict] = None) -> Optional[str]:
+    """Resolve which environment this process installs into.
+
+    The inherited value **wins** over ``passed``: the only production caller is the C++
+    endpoint hook, which hard-codes ``'main'`` for every process. Empty is absent.
+
+    Consumed on first read -- frozen, then popped from ``os.environ`` -- so neither node code
+    nor anything a node spawns can observe or change it. An explicitly passed ``env`` is
+    resolved fresh and never popped.
+    """
+    global _ENV_ID_CACHE
+    if env is not None:
+        return (env.get(VENV_ENV_ID_ENV) or '').strip() or passed
+    if _ENV_ID_CACHE is _UNREAD:
+        _ENV_ID_CACHE = (os.environ.pop(VENV_ENV_ID_ENV, '') or '').strip()
+    return _ENV_ID_CACHE or passed
+
+
+def _reset_venv_env_cache() -> None:
+    """Drop the process-init caches so the next call reads the environment again.
+
+    Tests only -- production resolves once by design.
+    """
+    global _MODE_CACHE, _ENV_ID_CACHE
+    _MODE_CACHE = None
+    _ENV_ID_CACHE = _UNREAD
 
 
 # ---------------------------------------------------------------------------
