@@ -73,6 +73,7 @@ from .venv_spawn import (
     VenvChild,
     VENV_TOKEN_ENV,
     VENV_ENV_ID_ENV,
+    VENV_ISOLATED_ENV,
     CH_DETAIL,
     CH_FLOW,
     CH_NONE,
@@ -110,25 +111,36 @@ CONST_TRACE_PAYLOAD_CAP = 1_000_000
 CONST_TRACE_PREVIEW_BYTES = CONST_TRACE_PAYLOAD_CAP - 1_024
 
 
-def build_main_env(base_env: Dict[str, str], run_token: Optional[str], avoid_mocks: bool) -> Dict[str, str]:
+def build_main_env(
+    base_env: Dict[str, str], run_token: Optional[str], has_isolated: bool, avoid_mocks: bool
+) -> Dict[str, str]:
     """Build the main engine's subprocess environment.
 
     Identity travels in the TASK FILE (see ``_build_task``'s 'identity' block), never the
     environment -- the ``ROCKETRIDE_*`` namespace is caller-influenced by design. Only the
-    per-run bridge token is added, so main's venv client nodes can present it to the children
-    (§4.5).
+    per-run bridge token and the isolated-group fact are added (§4.5, §4.15).
 
-    Pure and separate from the spawn so the negative is assertable: main must carry **no**
-    environment id. ``base_env`` is the SERVER's environment as ``_build_subprocess_env`` leaves
-    it -- scrubbed of the DB broker credentials, carrying the resolved per-tenant DSN -- so an
-    operator-exported ``ROCKETRIDE_VENV_ENV_ID`` would otherwise send the main engine installing
-    into another environment's overlay. The child's ``venv_spawn.build_child_env`` is the mirror
-    image -- it assigns, because a child must carry exactly one.
+    Pure and separate from the spawn so the negatives are assertable. ``base_env`` is a copy of
+    the SERVER's environment -- as ``_build_subprocess_env`` leaves it, scrubbed of the DB broker
+    credentials and carrying the resolved per-tenant DSN -- so both venv variables must be written
+    in **both** directions:
+
+    * the environment id is always popped -- main resolves ``'main'`` itself, and an
+      operator-exported value would send it installing into another environment's overlay. The
+      child's ``venv_spawn.build_child_env`` is the mirror image: it assigns, because a child must
+      carry exactly one.
+    * the isolated flag is set when true and **popped when false** -- a stale export in the shell
+      that launched the server would otherwise ride into every run and scope pipelines that have
+      no isolated group. A set-only stamp is the same class of bug as treating unset as ``=0``.
     """
     env = dict(base_env)
     if run_token:
         env[VENV_TOKEN_ENV] = run_token
     env.pop(VENV_ENV_ID_ENV, None)
+    if has_isolated:
+        env[VENV_ISOLATED_ENV] = '1'
+    else:
+        env.pop(VENV_ISOLATED_ENV, None)
     if avoid_mocks:
         env.pop('ROCKETRIDE_MOCK', None)  # so node.py loads real libraries
     return env
@@ -471,6 +483,10 @@ class Task(DAPBase):
         # The per-run bridge token, shared (via inherited env) by the main engine and every
         # venv child; None unless venv scoping is active this run.
         self._run_venv_token: Optional[str] = None
+        # The raw document fact, computed once in start_task while `resolved` still exists and
+        # stamped into the main engine's env much later. Not a scoping decision -- under =0 it is
+        # still stamped and still inert, because scoping_enabled(USE_OFF, True) is False.
+        self._has_isolated_group: bool = False
         # False until this run's main engine is spawned. Gates the one thing a venv child may
         # write to the run's status (its startup progress), because that window IS child
         # startup. Deliberately a per-run flag rather than `_engine_process is None`: that
@@ -818,8 +834,11 @@ class Task(DAPBase):
 
         return taskpath
 
-    def _venv_scoping_enabled(self, resolved: Dict[str, Any]) -> bool:
+    def _venv_scoping_enabled(self, isolated: bool) -> bool:
         """Whether this run cuts isolated groups into venv children (§4.15 master switch).
+
+        Takes the document fact rather than the document: the caller needs the same bool later,
+        to stamp it into the main engine's environment, and by then ``resolved`` is gone.
 
         ``venv_env`` reads ``ROCKETRIDE_SERVER_USE_VENV`` and lives on the engine's sys.path
         (``dist/server/lib``); a guarded import means any non-engine context (or a broken
@@ -830,7 +849,7 @@ class Task(DAPBase):
         except ImportError:
             debug('venv_env unavailable; venv scoping disabled (legacy flatten)')
             return False
-        return venv_env.scoping_enabled(venv_env.use_venv_mode(), has_isolated_group(resolved))
+        return venv_env.scoping_enabled(venv_env.use_venv_mode(), isolated)
 
     async def _spawn_venv_children(self, result: PartitionResult, run_token: str) -> Dict[str, int]:
         """Spawn one resident venv child per isolated group; return ``{env_id: data_port}``.
@@ -2578,7 +2597,10 @@ class Task(DAPBase):
             # containers into one document (a dict), byte-identical to legacy. On -> it
             # returns a PartitionResult with one sub-document per environment; each isolated
             # group runs in its own venv child engine, wired to main over loopback.
-            scoped = self._venv_scoping_enabled(resolved)
+            # Computed ONCE, here: `resolved` is deleted below, while the stamp into the main
+            # engine's environment happens much later.
+            self._has_isolated_group = has_isolated_group(resolved)
+            scoped = self._venv_scoping_enabled(self._has_isolated_group)
 
             # Lift container members to the top level. The flatten path is unchanged; the
             # source check below looks for the source among top-level components, so a source
@@ -2704,10 +2726,12 @@ class Task(DAPBase):
             # block), never the environment — the ROCKETRIDE_* namespace is caller-influenced by
             # design. Two steps, both load-bearing: _build_subprocess_env scrubs the DB broker
             # credentials and injects the resolved per-tenant DSN; build_main_env then adds the
-            # per-run bridge token and strips the environment id main must never carry (§4.5).
+            # per-run bridge token, stamps the isolated fact and strips the environment id main
+            # must never carry (§4.5, §4.15).
             subprocess_env = build_main_env(
                 await self._build_subprocess_env(),
                 self._run_venv_token,
+                self._has_isolated_group,
                 bool(self._pipeline.get('avoidMocks')),
             )
 

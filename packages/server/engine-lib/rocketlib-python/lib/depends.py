@@ -1618,10 +1618,14 @@ def ensure_env_scoped(
         activate_env(register_env(paths.env_dir))
         _apply_overlay_path(paths.site_packages)
 
-    # Resolved at the one production door, not inside run_scoped_install: the resolver pops
+    # Resolved at the one production door, not inside run_scoped_install: the resolvers pop
     # os.environ, and that side effect must not hide in a planning function. Unconditional --
     # run_scoped_install early-returns under =0, but the consume must still happen.
     env_id = venv_env.resolve_env_id(env_id)
+    # OR, not replace: the parameter side is always False today (the sole caller is C++ passing
+    # three positional arguments), so the variable is in practice the only live input. The OR keeps
+    # the signature honest for a future non-C++ caller rather than guarding a real second source.
+    has_isolated_group = has_isolated_group or venv_env.isolated_from_env()
 
     return venv_env.run_scoped_install(
         exe_dir,

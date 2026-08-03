@@ -106,6 +106,42 @@ def test_resolve_env_id_explicit_env_is_neither_cached_nor_popped():
     assert V.resolve_env_id('main', {}) == 'main'
 
 
+# --- ROCKETRIDE_VENV_ISOLATED (the raw document fact) -----------------------
+
+
+@pytest.mark.parametrize(
+    'raw,expected',
+    [('1', True), ('true', True), ('YES', True), ('0', False), ('', False), ('  ', False), ('nope', False)],
+)
+def test_isolated_from_env_truth_table(raw, expected):
+    assert V.isolated_from_env({'ROCKETRIDE_VENV_ISOLATED': raw}) is expected
+
+
+def test_isolated_from_env_absent_is_false():
+    assert V.isolated_from_env({}) is False
+
+
+def test_isolated_from_env_is_consumed_on_first_read(monkeypatch):
+    monkeypatch.setenv('ROCKETRIDE_VENV_ISOLATED', '1')
+    assert V.isolated_from_env() is True
+    assert 'ROCKETRIDE_VENV_ISOLATED' not in os.environ
+    monkeypatch.delenv('ROCKETRIDE_VENV_ISOLATED', raising=False)
+    assert V.isolated_from_env() is True
+
+
+def test_isolated_from_env_false_is_frozen_too(monkeypatch):
+    monkeypatch.delenv('ROCKETRIDE_VENV_ISOLATED', raising=False)
+    assert V.isolated_from_env() is False
+    monkeypatch.setenv('ROCKETRIDE_VENV_ISOLATED', '1')
+    assert V.isolated_from_env() is False
+
+
+def test_isolated_cannot_switch_scoping_on_under_off():
+    # Decision 1 in one assertion: the flag travels as the raw document fact, so however stale it
+    # gets it cannot defeat =0 -- scoping_enabled's first branch settles it.
+    assert V.scoping_enabled(V.USE_OFF, V.isolated_from_env({'ROCKETRIDE_VENV_ISOLATED': '1'})) is False
+
+
 # --- id shortening + layout -------------------------------------------------
 
 

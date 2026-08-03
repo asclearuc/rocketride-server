@@ -133,14 +133,43 @@ def resolve_env_id(passed: Optional[str], env: Optional[dict] = None) -> Optiona
     return _ENV_ID_CACHE or passed
 
 
+# Mirrored in ai/modules/task/venv_spawn.py -- keep in sync.
+VENV_ISOLATED_ENV = 'ROCKETRIDE_VENV_ISOLATED'
+
+_ISOLATED_CACHE = _UNREAD
+
+
+def _truthy(raw) -> bool:
+    return (raw or '').strip().lower() in ('1', 'true', 'yes')
+
+
+def isolated_from_env(env: Optional[dict] = None) -> bool:
+    """Whether this process's document contains an isolated group.
+
+    The raw document **fact**, not a resolved decision: :func:`scoping_enabled` still decides, so
+    however stale this value gets it cannot switch scoping on under ``=0``. Consumed on first read
+    -- frozen, then popped -- like the environment id.
+
+    Absent, empty and ``'0'`` all mean False; there is no third state to distinguish, unlike the
+    mode switch where unset genuinely differs from ``'0'``.
+    """
+    global _ISOLATED_CACHE
+    if env is not None:
+        return _truthy(env.get(VENV_ISOLATED_ENV))
+    if _ISOLATED_CACHE is _UNREAD:
+        _ISOLATED_CACHE = _truthy(os.environ.pop(VENV_ISOLATED_ENV, ''))
+    return _ISOLATED_CACHE
+
+
 def _reset_venv_env_cache() -> None:
     """Drop the process-init caches so the next call reads the environment again.
 
     Tests only -- production resolves once by design.
     """
-    global _MODE_CACHE, _ENV_ID_CACHE
+    global _MODE_CACHE, _ENV_ID_CACHE, _ISOLATED_CACHE
     _MODE_CACHE = None
     _ENV_ID_CACHE = _UNREAD
+    _ISOLATED_CACHE = _UNREAD
 
 
 # ---------------------------------------------------------------------------

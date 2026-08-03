@@ -42,7 +42,14 @@ from ai.modules.task.task_engine import (
     cap_trace_payload,
 )
 from ai.modules.task.task_metrics import TaskMetrics
-from ai.modules.task.venv_spawn import VENV_ENV_ID_ENV, VENV_TOKEN_ENV, VENV_TRACE_EVENT, ProcessGuard, VenvChild
+from ai.modules.task.venv_spawn import (
+    VENV_ENV_ID_ENV,
+    VENV_ISOLATED_ENV,
+    VENV_TOKEN_ENV,
+    VENV_TRACE_EVENT,
+    ProcessGuard,
+    VenvChild,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1467,34 +1474,53 @@ async def test_teardown_reports_children_the_cooperative_phase_failed_to_reap():
 
 def test_main_env_never_carries_an_environment_id():
     # Pre-set on purpose: over a clean base a set-only implementation passes too, proving no pop.
-    env = build_main_env({'PATH': '/x', VENV_ENV_ID_ENV: 'v1'}, None, avoid_mocks=False)
+    env = build_main_env({'PATH': '/x', VENV_ENV_ID_ENV: 'v1'}, None, False, avoid_mocks=False)
     assert VENV_ENV_ID_ENV not in env
 
 
+@pytest.mark.parametrize('isolated', [True, False])
+def test_main_env_stamps_the_isolated_flag_both_ways(isolated):
+    # Both pre-set: a clean base passes on a set-only implementation and proves neither direction.
+    base = {VENV_ENV_ID_ENV: 'v1', VENV_ISOLATED_ENV: '1'}
+    env = build_main_env(base, None, isolated, avoid_mocks=False)
+    assert (VENV_ISOLATED_ENV in env) is isolated
+
+
 def test_main_env_differs_from_its_base_in_the_venv_keys_only():
-    # avoidMocks held fixed across the comparison -- it legitimately removes a third key.
+    # The general invariant, and it must survive both increments: main's env differs from the
+    # baseline in exactly the venv variables and nothing else. avoidMocks is held fixed across the
+    # comparison -- it legitimately removes a third key.
     base = {'PATH': '/x', 'ROCKETRIDE_MOCK': '/m', VENV_ENV_ID_ENV: 'v1'}
-    env = build_main_env(base, 'tok-1', avoid_mocks=False)
+    env = build_main_env(base, 'tok-1', True, avoid_mocks=False)
     assert set(base) - set(env) == {VENV_ENV_ID_ENV}
-    assert set(env) - set(base) == {VENV_TOKEN_ENV}
+    assert set(env) - set(base) == {VENV_TOKEN_ENV, VENV_ISOLATED_ENV}
     assert env['PATH'] == '/x'
     assert env['ROCKETRIDE_MOCK'] == '/m'
 
 
+def test_main_env_under_off_adds_the_flag_for_an_isolated_document():
+    # Under =0 the flag IS added and IS inert: scoping_enabled(USE_OFF, True) is False, so the
+    # document fact travels while the mode decides. "=0 adds nothing" is the tempting wording and
+    # it is false -- a test written to it would have to be weakened until it asserted nothing.
+    env = build_main_env({'PATH': '/x'}, None, True, avoid_mocks=False)
+    assert env[VENV_ISOLATED_ENV] == '1'
+    assert set(env) - {'PATH'} == {VENV_ISOLATED_ENV}
+
+
 def test_main_env_without_a_run_token_adds_nothing():
-    env = build_main_env({'PATH': '/x', VENV_ENV_ID_ENV: 'v1'}, None, avoid_mocks=False)
+    env = build_main_env({'PATH': '/x', VENV_ENV_ID_ENV: 'v1'}, None, False, avoid_mocks=False)
     assert set(env) == {'PATH'}
 
 
 def test_main_env_strips_mocks_only_under_avoid_mocks():
     base = {'ROCKETRIDE_MOCK': '/m'}
-    assert 'ROCKETRIDE_MOCK' in build_main_env(base, None, avoid_mocks=False)
-    assert 'ROCKETRIDE_MOCK' not in build_main_env(base, None, avoid_mocks=True)
+    assert 'ROCKETRIDE_MOCK' in build_main_env(base, None, False, avoid_mocks=False)
+    assert 'ROCKETRIDE_MOCK' not in build_main_env(base, None, False, avoid_mocks=True)
 
 
 def test_main_env_does_not_mutate_the_base():
-    # The call site passes os.environ itself, so a missing copy would pop the variable out of
+    # The call site passes os.environ itself, so a missing copy would pop the variables out of
     # the SERVER's own environment and degrade every later run.
-    base = {VENV_ENV_ID_ENV: 'v1', 'ROCKETRIDE_MOCK': '/m'}
-    build_main_env(base, 'tok', avoid_mocks=True)
-    assert base == {VENV_ENV_ID_ENV: 'v1', 'ROCKETRIDE_MOCK': '/m'}
+    base = {VENV_ENV_ID_ENV: 'v1', VENV_ISOLATED_ENV: '1', 'ROCKETRIDE_MOCK': '/m'}
+    build_main_env(base, 'tok', False, avoid_mocks=True)
+    assert base == {VENV_ENV_ID_ENV: 'v1', VENV_ISOLATED_ENV: '1', 'ROCKETRIDE_MOCK': '/m'}
