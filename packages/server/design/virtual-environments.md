@@ -1080,10 +1080,12 @@ split is real rather than nominal: each child lists exactly **one** `# Source:`
 while main lists **four** — `ai/`, `ai/common/avi/`, `nodes/response/`, `nodes/webhook/`, its own
 two nodes and nothing of the children's. The count of legacy `main`-only directories is now
 frozen history rather than a growing debt.
-What does **not** change is the second consequence: those directories are still unreclaimable —
-nothing deletes them — which is the disk debt §4.10's purge/delete operations exist to settle, and
-8.7A makes it grow **faster**, since a project now occupies one overlay per environment instead of
-one in total. That is the increment working, and it is why purge lands right after.
+The second consequence — that those directories were **unreclaimable**, since nothing deleted
+them — was the disk debt §4.10's purge/delete operations existed to settle, and 8.7A made it grow
+**faster**, since a project now occupies one overlay per environment instead of one in total.
+**8.6 settled it**: `rrext_venv` purges and deletes them under an active-run gate. So the growth
+8.7 causes is now bounded by an operation rather than by nothing, which is why purge landed
+immediately after.
 
 **It is a swap, not an insert (IMPLEMENTED).** Inserting without removing means applying a second
 environment in one process leaves **both** overlays in front of base: the newer wins for packages
@@ -1491,6 +1493,21 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
 - **Tests (§8.1–8.3):** AST-walk / resolution-rule / `depends`-parameterization / model-server-pruning
   **unit tests**; the `vtest_alpha`/`vtest_beta` **fixture nodes**; the **no-venv-conflict-fails** and
   **only-needed-installed (no-whisper)** acceptance tests; embedding-invariant regression.
+
+**Phase 2A-R — the residuals this phase left open, grouped and deferred as one.** The name exists
+so the group is addressable; the working handoff is
+`packages/server/design/NEXT-STEP-2A-R-prompt.md` (untracked, like every `NEXT-STEP-*` sibling).
+Five items: **base = engine runtime only** (§4.9 residual); **AST within-family over-inclusion**
+(§4.8 residual); **`builder nodes:test` per-node isolation** (open, with the trigger stated above);
+**a permanent home for the `vtest_*` fixtures** where the startup glob does not reach; and
+**`--node_path=` inheritance for venv children** (recorded, not fixed).
+**They were deferred together rather than picked off**, because items 3 and 4 are mutually
+entangled and 4 depends on the unfixed defect in 5 — half of that pair is worse than neither.
+*Item 4 is the sharpest lever in the whole feature:* staging the two fixtures is what makes
+§8.3's conflict acceptance possible, and staging them is what makes `auto`/`=0` refuse to start
+(their pins join the startup glob and `ensure_constraints()` fails at import, in every process,
+`builder test` included). So the headline proof of the feature is **structurally `=1`-only**
+until the fixtures move.
 
 **Phase 2B — Venv runtime (the isolation feature), on top of 2A.**
 4. **Schema + UI — DONE except the creation entry.** The Virtual Environment container as a canvas
@@ -1982,9 +1999,22 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
     overlay. Convert it to a set of env keys.
   - Per-node test environments need a **stable** env key — today's harness id is regenerated per run
     (§4.14).
-- **Tests (§8):** partitioner **unit tests**; the **two-venv conflict-coexists** acceptance
-  (`vtest_alpha`/`vtest_beta` split across venvs); compat `=0` isolated-group **demotion**; purge /
-  delete / GC **lifecycle** (blocked while a run is active).
+- **Tests (§8) — all four DONE except GC, which is 2C:** partitioner **unit tests** (39, step 8.3);
+  the **two-venv conflict-coexists** acceptance (`vtest_alpha`/`vtest_beta` split across venvs —
+  **run for the first time in 8.7A**, both pins imported, each from its own overlay, none in main);
+  compat `=0` isolated-group **demotion** (8.7B: four shapes returned their values, no `venvs/`
+  directory, 3 processes where two children would have made 5); purge / delete **lifecycle**
+  including the refusal while a run is active (8.6, live end to end). **GC/LRU stays 2C.**
+- **REMAINING in 2B — the client half of `rrext_venv`.** 8.6 shipped the **engine-side protocol
+  command only**: `list` / `purge` / `delete_env` / `delete_project` answer over the socket and are
+  documented in `packages/server/docs/observability.md`. What does **not** exist is anything that
+  calls them — no `client-python` method, no `client-typescript` method, and no canvas wiring, so
+  §4.10's operations **A/B/C are still buttons with nothing to press**. Recorded here rather than
+  only as a scope note inside §4.10's "implemented" bullet, because that is where a reader looks
+  for what shipped, not for what is left.
+  *Nothing is blocked on it:* the driver `e:\tmp\venv-drivers\venv_purge.py` reaches the command
+  through `RocketRideClient.call()`, the generic DAP entry point, which is how the 8.6 live check
+  ran end to end without a single line of client code.
 
 **Phase 2C — Polish & scale.** Multi-process debug/observability across the cut; deploy-time pre-warm;
 the local-IPC transport seam (UDS/named-pipe/shared-mem, §4.5); the **bridge-base + `write_lane`
@@ -2196,7 +2226,14 @@ remove afterwards: `nodes/src` is a committed tree.
   children; readiness; teardown; metric/trace fan-in. **Merge-back is not here:** it lives entirely in
   the bridge nodes (`nodes/venv/{server,base,client}/IInstance.py` + `nodes/venv/base/merge.py`, §4.12)
   and the orchestrator never sees it.
-- `packages/ai/src/ai/modules/task/task_server.py` — active-task registry (gate purge/GC); `project_id`.
+- `packages/ai/src/ai/modules/task/task_server.py` — active-task registry; `project_id`;
+  `has_active_project_run` is the purge/GC gate (matches the raw **and** the shortened id form, or a
+  purge addressed by a name from `list` walks straight past it).
+- `packages/ai/src/ai/modules/task/commands/cmd_venv.py` — the `rrext_venv` mixin (`list` / `purge` /
+  `delete_env` / `delete_project`). Wiring it into `TaskConn` is **three** edits: the import, the base
+  class list, and an explicit `VenvCommands.__init__` call — omit the third and the class still
+  imports and still constructs, the handler map is simply never built, and the first command dies on
+  `AttributeError` at connection time, far from the cause.
 - `packages/ai/src/ai/modules/task/pipeline.py` — `resolve_implied_source` (source-in-venv guard).
 - `packages/ai/src/ai/modules/data/data_conn.py` — canonical lane serialization to reuse in the bridge.
 - **Testing:** `nodes/test/framework/pipeline.py` (declarative node tests are mini-pipelines → run
