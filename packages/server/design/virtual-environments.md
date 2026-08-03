@@ -127,6 +127,110 @@ Three pillars:
 3. **Polish & scale.** Cross-cut debug/observability, pre-warm, and v2 optimizations (direct
    venv↔venv mesh, shared-memory for large buffers, the local-IPC transport seam).
 
+### 3.1 Two views of one scoped run
+
+The same run answers two different questions badly when drawn once: *what starts when* is about
+**processes and ordering**, *how data crosses* is about **frames and channels**, and the two do not
+share a shape. Both diagrams below describe a `=1` (or `auto` + isolated group) run of
+`webhook → [v1] → [v2] → response`; under `=0` neither applies, because the partitioner flattens
+the document and there is only ever one engine.
+
+*Rendered by GitHub natively. This file is **not** part of the docs site — `gather.js` collects
+`{nodes,packages,apps}/**/docs/**`, and `design/` is not `docs/` — so nothing in the site build
+depends on these blocks.*
+
+**View 1 — processes: what starts, in what order, holding what.**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as SDK client
+    participant S as Server, Task is server-side
+    participant G as ProcessGuard
+    participant V1 as child engine v1
+    participant V2 as child engine v2
+    participant M as main engine
+
+    C->>S: use pipeline
+    Note over S: scoped = scoping_enabled of mode<br/>and has_isolated_group
+    S->>S: partition_pipeline - main doc plus one sub-doc per env
+    S->>S: mint per-run bridge token
+    S->>G: create - Job Object on Windows, process group on POSIX
+
+    rect rgb(238,238,238)
+    Note over S,V2: children FIRST, and strictly one at a time
+    S->>V1: spawn --autoterm, env carries CLIENT_ID + VENV_TOKEN + VENV_ENV_ID=v1
+    S->>G: assign pid - before the readiness wait, so a hung child is still bound
+    V1->>V1: ensure_env_scoped, resolve_env_id wins over the literal main
+    V1->>V1: install into venvs/proj/v1, then mount /venv/pipe
+    V1-->>S: ready - the child's OWN signal, not a socket probe
+    S->>V2: spawn, env carries VENV_ENV_ID=v2
+    S->>G: assign pid
+    V2->>V2: install into venvs/proj/v2, then mount /venv/pipe
+    V2-->>S: ready
+    end
+
+    S->>S: inject_venv_urls - fill each bridge node's live loopback URL
+    S->>M: spawn - VENV_TOKEN kept, VENV_ENV_ID popped
+    S->>G: assign pid - the guard holds main too, not only children
+    M->>M: ensure_env_scoped main, installs venvs/proj/main
+    M->>V1: dial /venv/pipe with the token
+    M->>V2: dial /venv/pipe with the token
+```
+
+Three things this ordering makes visible, each of which has bitten someone:
+**children finish before main starts** (main's bridge nodes dial ports that must already answer);
+**the loop is sequential**, so N cold environments cost *install₁ + … + installₙ* of wall clock, not
+the maximum (§4.10 — parallel spawn is possible now that each env owns its lock, and still out of
+scope); and **the env id travels in opposite directions at the two ends** — assigned to a child,
+popped from main (§4.15).
+
+**View 2 — messages: one socket per child, and no socket between children.**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as SDK client
+    participant M as main engine graph
+    participant B1 as bridge node for v1, in main
+    participant V1 as child v1
+    participant B2 as bridge node for v2, in main
+    participant V2 as child v2
+
+    C->>M: send - reaches main's root pipe through the server, not a direct socket
+    M->>B1: writeText - an ordinary main-graph edge
+    B1->>V1: frame with lane header, over the ONE socket for v1
+    activate V1
+    V1->>V1: sub-pipeline runs, its own overlay ahead of base on sys.path
+    V1-->>B1: return frame, same socket
+    deactivate V1
+    Note over B1,B2: the venv-to-venv edge is cut at BOTH boundaries and<br/>reaches its consumer as a plain edge between bridge nodes
+    B1->>B2: writeText
+    B2->>V2: frame with lane header, over the ONE socket for v2
+    activate V2
+    V2-->>B2: return frame
+    deactivate V2
+    B2->>M: writeText onward
+    M-->>C: response
+
+    Note over M,V2: teardown and merge-back
+    M->>B1: closing
+    B1->>V1: a single close frame - never closing plus close
+    V1-->>B1: entry frame, if a response or end node lives inside the venv
+```
+
+Why this is correct in one breath: each child has exactly **one** connection, so a double-open is
+impossible by construction; ordering is delegated to **main's engine**; and main's engine thread is
+only ever inside one bridge node's call, so a return always arrives on the socket being read — the
+two `callRemote`s simply nest. Channels are keyed `(direction, env)`, one forward and one return per
+environment, which is what lets a venv→venv edge be cut twice rather than relayed (§4.6).
+
+**What deliberately does not appear in view 2:** a child's **events** — status, traces, metrics,
+warnings — do not travel on these sockets at all. They are drained from the child's **stdout**,
+classified, and fanned into the run (§4.4, step 8.4). Drawing them as frames would suggest the
+bridge carries observability, and the first person to debug a missing trace would look at the wrong
+transport.
+
 ---
 
 ## 4. Detailed design
@@ -502,6 +606,8 @@ main graph:  dropper ──▶ [venv1 bridge] ──▶ [venv2 bridge] ──▶
 sockets:     bridge ↔ child venv1, bridge ↔ child venv2   (no venv1↔venv2 link)
 ```
 
+*Sequence view of the same thing, including teardown and merge-back: **§3.1, view 2**.*
+
 Why it is correct in one breath: each child has exactly **one** connection, so a double-open is
 impossible by construction; `open`/`closing`/`close` ordering is delegated to **main's engine**; and
 main's engine thread is only ever inside one bridge node's call, so a return always arrives on the
@@ -842,6 +948,9 @@ Findings behind the cost estimate, to re-verify when the question is reopened:
   venv installs at **one shared `uv` download cache** so common wheels aren't re-downloaded.
 
 ### 4.10 Lifecycle: per-run process, install lock, purge/GC
+
+*Startup ordering — what spawns when, what the guard holds, and why children finish before main
+starts — is drawn in **§3.1, view 1**.*
 - **Venv process = the pipeline run.** A venv child is spawned when the run starts and exits when it
   ends — a **sibling** of the main `engine.exe`, mirroring today's process-per-run model. It handles all
   objects in that run but is **never reused across runs**. No warm pool. Two runs (same or different
@@ -883,14 +992,30 @@ Findings behind the cost estimate, to re-verify when the question is reopened:
   that child, so a first run that compiles and installs is waited for rather than killed at a fixed
   deadline. **First-run cost, stated because it is real:** `_spawn_venv_children` awaits each child
   to readiness before spawning the next, so N cold environments cost *install₁ + … + installₙ* of
-  wall clock, not the maximum. Accepted for v1 — before 8.7 the overlap would be fake anyway, since
-  every child contends on the same `install.lock` over `venvs/<proj>/main` — and parallel spawn is
-  deliberately out of scope until each environment owns its lock.
+  wall clock, not the maximum. Accepted for v1.
+  **The reason for accepting it changed in 8.7A — restate it rather than carrying the old one
+  forward.** It used to be that overlapping the installs would be *fake* anyway, since every child
+  contended on the same `install.lock` over `venvs/<proj>/main`, and parallel spawn was out of
+  scope "until each environment owns its lock". **That precondition is now met**: each environment
+  has its own directory and therefore its own lock (§4.10). Parallel spawn stays out of scope for a
+  different and weaker reason — nothing here needs it, and it would widen the blast radius of a
+  spawn bug. Left as written, the paragraph names a blocker that no longer exists, and the next
+  reader either takes the expired argument at face value or re-derives the whole question.
 - **Concurrent-install lock (race fix):** process-per-run + a shared cached env dir + install-on-drift
   could let two concurrent runs both `uv install --target` into the same `site-packages` → corruption.
   `depends.py` **already** has the `FileLock`/`install.lock` mechanism — **scope it per env dir** (one
   lock per `venvs/<proj>/<env>/`, not the single global lock) and define the **second-run
   wait-on-readiness** vs. fail behavior.
+  **First half DISCHARGED by 8.7A, and no lock code moved to do it.** `env_paths()` has always
+  placed the lock at `<env_dir>/install.lock`, and `ensure_env_scoped`'s `FileLock` line already
+  carried the comment "one lock per overlay, not the global one" — the lock became per-environment
+  the moment environments got distinct directories, which is what 8.7A delivered under `=1` (and
+  8.7B extends to `auto`). The item was never blocked on locking; the code was written for it and
+  then starved of distinct overlays. It was blocked on F6.
+  **Second half still OPEN**, and it is a separate question: the behaviour today is `FileLock`
+  polling until the holder releases — **wait, never fail** — and nothing has revisited whether that
+  is the right answer. Claiming this bullet whole is the easy error, and one that only surfaces
+  when two runs of one project collide months later.
 - **Purge & delete (canvas-driven).** *Purge* = remove all installed packages, keeping standard Python
   (delete the contents of the venv's `site-packages`; the base/stdlib survives because it's shared).
   - **Operation A — Purge (cog):** wipes packages, keeps the container + nodes. Allowed only when no run
@@ -908,24 +1033,36 @@ The venv child runs the **original `engine.exe`, unmoved**; the overlay's `site-
 **ahead of base** on `sys.path` for **overlay precedence** (venv `torch` wins; appending would let
 base shadow it). **`PYTHONPATH` won't work** (isolated `PyConfig`); use the runtime insert.
 
-**Correction (measured):** this section previously said "the bootstrap reads
-`ROCKETRIDE_VENV_SITE`". It does not, and nothing else does either — searched both as the literal
-string across every `.py`/`.cpp`/`.hpp`/`.ts` in the repo and as the constant `VENV_SITE_ENV` that
-carries it; both return the same two hits, in `venv_spawn.py`, being the definition and the single
-**write** in `build_child_env`. The overlay that actually gets applied is the one
-`ensure_env_scoped` computes for itself and hands to `_apply_overlay_path` via `on_overlay`, so the
-variable is write-only decoration. Retiring the write (rather than adding a reader) is part of the
-per-environment-scoping fix; see the step-8 record.
+**Correction (measured) — now history; the variable is gone as of 8.7A.** This section once said
+"the bootstrap reads `ROCKETRIDE_VENV_SITE`". It never did, and nothing else did either: searched
+both as the literal string across every `.py`/`.cpp`/`.hpp`/`.ts` in the repo and as the constant
+`VENV_SITE_ENV` that carried it, both returned the same two hits in `venv_spawn.py` — the
+definition and the single **write** in `build_child_env`. The overlay that actually got applied
+was the one `ensure_env_scoped` computed for itself and handed to `_apply_overlay_path` via
+`on_overlay`, so the variable was write-only decoration. **8.7A retired the write rather than
+adding a reader**: `overlay_site()` and `VENV_SITE_ENV` are deleted, and a child is now told its
+**environment id** (`ROCKETRIDE_VENV_ENV_ID`) and resolves its own overlay path from it. Telling a
+child a *path* was always the weaker design — it made the parent decide something the child is
+better placed to compute, and it is why the variable could sit unread for so long without anyone
+noticing.
 
-**And the consequence is visible on disk, not only in the code (measured while building 8.5).**
-`dist/server/venvs/` on the development machine holds **152 project directories, and every one of
-them contains only `main`** — not a single per-group overlay, across a history that includes dozens
-of `chain`/`diamond`/`two_merges` runs with isolated groups under `=1`. So the scoping layer has
-never once produced the thing it exists to produce. Two things follow. The isolation promise is
-unfulfilled in fact and not merely in theory, which is what makes 8.7 the increment that matters
-most here; and those 152 directories are unreclaimable today — nothing deletes them — which is the
-disk debt §4.10's purge/delete operations exist to settle and the reason 2A-R's per-node test
-environments need an eviction story before they multiply it further.
+**And the consequence was visible on disk, not only in the code (measured while building 8.5).**
+`dist/server/venvs/` on the development machine held **152 project directories, and every one of
+them contained only `main`** — not a single per-group overlay, across a history that includes
+dozens of `chain`/`diamond`/`two_merges` runs with isolated groups under `=1`. The scoping layer
+had never once produced the thing it exists to produce.
+
+**8.7A ended that, and the measurement is the same one inverted.** A `chain` run under `=1` now
+produces `venvs/<proj>/` holding **`main`, `v1` and `v2`**, and the `combined.txt` files show the
+split is real rather than nominal: each child lists exactly **one** `# Source:`
+(`ai/requirements.txt`, reached through the venv source stub's deferred `from ai import node`),
+while main lists **four** — `ai/`, `ai/common/avi/`, `nodes/response/`, `nodes/webhook/`, its own
+two nodes and nothing of the children's. The count of legacy `main`-only directories is now
+frozen history rather than a growing debt.
+What does **not** change is the second consequence: those directories are still unreclaimable —
+nothing deletes them — which is the disk debt §4.10's purge/delete operations exist to settle, and
+8.7A makes it grow **faster**, since a project now occupies one overlay per environment instead of
+one in total. That is the increment working, and it is why purge lands right after.
 
 **It is a swap, not an insert (IMPLEMENTED).** Inserting without removing means applying a second
 environment in one process leaves **both** overlays in front of base: the newer wins for packages
@@ -1029,9 +1166,13 @@ silently vanish. This is what allows an **end/return node to live in a venv** (�
   is the accepted v1 cost — revisit (shared children per pipeline) only if real pipelines hit limits.
 
 ### 4.14 Non-pipeline entry points (engtest, CLI, ad-hoc, test harnesses)
-These have **no `project_id`**, so the scoping must degrade gracefully: `ROCKETRIDE_VENV_SITE` unset →
-overlay no-ops → use base; `depends.py` tolerates a missing `project_id`/`env_id` and falls back to a
-**default env** (or base). Concrete cases:
+These have **no `project_id`**, so the scoping must degrade gracefully. **Where that degradation
+actually comes from (corrected in 8.7A):** not from an unset environment variable — it is
+`run_scoped_install`'s **empty-provider early return**, which exits before `plan_install` and so
+never creates a directory at all. This section demonstrates it three paragraphs down for
+`engtest`. The earlier wording ("`ROCKETRIDE_VENV_SITE` unset → overlay no-ops → use base") was
+doubly wrong: nothing ever read that variable, and it is now deleted. `depends.py` tolerates a
+missing `project_id`/`env_id` and falls back to a **default env** (or base). Concrete cases:
 
 - **`engtest`** (engine-lib Catch2 binary, links engLib → embeds Python) runs
   `loadModule("nodes.webhook")`. Its `python::config` test asserts `sys.prefix == sys.executable dir ==
@@ -1052,7 +1193,11 @@ overlay no-ops → use base; `depends.py` tolerates a missing `project_id`/`env_
   currently compatible). Once venvs allow incompatible nodes, a single pytest process (one
   `site-packages`) can't host `torch 2.0` and `torch 2.1` tests → **per-node-scoped test envs**, reusing
   the same `depends.py` env-dir primitive, with incompatible nodes in **separate worker processes**
-  pinned via `ROCKETRIDE_VENV_SITE` (composing with the planned pytest-xdist work). Declarative node
+  each given their own **`ROCKETRIDE_VENV_ENV_ID`** (composing with the planned pytest-xdist work).
+  *Updated in 8.7A:* this used to say "pinned via `ROCKETRIDE_VENV_SITE`", which no longer exists —
+  a worker is told which **environment** it is, and resolves its own overlay. The variable is
+  consumed on first read (frozen, then popped), so a worker cannot leak it to anything it spawns.
+  Declarative node
   tests are already mini-pipelines (`nodes/test/framework/pipeline.py`) → run them through the same
   partitioner. **Must land before the first incompatible node ships**, else the suite breaks.
   **The env key must become stable, too (VERIFIED).** The harness builds `project_id` as
@@ -1122,6 +1267,15 @@ teaching `venv_env` to parse the file.
   positional arguments, so `has_isolated_group` keeps its `False` default. **Only `=1` scopes
   anything at all right now** — the §8.3 measurement (auto = 130 sources = exactly the legacy set)
   follows from this, not merely from the test pipeline lacking a group.
+  **Two of the three sentences above are already out of date, and this bullet is rewritten whole in
+  8.7B — read it against §4.11 and §7 step 8 meanwhile.** "`auto` is byte-equivalent to `=0`"
+  stopped being true when the partitioner was wired in step 8: `auto` **plus** an isolated group
+  already cuts the document and spawns children; what those children then fail to do is *scope*.
+  And the "three positional arguments" clause is now only half the story — the arity is unchanged
+  and `has_isolated_group` does still default to `False`, but since **8.7A** the `"main"` literal no
+  longer decides anything: an inherited `ROCKETRIDE_VENV_ENV_ID` wins over it, which is how children
+  reached their own overlays without the C++ signature moving. What survives intact is the last
+  claim — **only `=1` scopes**, because 8.7A is deliberately `auto`-inert. 8.7B is what ends that.
 - **`=0` = force off (legacy mode).** Never partition: any `isolated` group is **demoted to a plain
   organizational group** (flattened into one process), and dependencies resolve via the **global-glob
   `constraints.txt` path**. Byte-for-byte today's behavior; **never an error**, even if the document
@@ -1258,10 +1412,23 @@ elsewhere that carry `environment`.
    **Trigger, not a reminder: the first node in this tree that is incompatible with another blocks
    on this item.** Until such a node exists nothing breaks, because the suite runs in one
    environment and all nodes are mutually satisfiable; the day one lands, `nodes:test` stops working
-   and the fix is per-node scoped test environments in separate worker processes pinned via
-   `ROCKETRIDE_VENV_SITE` (§4.14). Staging the `vtest_*` fixtures into `dist/server/nodes` belongs to
-   this item too — it is the same plumbing, and it is what unblocks the end-to-end acceptance in
-   §8.3. Do not build it standalone beforehand: the shape follows from the isolation work.
+   and the fix is per-node scoped test environments in separate worker processes, each given its own
+   **`ROCKETRIDE_VENV_ENV_ID`** (§4.14; the `ROCKETRIDE_VENV_SITE` this item used to name was
+   deleted in 8.7A, and an instruction to pin workers with a variable that no longer exists is
+   exactly what a handoff prompt would carry forward unchecked).
+   **Staging the `vtest_*` fixtures belongs to this item too, and 8.7A measured what "staging"
+   actually costs — it is two trees, not one.** `dist/server/nodes/` is the startup **glob** root,
+   so pins placed there are seen by dependency resolution; but **providers are registered from
+   `nodes/src/nodes/`**, and fixtures staged only in `dist` fail inside the child with
+   `Component venv_egress--<env>--main input references unknown component id: <node>` — a message
+   naming the bridge rather than the missing provider, which reads as a partitioner defect. The
+   permanent home has to satisfy both roles.
+   *And the reason this item is the sharpest lever on the whole feature:* §8.3's conflict
+   acceptance **passed** in 8.7A, but structurally **only under `=1`** — staging the two fixtures
+   is what makes the acceptance possible, and staging them is what makes `auto`/`=0` refuse to
+   start, `builder test` included. Until the fixtures live somewhere the startup glob does not
+   reach, the headline proof cannot be run under the mode everyone actually uses.
+   Do not build it standalone beforehand: the shape follows from the isolation work.
    *Payoff (opt-in, per §4.15):* when the scoped path is enabled (`ROCKETRIDE_SERVER_USE_VENV=1`, or
    auto with an isolated group present), the pipeline runs in a node-scoped "main" env → faster/smaller,
    no gliner/whisper bloat. **If no venv is needed** — the pipeline contains no isolated groups and the
@@ -1350,7 +1517,8 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    `scoping_enabled(use_venv_mode(), has_isolated_group(doc))`, module-top `import venv_env`) branches to
    `_spawn_venv_children`: assign a port, write the child task file, build the child env
    (`ROCKETRIDE_CLIENT_ID` + per-run `ROCKETRIDE_VENV_TOKEN` + `ROCKETRIDE_VENV_SITE` via `venv_env` when
-   the overlay exists), `create_subprocess_exec` with `--autoterm`, drain stdio, and TCP-probe readiness —
+   the overlay exists — *the third retired in 8.7A, replaced by `ROCKETRIDE_VENV_ENV_ID`*),
+   `create_subprocess_exec` with `--autoterm`, drain stdio, and TCP-probe readiness —
    all children up before the main engine, whose `venv` nodes dial them. The token rides the inherited env
    (§4.5), never the config. Teardown (`_terminated`, universal exit path): two-phase `terminate→kill→wait`
    per child + `release_port` + remove task file; children are resident and never self-stop.
@@ -1671,9 +1839,40 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    is real rather than inert. The gating regression is itself an `auto` run, so every process in
    it resolves through the frozen path — that, not the units, is this increment's breadth.
    Checked on WSL Python **3.10.12** by smoke script, that interpreter having no pytest installed.
-   *Remaining:* **8.7A/8.7B** per-environment scoping,
-   which §4.11's correction above shows reaches no child under `=1` and, under the default `auto`,
-   no process at all; **8.6** purge/delete with active-run gates.
+   *Increment 8.7A — **DONE, live-verified**: the child's own environment id, and F6 closed.* The
+   C++ hook calls `ensure_env_scoped(projectId, "main", providers)` with three positional
+   arguments, so **every** process resolved the literal `"main"` and children installed into the
+   same overlay as the main engine. A child is now told **which environment it is**
+   (`ROCKETRIDE_VENV_ENV_ID`) and resolves its own overlay from that; `ensure_env_scoped` reads the
+   variable inside itself, so **the C++ signature is untouched** — same arity, same order, no
+   engine rebuild. `ROCKETRIDE_VENV_SITE` and `overlay_site()` are **deleted** rather than taught
+   to be read (§4.11).
+   Both ends are protected, and by *opposite* mechanisms that must not be unified: the child's env
+   **assigns** the id unconditionally (a child must carry exactly one, so an inherited value has to
+   lose), while **main pops it** (main must carry none, and its environment is a copy of the
+   *server's*, where an operator export would otherwise redirect the main engine into another
+   environment's overlay). The variable is consumed on first read — frozen, then popped — so node
+   code and anything it spawns can neither observe nor change it (§4.15).
+   *Live under `=1`, three checks, all passed.* **(1)** A `chain` run produced `venvs/<proj>/`
+   holding **`main`, `v1`, `v2`** — the first per-group overlays this feature has ever created —
+   with each child's `combined.txt` listing exactly one `# Source:` against main's four.
+   **(2)** Settling: a second run of the same project left all three `requirements.hash` mtimes
+   **unchanged** — zero rebuilds. The `Compiling constraints...` status line is *not* the signal to
+   read, since a base recompile emits the identical text; the mtimes are the discriminator.
+   **(3) §8.3's headline acceptance, never run before**: `tabulate==0.8.10` and `==0.9.0` — a
+   mutually unsatisfiable pair — both imported in one pipeline, each from its own overlay, with
+   **no `tabulate` in main's `site-packages` at all**. The two report different files as well as
+   different versions (`tabulate.py` vs `tabulate/__init__.py`), which is independent evidence that
+   they are two distributions and not one counted twice.
+   *Three rakes measured here, each of which cost a run:* reusing a `project_id` against a **live**
+   server fails with `Pipeline is already running` and waiting does not clear it — a settling check
+   needs a server restart between its two runs; the fixture-staging trap fires on the **drivers**
+   too, since each is an `engine.exe` running `ensure_constraints()` at import, so every process
+   needs the flag and not just the server; and staging into `dist/server/nodes/` alone is
+   insufficient — that path is the glob root, while providers register from `nodes/src/nodes/`
+   (§7 phase 2A carries both halves).
+   *Remaining:* **8.7B** per-environment scoping under the default `auto`, which today still
+   reaches no process at all; **8.6** purge/delete with active-run gates.
    *Observed while verifying 8.2, recorded for 8.5 rather than fixed here:* after an in-venv failure
    a **second `send()` on the same token fails fast** — the boundary socket closed cleanly (1000) and
    the SDK raises `PipeException` with its usual "pipeline isn't running" diagnostic. It does not hang
@@ -1775,9 +1974,20 @@ automated acceptance — `rocketlib-python/tests/test_scoping_acceptance.py`, wh
 at `nodes/test/fixtures` and is gated on the engine interpreter, on `uv` being bootstrapped, and
 skipped when offline — but nothing copies them into `dist/server/nodes`, so no *pipeline* can
 reference them without a manual copy and `nodes:test` does not exercise them at all. Staging them
-is the prerequisite for the end-to-end acceptance in §8.3; until then, `vtest_alpha` also has
-nothing to report — it forwards text unchanged, so the version it actually imported is not
-observable from outside the process.
+is the prerequisite for the end-to-end acceptance in §8.3.
+
+**Both fixtures now report what they imported (8.7A).** Each appends
+`<name>=<version>@<file>` to the text it forwards, folded into the **same** text lane it already
+declares, so a chained pipeline delivers both reports in one payload. Without this the acceptance
+proved only that the right files were on disk, not that the node imported them. Attributes of the
+already-imported `tabulate` are used deliberately — adding any *import* would pull another
+`requirement*.txt` into the discovery walk and turn `test_scoping_acceptance.py`'s
+"exactly one requirements file" assertion red for a reason that looks unrelated.
+
+**Manual staging measured (8.7A): it is two trees, not one.** `dist/server/nodes/` is the startup
+glob root, but **providers register from `nodes/src/nodes/`** — copied only into `dist`, the run
+dies inside the child with `input references unknown component id: <node>`. Copy into both, and
+remove afterwards: `nodes/src` is a committed tree.
 
 ### 8.3 Integration / acceptance
 
@@ -1794,10 +2004,25 @@ observable from outside the process.
   still in the startup glob, the identical setup killed `ai/__init__`'s `depends()` at import: the engine
   **could not start at all**, in every process including the CLI client. This is what motivated the
   gating.
-- **Conflict → split across venvs → all good.** The same two nodes in **two separate venvs** → each env
-  compiles/install its single pin → the pipeline runs **end-to-end**, both `requests` versions
-  coexisting. Assert each overlay's `site-packages` holds the expected version (alpha-env→`0.8.10`,
-  beta-env→`0.9.0`) and the other is **absent**. [2B]
+- **Conflict → split across venvs → all good — VERIFIED live (8.7A).** The same two nodes in **two
+  separate venvs** → each env compiles/installs its single pin → the pipeline runs **end-to-end**,
+  both `tabulate` versions coexisting. *(This entry used to say "both `requests` versions" while
+  quoting `0.8.10`/`0.9.0`: a leftover from before the fixtures moved off `requests` — precisely
+  the package `vtest_alpha/requirements.txt` rejects as "used by the SDK or engine runtime". The
+  versions were updated then; the package name was not.)*
+  Measured, `webhook(main) → [v1: vtest_alpha] → [v2: vtest_beta] → response(main)`:
+  each node reported the version **and the file** it actually imported —
+  `alpha=0.8.10@venvs/<proj>/v1/site-packages/tabulate.py` and
+  `beta=0.9.0@venvs/<proj>/v2/site-packages/tabulate/__init__.py`. The differing *file shapes*
+  (0.8.10 is a single module, 0.9.0 a package) corroborate independently that these are two
+  distributions rather than one reported twice. Each overlay holds its own pin and not the other,
+  and — the assertion that proves scoping rather than mere separation — **`main/site-packages`
+  holds no `tabulate` at all**.
+  **Structurally `=1`-only, and that is the standing limit, not an oversight.** Staging the two
+  fixtures is what makes this acceptance possible, and staging them is what makes `auto`/`=0`
+  refuse to start (their pins join the startup glob and `ensure_constraints()` fails at import, in
+  every process). Re-running it under the default mode needs the fixtures to live where the glob
+  does not reach — §7 phase 2A. [2B → done]
 - **Only-needed-installed (scoping).** (a) A pipeline using `vtest_alpha` only → its env has
   `tabulate==0.8.10`, **not** the other pin and **not** `whisper`/`faster-whisper`/`torch`. (b) A
   **no-audio** pipeline → `whisper`/`faster-whisper` **absent** from every env's install set; an audio

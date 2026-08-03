@@ -33,9 +33,10 @@ from typing import Any, Deque, Dict, FrozenSet, List, NamedTuple, Optional
 # inherited env var (never argv, never the on-disk task file); the child's /venv/pipe
 # route verifies it and the main-side venv clients present it. (§4.5)
 VENV_TOKEN_ENV = 'ROCKETRIDE_VENV_TOKEN'
-# Points a child at its per-environment ``sys.path`` overlay (§4.11); consumed by the
-# engine bootstrap in ``depends.py``. Unset -> the child runs on the base runtime.
-VENV_SITE_ENV = 'ROCKETRIDE_VENV_SITE'
+# Which environment the child installs into and imports from. The child resolves its own
+# overlay path from this; it is never told the path. Mirrors venv_env.VENV_ENV_ID_ENV, which
+# this module cannot import (engine sys.path only) -- keep in sync.
+VENV_ENV_ID_ENV = 'ROCKETRIDE_VENV_ENV_ID'
 
 # ---------------------------------------------------------------------------
 # child event routing (pure; the Task acts on the result)
@@ -225,40 +226,27 @@ class VenvChild:
     last_event_at: float = field(default_factory=time.monotonic)
 
 
-def overlay_site(exe_dir: str, project_id: Optional[str], env_id: str) -> Optional[str]:
-    """The child's ``ROCKETRIDE_VENV_SITE`` overlay path, or ``None`` to use the base runtime.
-
-    Computed through ``venv_env`` (ids are shortened for MAX_PATH; never hand-assemble the
-    path). Returns ``None`` when ``venv_env`` is unavailable (non-engine context) or the
-    overlay has not been installed yet -- step 7 only points at the overlay; installing it
-    (uv via ``depends.py``) is a separate phase, and an absent overlay degrades to base.
-    """
-    try:
-        import venv_env  # engine sys.path only
-    except ImportError:
-        return None
-    site = venv_env.env_paths(venv_env.env_dir(exe_dir, project_id, env_id)).site_packages
-    return site if os.path.isdir(site) else None
-
-
 def build_child_env(
     base_env: Dict[str, str],
     client_id: str,
     run_token: str,
-    overlay: Optional[str],
+    env_id: str,
     avoid_mocks: bool,
 ) -> Dict[str, str]:
     """Build a venv child's subprocess environment, mirroring the main-engine spawn.
 
     Copies the parent env, sets the account context (``ROCKETRIDE_CLIENT_ID``), the per-run
-    bridge token, and (when present) the overlay path; strips ``ROCKETRIDE_MOCK`` under
+    bridge token and the child's environment id; strips ``ROCKETRIDE_MOCK`` under
     ``avoidMocks`` exactly like the main engine so the child loads real libraries.
+
+    The env id is **assigned, never conditionally set**: a child must carry exactly one, so an
+    inherited value has to lose. Main's spawn is the mirror image -- it pops the variable,
+    because main must carry none.
     """
     env = dict(base_env)
     env['ROCKETRIDE_CLIENT_ID'] = client_id
     env[VENV_TOKEN_ENV] = run_token
-    if overlay:
-        env[VENV_SITE_ENV] = overlay
+    env[VENV_ENV_ID_ENV] = env_id
     if avoid_mocks:
         env.pop('ROCKETRIDE_MOCK', None)
     return env

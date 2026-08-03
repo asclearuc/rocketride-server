@@ -1591,7 +1591,8 @@ def ensure_env_scoped(
 
     Args:
         project_id: Pipe id, or ``None`` for the shared default env.
-        env_id: ``'main'`` or a group id.
+        env_id: ``'main'`` or a group id. An inherited ``ROCKETRIDE_VENV_ENV_ID`` wins over
+            it -- the C++ hook passes the literal ``'main'`` for every process.
         providers: The environment's node ``provider`` strings.
         has_isolated_group: Whether the pipeline has an isolated group (auto mode).
 
@@ -1616,6 +1617,11 @@ def ensure_env_scoped(
         # imports come from. use_env() deliberately does only the first.
         activate_env(register_env(paths.env_dir))
         _apply_overlay_path(paths.site_packages)
+
+    # Resolved at the one production door, not inside run_scoped_install: the resolver pops
+    # os.environ, and that side effect must not hide in a planning function. Unconditional --
+    # run_scoped_install early-returns under =0, but the consume must still happen.
+    env_id = venv_env.resolve_env_id(env_id)
 
     return venv_env.run_scoped_install(
         exe_dir,
