@@ -3,7 +3,7 @@
 # (full text in depends.py)
 # =============================================================================
 
-"""Per-environment overlay layout and scoped-install planning.
+"""Per-environment overlay layout, scoped-install planning, and reclamation.
 
 Every environment (``main`` or an isolated group) gets its own overlay under
 ``<exe>/venvs/<proj>/<env>/`` holding ``site-packages/`` plus its own
@@ -14,7 +14,12 @@ Ids are shortened to stay under the Windows ``MAX_PATH`` limit.
 installed into that environment, so switching environments is one act rather than four
 independent ones.
 
-Stdlib only — no engine, ``uv``, subprocess or ``sys.path`` mutation — so it is
+The module also **destroys** environments (``purge_env`` / ``delete_env`` /
+``delete_project``) and enumerates them (``list_envs``), and takes OS file locks to do
+it safely. Say so here rather than advertising planning alone: the next person otherwise
+concludes this file is read-only and puts the destructive half somewhere else.
+
+Stdlib only — no engine, ``uv`` or subprocess, and no ``sys.path`` mutation — so it is
 testable in isolation; ``depends.py`` layers the actual compile/install on top.
 The hash/combine helpers mirror ``depends.py`` to avoid importing it (that would
 pull in ``engLib``); keep them in sync.
@@ -25,8 +30,17 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from typing import Optional
+
+# Load-bearing, not style: a bare ``import msvcrt`` makes this module UNIMPORTABLE on Linux,
+# and this is precisely the module the POSIX test half loads -- the mistake would surface as
+# the whole suite erroring at collection, not as a failing lock test. Mirrors depends.py.
+if os.name == 'nt':
+    import msvcrt
+else:
+    import fcntl
 
 # env_id for the always-present base-of-the-pipeline environment.
 MAIN_ENV = 'main'
@@ -293,8 +307,8 @@ def requirements_hash(req_files: list[str]) -> str:
     """
     hasher = hashlib.md5()
     for path in sorted(req_files):
-        stat = os.stat(path)
-        hasher.update(f'{path}:{stat.st_size}:{stat.st_mtime_ns}\n'.encode())
+        info = os.stat(path)  # not `stat`: that name is the stdlib module here
+        hasher.update(f'{path}:{info.st_size}:{info.st_mtime_ns}\n'.encode())
     return hasher.hexdigest()
 
 
@@ -546,3 +560,265 @@ def _read_text(path: str) -> Optional[str]:
             return fh.read().strip()
     except FileNotFoundError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# reclamation: purge / delete / list
+# ---------------------------------------------------------------------------
+
+
+class EnvBusy(RuntimeError):
+    """An environment could not be reclaimed because something still holds it."""
+
+
+class _EnvLock:
+    """Non-blocking exclusive lock on one environment's ``install.lock``.
+
+    **Same primitive family as** ``depends.FileLock`` -- ``msvcrt`` on Windows,
+    ``fcntl.flock`` on POSIX -- because ``flock`` and ``lockf`` do not see each other on Linux,
+    so the wrong one evaporates the gate on exactly one platform, invisibly.
+
+    **Not** ``depends.FileLock`` itself, for two independent reasons either of which settles it:
+    that lock **blocks** (polls forever with a status sidecar), which is what a protocol call
+    must never do -- a purge issued behind a live install would hang instead of reporting busy;
+    and this module deliberately imports nothing from ``depends``, since that would pull in
+    ``engLib``.
+    """
+
+    def __init__(self, path: str):
+        self._path = path
+        self._fh = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        fh = open(self._path, 'a+b')
+        try:
+            if os.name == 'nt':
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            fh.close()
+            raise EnvBusy(f'environment is busy (install in progress): {self._path}') from exc
+        self._fh = fh
+        return self
+
+    def __exit__(self, *_exc):
+        if self._fh is None:
+            return False
+        try:
+            if os.name == 'nt':
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        self._fh.close()
+        self._fh = None
+        return False
+
+
+def _force_remove(path: str) -> None:
+    """Remove one file, retrying once after clearing a read-only bit.
+
+    The chmod retry is cheap insurance, **not** the load-bearing case: measured across 40
+    overlays (77,191 files) ``uv`` leaves **zero** read-only files. What actually fails here is a
+    resident engine holding an imported ``.pyd``/``.dll`` open, and no chmod frees that -- so the
+    second failure is **named**, not retried. A retry loop that hides an open file turns a clear
+    "stop the engine first" into a hang, on the one platform where this is the expected outcome.
+    """
+    try:
+        os.unlink(path)
+        return
+    except FileNotFoundError:
+        return
+    except PermissionError:
+        pass
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        os.unlink(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise EnvBusy(f'cannot remove {path} - a process may still hold it open') from exc
+
+
+def _empty_dir(directory: str, keep=()) -> None:
+    """Delete everything inside ``directory``, keeping the named top-level entries.
+
+    Hand-rolled rather than ``shutil.rmtree``: neither ``onexc=`` nor ``onerror=`` is right on
+    both interpreters this module must run on -- the engine embeds 3.12 (where ``onerror`` is
+    deprecated) and WSL ships 3.10 (where ``onexc`` is a ``TypeError``). An explicit try/except
+    is version-neutral.
+    """
+    if not os.path.isdir(directory):
+        return
+    for entry in os.scandir(directory):
+        if entry.name in keep:
+            continue
+        if entry.is_dir(follow_symlinks=False):
+            _empty_dir(entry.path)
+            try:
+                os.rmdir(entry.path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise EnvBusy(f'cannot remove {entry.path} - a process may still hold it open') from exc
+        else:
+            _force_remove(entry.path)
+
+
+def _resolve_segment(parent: str, given: Optional[str]) -> str:
+    """Literal-first: an exact on-disk name wins, otherwise shorten.
+
+    ``list_envs`` can only report what is on disk, and what is on disk is ``short_id`` of both
+    segments. Feeding a listed name back into ``purge`` and applying ``short_id`` **again** is not
+    idempotent: ``chaindaa-abc12345`` cleans to 16 characters and re-hashes to a *different,
+    plausible* directory, which is absent, which is idempotent success -- so the command would
+    report success and delete nothing, and a ``list -> purge -> list`` check would not even
+    notice, because the entry it re-lists is the one that was never touched.
+    """
+    name = (given or '').strip()
+    if name and os.path.isdir(os.path.join(parent, name)):
+        return name
+    return short_id(name or None)
+
+
+def resolve_project_dir(exe_dir: str, project_id: Optional[str]) -> str:
+    """``venvs/<project>``, resolved literal-first."""
+    root = venv_root(exe_dir)
+    return os.path.join(root, _resolve_segment(root, project_id))
+
+
+def resolve_env_dir(exe_dir: str, project_id: Optional[str], env_id: Optional[str]) -> str:
+    """``venvs/<project>/<env>``, both segments resolved literal-first."""
+    project = resolve_project_dir(exe_dir, project_id)
+    return os.path.join(project, _resolve_segment(project, env_id))
+
+
+def purge_env(exe_dir: str, project_id: Optional[str], env_id: Optional[str]) -> bool:
+    """Empty one environment's ``site-packages``, keeping its compiled inputs.
+
+    Returns ``False`` when the environment does not exist -- an absent target is idempotent
+    success, not an error.
+
+    **Drops ``requirements.hash`` FIRST, then wipes.** The reverse order turns any mid-wipe
+    failure into an environment that is half-deleted yet still marked installed, which the next
+    run happily imports from; hash-first makes the worst case a redundant reinstall.
+
+    ``combined.txt`` and ``constraints.txt` survive (§4.10). That does **not** make the next run
+    cheap: with the hash gone ``plan_install`` rebuilds regardless, so the constraints are
+    recompiled from scratch and the post-purge run is a full compile-and-install. Never
+    "optimise" this by keeping the hash -- that is the inverse of this rule and hands the next
+    run an empty ``site-packages`` marked as installed.
+    """
+    directory = resolve_env_dir(exe_dir, project_id, env_id)
+    if not os.path.isdir(directory):
+        return False
+    paths = env_paths(directory)
+    with _EnvLock(paths.lock_file):
+        _force_remove(paths.hash_file)
+        _empty_dir(paths.site_packages)
+    return True
+
+
+def _delete_env_dir(directory: str) -> bool:
+    """Delete one environment overlay **by path**. Shared by both delete entry points.
+
+    Windows cannot remove the lock file while it is held, hence the order: acquire -> delete
+    everything except ``install.lock`` -> release -> unlink the lock best-effort -> remove the
+    now-empty directory. A failure at either of the last two steps is **not** an error: the
+    environment is already gone in every sense that matters.
+    """
+    if not os.path.isdir(directory):
+        return False
+    paths = env_paths(directory)
+    with _EnvLock(paths.lock_file):
+        _empty_dir(directory, keep={os.path.basename(paths.lock_file)})
+    try:
+        os.unlink(paths.lock_file)
+        os.rmdir(directory)
+    except OSError:
+        pass
+    return True
+
+
+def delete_env(exe_dir: str, project_id: Optional[str], env_id: Optional[str]) -> bool:
+    """Delete one environment overlay entirely. Absent target -> ``False``, not an error."""
+    return _delete_env_dir(resolve_env_dir(exe_dir, project_id, env_id))
+
+
+def delete_project(exe_dir: str, project_id: Optional[str]) -> int:
+    """Delete every environment of one project **and the project directory itself**.
+
+    §4.10's operation C is "delete the whole ``venvs/<project_id>/`` subtree", not "empty it":
+    iterating environments alone would leave a childless project directory behind, and that is
+    not cosmetic -- it decides what the closing ``list`` shows. ``list_envs`` skips childless
+    project directories for the same reason, so the two answers agree.
+
+    Iterates through the **path-level** helper because ``short_id`` is not idempotent: a
+    name-level loop would re-shorten each directory name it just read off disk, land on a
+    different plausible name, find it absent, and report success having deleted nothing.
+
+    Returns the number of environments removed.
+    """
+    root = resolve_project_dir(exe_dir, project_id)
+    if not os.path.isdir(root):
+        return 0
+    removed = 0
+    for entry in sorted(os.scandir(root), key=lambda e: e.name):
+        if entry.is_dir(follow_symlinks=False) and _delete_env_dir(entry.path):
+            removed += 1
+    try:
+        os.rmdir(root)
+    except OSError:
+        pass
+    return removed
+
+
+def _dir_size(directory: str) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(directory):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def list_envs(exe_dir: str, project_id: Optional[str] = None, sizes: bool = False):
+    """Enumerate installed environments. Read-only, no lock.
+
+    Keys are the **wire** spelling, since these rows travel to a client as they are.
+
+    ``sizes`` is opt-in, and the numbers rather than taste say why: measured here, **154**
+    populated ``site-packages`` directories with ~3520 files in a sampled one, so sizing
+    everything is on the order of half a million ``stat`` calls -- on the call a canvas makes
+    most often. Default is a cheap ``scandir`` with no recursion; size only when someone is
+    actually deciding what to reclaim.
+    """
+    root = venv_root(exe_dir)
+    rows = []
+    if not os.path.isdir(root):
+        return rows
+    wanted = _resolve_segment(root, project_id) if project_id else None
+    for project in sorted(os.scandir(root), key=lambda e: e.name):
+        if not project.is_dir(follow_symlinks=False):
+            continue
+        if wanted is not None and project.name != wanted:
+            continue
+        for env in sorted(os.scandir(project.path), key=lambda e: e.name):
+            if not env.is_dir(follow_symlinks=False):
+                continue
+            row = {
+                'projectId': project.name,
+                'envId': env.name,
+                'installed': os.path.isfile(os.path.join(env.path, 'requirements.hash')),
+            }
+            if sizes:
+                row['bytes'] = _dir_size(os.path.join(env.path, 'site-packages'))
+            rows.append(row)
+    return rows

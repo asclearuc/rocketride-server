@@ -1024,6 +1024,27 @@ starts — is drawn in **§3.1, view 1**.*
   - **Operation B — Delete the container:** asks (1) delete member nodes + connections? (no = ungroup,
     keep them); (2) also remove the venv? (yes = delete the entire `venvs/<project_id>/<group_id>/`).
   - **Operation C — Pipeline deleted:** delete the whole `venvs/<project_id>/` subtree.
+  - **IMPLEMENTED (8.6) — the engine side of all three, plus a `list`.** `rrext_venv` dispatches
+    `list` / `purge` / `delete_env` / `delete_project` onto `venv_env` primitives
+    (`packages/server/docs/observability.md` documents the wire surface). **Scope boundary:
+    the protocol command only** — no SDK method and no canvas wiring; A/B/C are the UI actions
+    that will call it. `list` is not in §4.10's original three and was added because without it
+    neither the canvas nor the live check can learn what exists, and the check would then be
+    asserting about files rather than about the protocol.
+    *Operation C means the subtree, not its contents:* `delete_project` removes the project
+    directory too, and `list_envs` skips a childless project directory, so the closing "list
+    shows them gone" cannot be ambiguous between a bug and an empty shell.
+    **Two residuals, both accepted for v1 and both stated because they will be met.** The
+    **check-then-act race**: the active-run gate and the wipe are not atomic, so a run starting
+    in between is not prevented. And the one that will arrive as a bug report — **completion is
+    not "the process is gone"**: a `ttl`-resident engine that imported from the overlay still
+    holds its `.pyd`/`.dll` open, so on Windows the wipe fails with a **named busy error** rather
+    than reporting a partial wipe as success. The gate proves "no active run", not "safe to
+    delete".
+    *The lock this uses is deliberately not `depends.FileLock`* — that one **blocks**, which a
+    protocol call must never do, and `venv_env` imports nothing from `depends`. It is the same
+    primitive family (`msvcrt` / `fcntl.flock`), because `flock` and `lockf` do not see each
+    other on Linux.
   - **Lifecycle coupling:** the dir lives as long as its canvas entity; **orphan-GC reconciliation** is
     the safety net (pipelines/groups can be deleted out-of-band — e.g. the `.pipe` removed directly).
     LRU eviction under disk pressure is a separate, secondary mechanism for still-valid-but-stale envs.
@@ -1907,7 +1928,36 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
    `No such host is known`, and the message reads like a scoping defect. It is not — and the same
    log proved the increment working, because the child only reached a compile *at all* under `auto`
    because 8.7B had already turned scoping on for it.
-   *Remaining:* **8.6** purge/delete with active-run gates.
+   *Increment 8.6 — **DONE**: purge / delete / list.* The overlays 8.7 finally started producing
+   were unreclaimable — nothing deleted them — and 8.7 makes them grow faster, since a project now
+   occupies one overlay per environment instead of one in total. `venv_env` gains `purge_env`,
+   `delete_env`, `delete_project` and `list_envs` (stdlib only, no engine); `rrext_venv` is a new
+   `commands/cmd_venv.py` mixin; `TaskServer.has_active_project_run` is the gate.
+   *Four things here are correctness rather than style.* **Hash-first**: `purge_env` drops
+   `requirements.hash` before wiping, so a mid-wipe failure leaves a redundant reinstall rather
+   than a half-emptied overlay still marked installed — pinned by a test that makes the wipe fail
+   partway, since the ordering is invisible on every happy path. **One path-level delete helper**
+   shared by both delete entry points, because `short_id` is not idempotent: a name-level loop
+   would re-shorten each directory name it just read off disk, land on a different plausible name,
+   find it absent, and report success having deleted nothing. **Literal-first id resolution**, so
+   a name from `list` and a raw id from a document address the same directory and the round trip
+   holds. And the **gate matches both id forms** — `control.project_id` is raw, while the command
+   accepts on-disk names, so comparing only the raw form would let a purge addressed by the
+   shortened name sail past into a live overlay.
+   *Permission model:* per subcommand (`task.monitor` for `list`, `task.control` for the three
+   destructive ones) behind one `_verify_venv_access` helper, with `teamId` **optional** —
+   present, the permission resolves against that team; absent, against the caller's default
+   context. Modelled on `cmd_log._verify_log_access`, the closest sibling in kind. The team branch
+   is a caller-asserted scope check and **not** a claim of ownership: overlays are machine-local
+   disk state and nothing ties them to a team.
+   *Measured while writing the tests, and it corrects a claim the neighbouring commands make:*
+   denials are **not** indistinguishable — a foreign team raises `No membership in team '<id>'`,
+   not a permission-name message. What stays hidden is whether the project or overlay exists,
+   which is the leak that would matter.
+   *Coverage:* `test_venv_env.py` runs on Windows (69 passed, 1 skipped) **and under WSL Python
+   3.10.12 (70 passed)** — including the cross-primitive case that holds a real `fcntl.flock` and
+   asserts the purge reports busy, which is the one platform with no other coverage;
+   `test_cmd_venv.py` (17) for the protocol face; `test_task_server.py` (+5) for the gate.
    *Observed while verifying 8.2, recorded for 8.5 rather than fixed here:* after an in-venv failure
    a **second `send()` on the same token fails fast** — the boundary socket closed cleanly (1000) and
    the SDK raises `PipeException` with its usual "pipeline isn't running" diagnostic. It does not hang
