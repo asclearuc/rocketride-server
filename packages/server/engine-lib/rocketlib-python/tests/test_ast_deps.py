@@ -92,6 +92,11 @@ def test_provider_native_and_unknown():
 # --- transitive walk --------------------------------------------------------
 
 
+def _rel(res):
+    """Discovered files as repo-relative forward-slash paths."""
+    return {os.path.relpath(p, _REPO).replace(os.sep, '/') for p in res.requirement_files}
+
+
 @_needs_tree
 @pytest.mark.parametrize(
     'provider, must_include',
@@ -109,14 +114,36 @@ def test_golden_requirement_sets(provider, must_include):
     # torch is reached through each heavy node's local (non-model-server) branch
     assert any('torch' in os.path.relpath(p, _REPO).replace(os.sep, '/') for p in res.requirement_files)
     assert res.dynamic_imports == []
+    # The packages Python executes on the way in. A subset assertion keeps passing when the walk
+    # stops finding these, so they are named: the golden set has to cover what the rule adds.
+    assert {'nodes/src/nodes/requirements.txt', 'packages/ai/src/ai/requirements.txt'} <= _rel(res)
 
 
 @_needs_tree
-def test_only_needed_excludes_unrelated_families():
-    res = A.discover_for_providers(['detect'], _NODES_SRC, _AI_SRC)
+@pytest.mark.parametrize(
+    'provider, foreign',
+    [
+        # detect imports its model submodule by full path and was never at risk -- it is the
+        # control. audio_transcribe is one of the four barrel importers Option A converted, so it
+        # is where a mis-scoped ancestor rule would re-admit ai.common.models' eager barrel and
+        # pull every family back in.
+        ('detect', {'requirements_whisper.txt', 'requirements_gliner.txt'}),
+        (
+            'audio_transcribe',
+            {
+                'requirements_gliner.txt',
+                'requirements_easyocr.txt',
+                'requirements_surya.txt',
+                'requirements_detection.txt',
+                'requirements_pose.txt',
+            },
+        ),
+    ],
+)
+def test_only_needed_excludes_unrelated_families(provider, foreign):
+    res = A.discover_for_providers([provider], _NODES_SRC, _AI_SRC)
     basenames = {os.path.basename(p) for p in res.requirement_files}
-    assert 'requirements_whisper.txt' not in basenames
-    assert 'requirements_gliner.txt' not in basenames
+    assert not (foreign & basenames), f'{provider} leaked {foreign & basenames}'
 
 
 @_needs_tree
@@ -124,6 +151,115 @@ def test_dynamic_import_is_flagged():
     # preprocessor_code resolves its module from a config-driven dict at runtime
     res = A.discover_for_providers(['preprocessor_code'], _NODES_SRC, _AI_SRC)
     assert res.dynamic_imports
+
+
+# --- ancestor packages ------------------------------------------------------
+# Python runs nodes/__init__.py before any node and ai/__init__.py before any ai module, and each
+# installs its own co-located requirements. Those files are nobody's import statement, so a walk
+# that only follows imports never opens them.
+
+
+@_needs_tree
+@pytest.mark.parametrize('provider', ['venv', 'venv_server', 'response', 'detect'])
+def test_every_nodes_rooted_provider_carries_the_tree_baseline(provider):
+    # Guaranteed by construction, not by luck: importing any node runs nodes/__init__.py. Leaf and
+    # sub-package entries alike, which is the half the measurement originally missed.
+    assert 'nodes/src/nodes/requirements.txt' in _rel(A.discover_for_providers([provider], _NODES_SRC, _AI_SRC))
+
+
+@_needs_tree
+@pytest.mark.parametrize(
+    'provider, parent_file',
+    [
+        ('venv', 'nodes/src/nodes/venv/requirements.txt'),
+        ('venv_server', 'nodes/src/nodes/venv/requirements.txt'),
+        ('remote_server', 'nodes/src/nodes/remote/requirements.txt'),
+    ],
+)
+def test_sub_package_entry_reaches_its_parent_packages_file(provider, parent_file):
+    # These providers' entry modules are sub-packages (nodes.venv.client, ...), so the parent
+    # package's file is executed but never imported. Three of them are this feature's own bridges,
+    # which is how the hole stayed invisible: they returned an empty set and nothing looked.
+    assert parent_file in _rel(A.discover_for_providers([provider], _NODES_SRC, _AI_SRC))
+
+
+def test_namespace_ancestor_is_skipped_not_stopped(tmp_path):
+    # PEP 420: a directory without __init__.py executes nothing, so it contributes no
+    # requirements -- but its own ancestors still run and still do. Every directory in the shipped
+    # tree has an __init__.py, so only a --node_path tree can tell "skip" from "stop" apart.
+    root = tmp_path / 'root'
+    pkg = root / 'local_nodes'
+    gap = pkg / 'gap'  # namespace package: no __init__.py on purpose
+    leaf = gap / 'leaf'
+    leaf.mkdir(parents=True)
+    (pkg / '__init__.py').write_text('', encoding='utf-8')
+    (pkg / 'requirements.txt').write_text('top\n', encoding='utf-8')
+    (gap / 'requirements.txt').write_text('namespace\n', encoding='utf-8')
+    (leaf / '__init__.py').write_text('', encoding='utf-8')
+    (leaf / 'requirements.txt').write_text('leaf\n', encoding='utf-8')
+
+    res = A.discover([str(leaf / '__init__.py')], {'local_nodes': str(root)})
+    names = {os.path.basename(os.path.dirname(p)) for p in res.requirement_files}
+    assert names == {'leaf', 'local_nodes'}, 'the namespace directory must be skipped, not a stop'
+
+
+@_needs_tree
+def test_the_models_barrel_needs_nothing_beyond_the_baseline_at_import_time():
+    """Why ancestors are harvested and not walked, stated as an assertion.
+
+    ``ai/common/models/__init__.py`` eagerly re-exports every family, so queuing it would drag the
+    whole model universe into every environment that touches one model -- the precise thing Option
+    A removed. Not queuing it is only safe because executing it needs nothing an environment
+    lacks: the heavy imports all sit inside functions, behind ``_ensure_dependencies``. That is a
+    property of the tree, not a promise, so it is measured. If this fails, harvest-only has become
+    an under-inclusion and the barrel has to be made lazy or the rule changed.
+    """
+    import ast
+
+    roots = {'nodes': _NODES_SRC, 'ai': _AI_SRC}
+    start = os.path.join(_AI_SRC, 'ai', 'common', 'models', '__init__.py')
+    seen, queue, third = set(), [start], set()
+    while queue:
+        cur = queue.pop()
+        if cur in seen or not os.path.isfile(cur):
+            continue
+        seen.add(cur)
+        try:
+            tree = ast.parse(open(cur, encoding='utf-8').read())
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in tree.body:  # module level only -- that is what import time executes
+            for stmt in ast.walk(node) if isinstance(node, ast.If) else [node]:
+                if not isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                    continue
+                for mod in A._import_targets(stmt, cur, roots):
+                    top = mod.split('.', 1)[0]
+                    if top in roots:
+                        nxt = A._module_to_file(mod, roots)
+                        if nxt:
+                            queue.append(nxt)
+                    elif top and top not in A._NON_REQUIREMENT_TOPS:
+                        third.add(top)
+
+    # numpy ships in the tree baseline every environment now carries; wave is stdlib; rocketride is
+    # the SDK shipped beside the engine. Anything else would be a package nobody installed.
+    assert third <= {'numpy', 'wave', 'rocketride'}, f'barrel needs {third} at import time'
+
+
+def test_root_matching_prefers_the_longest_base(tmp_path):
+    # With --node_path pointing inside the exe dir, `nodes` and `ai` both map to the exe dir; plain
+    # iteration order would claim a local_nodes file before its own root was considered, and the
+    # walker and _pkg_of would then disagree about which package a file belongs to.
+    exe = tmp_path / 'exe'
+    local_root = exe / 'workspace'
+    pkg = local_root / 'local_nodes' / 'mine'
+    pkg.mkdir(parents=True)
+    (local_root / 'local_nodes' / '__init__.py').write_text('', encoding='utf-8')
+    (pkg / '__init__.py').write_text('', encoding='utf-8')
+    roots = {'nodes': str(exe), 'ai': str(exe), 'local_nodes': str(local_root)}
+
+    assert A._root_of(str(pkg / '__init__.py'), roots) == str(local_root)
+    assert A._pkg_of(str(pkg / '__init__.py'), roots) == 'local_nodes.mine'
 
 
 # --- conflict fixture nodes -------------------------------------------------

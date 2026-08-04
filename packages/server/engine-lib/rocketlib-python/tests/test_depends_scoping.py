@@ -54,28 +54,55 @@ def test_overlay_index_tolerates_mock_path_not_on_sys_path(monkeypatch, tmp_path
     assert D._overlay_index() == 0
 
 
-def _has_node_path(paths):
-    root = os.path.abspath(os.path.join(D._get_executable_dir(), 'nodes'))
-    return any(os.path.abspath(p).startswith(root + os.sep) for p in paths)
+# One predicate no longer expresses the rule: under =1 the node tree contributes exactly one file
+# and no others, so "is it under nodes/" cannot tell the kept case from the dropped one.
+
+
+def _node_root():
+    return os.path.abspath(os.path.join(D._get_executable_dir(), 'nodes'))
+
+
+def _has_tree_baseline(paths):
+    """``<exe>/nodes/requirements.txt`` — the Python-backend floor, kept in every mode."""
+    want = os.path.join(_node_root(), 'requirements.txt')
+    return any(os.path.abspath(p) == want for p in paths)
+
+
+def _has_per_node_file(paths):
+    """A requirement file owned by an individual node, i.e. *below* ``<exe>/nodes/``."""
+    root = _node_root()
+    return any(
+        os.path.abspath(p).startswith(root + os.sep) and os.path.dirname(os.path.abspath(p)) != root for p in paths
+    )
+
+
+def _ships_node_files():
+    """The assertions about the node tree only mean something where one is installed."""
+    return os.path.isdir(_node_root())
 
 
 # The cases below measure the requirement-file glob, not the switch. venv_env freezes the mode
 # at first read, so each one relies on conftest's autouse reset to get one.
 
 
-def test_forced_scoping_drops_node_requirements(monkeypatch):
-    # With scoping forced on, node deps come from each env's scoped install; folding them
-    # into the startup compile would make two conflicting nodes unable to coexist at all.
+def test_forced_scoping_drops_per_node_files_but_keeps_the_tree_baseline(monkeypatch):
+    # Per-node deps come from each env's scoped install; folding them into the startup compile
+    # would make two conflicting nodes unable to coexist at all. The baseline is not a node
+    # dependency -- it is the floor the engine's own Python runs on -- so it stays, and the
+    # positive half is what stops the drop from quietly widening back into it.
     monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', '1')
-    assert not _has_node_path(D._find_requirement_files())
+    found = D._find_requirement_files()
+    assert not _has_per_node_file(found)
+    if _ships_node_files():
+        assert _has_tree_baseline(found)
 
 
 def test_the_glob_does_not_follow_a_mid_process_flip(monkeypatch):
-    # A node flipping the switch must not put nodes/** back into the base compile.
+    # A node flipping the switch must not put the per-node globs back into the base compile.
     monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', '1')
-    assert not _has_node_path(D._find_requirement_files())
+    assert not _has_per_node_file(D._find_requirement_files())
     monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', '0')
-    assert not _has_node_path(D._find_requirement_files())
+    assert not _has_per_node_file(D._find_requirement_files())
 
 
 @pytest.mark.parametrize('value', ['0', None])
@@ -89,8 +116,8 @@ def test_legacy_and_auto_keep_node_requirements(monkeypatch, value):
     V._reset_venv_env_cache()  # without this the frozen set comes back and the case passes vacuously
     assert set(D._find_requirement_files()) <= set(unscoped)
     # Only meaningful while the installation actually ships node requirement files.
-    if os.path.isdir(os.path.join(D._get_executable_dir(), 'nodes')):
-        assert _has_node_path(unscoped)
+    if _ships_node_files():
+        assert _has_per_node_file(unscoped)
 
 
 def test_ai_and_root_requirements_survive_forced_scoping(monkeypatch):
