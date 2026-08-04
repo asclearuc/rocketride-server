@@ -95,10 +95,19 @@ function makeStartTestServerAction(options = {}) {
             // Set ROCKETRIDE_MOCK to enable mock modules for testing
             const mocksPath = path.join(PACKAGE_DIR, 'test', 'mocks');
 
+            // Register the vtest_* conflict fixtures as workspace-local nodes. They live
+            // outside dist/server on purpose, where the startup requirements glob cannot
+            // reach their mutually unsatisfiable pins -- so the server starts normally and
+            // the pins only ever enter a per-environment resolution. The flag is inherited
+            // by the main engine (startup_args) and by venv children, which is what lets
+            // the conflict acceptance in test/venv_runtime/ run under the default `auto` mode.
+            const fixturesPath = path.join(PACKAGE_DIR, 'test', 'fixtures');
+
             const result = await startServer({
                 script: 'ai/eaas.py',
                 trace: options.trace,
                 basePort: 40000,  // Use 40000 range for node tests
+                args: [`--node_path=${fixturesPath}`],
                 env: {
                     ROCKETRIDE_MOCK: mocksPath
                 },

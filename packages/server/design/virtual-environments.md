@@ -795,6 +795,65 @@ variant — so the backstop is a narrow safety net, not the primary mechanism.
   one** dynamic import — `preprocessor_code/code.py`'s `importlib.import_module(modmap[lang_key])`, a
   **static lang→module dict** whose targets the walk can enumerate (or the runtime `depends()` backstop
   covers). Static AST is sound across the tree, modulo that one enumerable case.
+- **A REAL under-inclusion, found in 2A-R and narrower than the claim above reads — the walk never
+  *walks* an ancestor package's `__init__.py`.** Say it that way or the next reader hunts for a bug in
+  the `depends()` detection rule: the rule is fine, the file it would fire on is never opened.
+  `discover()` collects `requirement*.txt` co-located with each **walked** file, and the walk starts at
+  the provider's entry module and follows imports. But Python, executing `import nodes.venv.client`,
+  **must** first run `nodes/__init__.py` and `nodes/venv/__init__.py` — those are not anyone's import,
+  they are what the import machinery itself executes. So the walk never sees them.
+  *Measured against the shipped `ast_deps`:*
+
+  | provider | files the walk returns |
+  | --- | --- |
+  | `venv`, `venv_server`, `remote_server` | **none at all** |
+  | `venv_source_stub` | `ai/requirements.txt` only |
+  | `remote` | `ai/common/requirements.txt` only |
+  | `response`, `webhook` (leaf nodes) | their own `nodes/<node>/requirements.txt` — correct |
+
+  Entry paths are the cause: `nodes.venv.client`, `nodes.venv.server`, `nodes.venv.source`,
+  `nodes.remote.client`, `nodes.remote.server` are **sub-packages**, while `response`/`webhook` are the
+  package itself. §4.8's "zero under-includes" was measured on the `detect`/`audio_transcribe`/
+  `anonymize` prototype — all leaves — so it was never wrong, only narrower than it reads.
+  **Three of the five affected providers are this feature's own bridge nodes.**
+
+  **The gap is two independent halves, and they want different treatments.** Netting out the overlaps
+  matters, because the raw list of missing files overstates it:
+  1. **The tree baseline** — `nodes/requirements.txt` (15 infrastructure packages: `certifi`,
+     `cryptography`, `numpy`, `requests`, `httpx`, `fastapi`, `uvicorn`, `pydantic`, `safetensors`,
+     `Cython`, …) is invisible to **every** provider, leaves included. *Treatment: a declared floor,
+     not a walk rule.* Python **guarantees** `nodes/__init__.py` runs on any node import, so the
+     baseline is needed by every environment **by construction** — declaring that states a fact, while
+     rediscovering it by walk re-derives the same fact and can miss. It does not weaken "if whisper
+     isn't needed it isn't installed": the baseline is needed by all, without exception. **Declare
+     file *paths*, never package names** — a name list in code is a second source of truth that drifts
+     silently the moment someone edits the file.
+  2. **Per-node files behind a sub-package entry** — `nodes/venv/requirements.txt`,
+     `nodes/remote/requirements.txt` (identical: `fastapi`, `nest-asyncio`, `websockets`).
+     *Treatment: fix the walk* — seed ancestor `__init__.py` files **below** the package root, stopping
+     before `nodes/__init__.py`. Hardcoding these two paths would patch the symptom; the next node with
+     a sub-package entry reopens the same hole, and without this record beside it. Netted out, the cost
+     is nearly nothing: `fastapi` is already in the baseline and `websockets` is also in
+     `ai/web/requirements.txt`, leaving **`nest-asyncio` as the only genuinely orphaned package in the
+     tree**.
+
+  **Not a live defect today, and the cushion is measured, not assumed.** `depends()` fires at import and
+  installs into the active overlay at env-resolved versions (§4.9) — late, unlocked and per-process
+  instead of once at compile time, but it arrives. Independently, the startup glob's
+  `nodes/**/requirement*.txt` **does** match `nodes/requirements.txt` (`**` matches zero directories),
+  so the baseline sits in the base runtime under `=0`/`auto`. Both cushions are removed by exactly one
+  thing: residual item 1 ("base = engine runtime only"). That is why the fix belongs there and the
+  choice is handed to it rather than taken here.
+
+  **What it costs when it lands — one-time per environment, not per run.** `plan_install` compares
+  `requirements_hash(...)` against `<env>/requirements.hash` and skips compile+install on a match, so
+  adding the baseline drifts each overlay's hash **once**; the rebuild happens on that environment's
+  next use and the new hash is committed. Two caveats worth carrying: the hash includes `mtime_ns`, so
+  making one shared file part of every environment's set means a future edit to it rebuilds **all**
+  overlays at once instead of none (`syncDir` compares content byte-for-byte and skips unchanged files,
+  so ordinary rebuilds do not disturb the mtime); and the baseline's names are unpinned, so folding
+  `numpy`/`safetensors`/`Cython` into every environment's resolution can surface a compile-time
+  conflict the runtime path tolerated.
 
 **The backstop is not free** — an under-include means a possibly multi-GB `depends()` install happens
 *mid-run* inside the venv child. Specify timing/failure: prefer resolving all reachable variants
@@ -1223,14 +1282,28 @@ missing `project_id`/`env_id` and falls back to a **default env** (or base). Con
   Declarative node
   tests are already mini-pipelines (`nodes/test/framework/pipeline.py`) → run them through the same
   partitioner. **Must land before the first incompatible node ships**, else the suite breaks.
-  **The env key must become stable, too (VERIFIED).** The harness builds `project_id` as
+  **The env key is now stable (2A-R item 3, DONE).** The harness used to build `project_id` as
   `f'test_{node_name}_{uuid4().hex[:8]}'` (`pipeline.py`), a fresh id per build, and `short_id`
-  hashes the *full* id — so under `=1` **every suite run keys a brand-new overlay set and installs
-  from scratch**, and nothing reclaims the old ones (a measured run added 41 directories to an
-  existing 41). Two consequences: per-node test environments need a stable key, not merely a scoped
-  install; and a "warm" timing measured on `nodes:test` is not warm at all — it is a cold install
-  with a warm `uv` download cache, which understates the reuse a real pipeline gets from its stable
-  `project_id`.
+  hashes the *full* id — so under `=1` **every suite run keyed a brand-new overlay set and installed
+  from scratch**, and nothing reclaimed the old ones (a measured run added 41 directories to an
+  existing 41). It is now a digest of the **built document**, computed after the components are
+  assembled. Not a bare `test_{node}`, which is the tempting simplification and is wrong: the task
+  token is `sha256({…, project_id, source})`, so one id per node is one *token* per node, and a
+  second test of that node alive at the same time is refused with `Pipeline is already running.`
+  Per-document keying keeps distinct tests distinct, bounds the directory count, and makes a second
+  suite run warm. A "warm" timing measured on `nodes:test` before this was not warm at all — it was
+  a cold install with a warm `uv` download cache, which understated the reuse a real pipeline gets.
+
+  **The `ROCKETRIDE_VENV_ENV_ID`-per-worker half above describes a harness this one is not
+  (corrected in 2A-R).** Checked against the code rather than carried forward: declarative node
+  tests are **clients** — each task already gets its own engine subprocess with its own overlay, so
+  the isolation the item asks for is largely there; the tests that *do* import node modules in the
+  pytest process **stub** `rocketlib`/`ai`/`pydantic` (`nodes/test/_sys_modules_guard.py`), so they
+  never load a real heavy dependency; and there is **no call site** — a bare `engine.exe -m pytest`
+  never fires the C++ endpoint hook, so an `ENV_ID` handed to a worker would activate nothing. The
+  trigger ("the first node in this tree incompatible with another") remains unfired, and the
+  `vtest_*` fixtures deliberately stay *outside* `nodes/src/nodes` so they cannot fire it. Building
+  the worker machinery now would be building against a model the harness does not have.
 - **The saas model server** (`extension/model_server`, saas repo) is a fourth non-pipeline entry
   point and the one that matters most for §4.9's base shrink: no pipeline, no endpoint, no overlay,
   and it imports `ai.common.torch` at module level, so it loads the whole model stack into base.
@@ -1443,7 +1516,9 @@ elsewhere that carry `environment`.
 2. **AST `ai/**` discovery** — once per init, cached; config-driven-variant + dynamic-import handling;
    runtime `depends()` backstop with defined timing/failure.
 3. **Non-pipeline entry points** — `engtest` fallback (**done**: verified to no-op by construction,
-   §4.14); `builder nodes:test` per-node isolation (**open**).
+   §4.14); `builder nodes:test` per-node isolation (**partly done in 2A-R**: the stable env key
+   landed and the fixture home moved; the `ENV_ID`-per-worker half was re-recorded against the
+   harness's real shape rather than built — §4.14).
    **Trigger, not a reminder: the first node in this tree that is incompatible with another blocks
    on this item.** Until such a node exists nothing breaks, because the suite runs in one
    environment and all nodes are mutually satisfiable; the day one lands, `nodes:test` stops working
@@ -1451,19 +1526,19 @@ elsewhere that carry `environment`.
    **`ROCKETRIDE_VENV_ENV_ID`** (§4.14; the `ROCKETRIDE_VENV_SITE` this item used to name was
    deleted in 8.7A, and an instruction to pin workers with a variable that no longer exists is
    exactly what a handoff prompt would carry forward unchecked).
-   **Staging the `vtest_*` fixtures belongs to this item too, and 8.7A measured what "staging"
-   actually costs — it is two trees, not one.** `dist/server/nodes/` is the startup **glob** root,
-   so pins placed there are seen by dependency resolution; but **providers are registered from
-   `nodes/src/nodes/`**, and fixtures staged only in `dist` fail inside the child with
+   **The `vtest_*` staging problem is RETIRED (2A-R).** It used to belong to this item, and 8.7A
+   measured what "staging" cost — two trees, not one: `dist/server/nodes/` is the startup **glob**
+   root, so pins placed there were seen by dependency resolution, but **providers register from
+   `nodes/src/nodes/`**, and fixtures staged only in `dist` failed inside the child with
    `Component venv_egress--<env>--main input references unknown component id: <node>` — a message
-   naming the bridge rather than the missing provider, which reads as a partitioner defect. The
-   permanent home has to satisfy both roles.
-   *And the reason this item is the sharpest lever on the whole feature:* §8.3's conflict
-   acceptance **passed** in 8.7A, but structurally **only under `=1`** — staging the two fixtures
-   is what makes the acceptance possible, and staging them is what makes `auto`/`=0` refuse to
-   start, `builder test` included. Until the fixtures live somewhere the startup glob does not
-   reach, the headline proof cannot be run under the mode everyone actually uses.
-   Do not build it standalone beforehand: the shape follows from the isolation work.
+   naming the bridge rather than the missing provider. The fixtures now live in
+   `nodes/test/fixtures/local_nodes/` and are reached through `--node_path=`, so **nothing is
+   staged** (§8.2). That message survives with a new meaning: it is what a **venv child** that did
+   not inherit `--node_path=` prints, which is how item 5 below was measured.
+   *This was the sharpest lever on the whole feature, and it is now pulled:* §8.3's conflict
+   acceptance passed in 8.7A but structurally **only under `=1`**, because staging was what made it
+   possible and what made `auto`/`=0` refuse to start. It now runs under `auto` inside
+   `builder test`.
    *Payoff (opt-in, per §4.15):* when the scoped path is enabled (`ROCKETRIDE_SERVER_USE_VENV=1`, or
    auto with an isolated group present), the pipeline runs in a node-scoped "main" env → faster/smaller,
    no gliner/whisper bloat. **If no venv is needed** — the pipeline contains no isolated groups and the
@@ -1498,16 +1573,60 @@ Do 2B (partitioner cut → spawn → orchestrator) first.
 so the group is addressable; the working handoff is
 `packages/server/design/NEXT-STEP-2A-R-prompt.md` (untracked, like every `NEXT-STEP-*` sibling).
 Five items: **base = engine runtime only** (§4.9 residual); **AST within-family over-inclusion**
-(§4.8 residual); **`builder nodes:test` per-node isolation** (open, with the trigger stated above);
-**a permanent home for the `vtest_*` fixtures** where the startup glob does not reach; and
-**`--node_path=` inheritance for venv children** (recorded, not fixed).
-**They were deferred together rather than picked off**, because items 3 and 4 are mutually
-entangled and 4 depends on the unfixed defect in 5 — half of that pair is worse than neither.
-*Item 4 is the sharpest lever in the whole feature:* staging the two fixtures is what makes
-§8.3's conflict acceptance possible, and staging them is what makes `auto`/`=0` refuse to start
-(their pins join the startup glob and `ensure_constraints()` fails at import, in every process,
-`builder test` included). So the headline proof of the feature is **structurally `=1`-only**
-until the fixtures move.
+(§4.8 residual); **`builder nodes:test` per-node isolation**; **a permanent home for the `vtest_*`
+fixtures** where the startup glob does not reach; and **`--node_path=` inheritance for venv
+children**. They were deferred together rather than picked off, because 3 and 4 are mutually
+entangled and 4 depends on 5.
+
+**Items 4 and 5 are DONE; item 3 is partly done. Items 1 and 2 remain deferred decisions.**
+
+- **4 — the home is `local_nodes` under `--node_path=`** (§8.2). Nothing is staged anywhere; the
+  §8.3 acceptance now runs under `auto` inside `builder test`, which is the lever this item
+  existed to pull.
+- **5 — the venv child inherits `--node_path=`**, via one prefix-parameterized helper
+  (`_effective_engine_arg`) that serves `--trace=` too, since writing inheritance per-flag is
+  exactly how the child drifted from main. **The entanglement with 4 is measured, not argued:**
+  with the inheritance reverted, the run dies naming the bridge —
+  `venv "v1" (v1) failed to start: venv child exited during startup with code 1` /
+  `Component venv_egress--v1--main input references unknown component id: alpha_1`
+  (`InvalidParam`, `pipeline_config.cpp:212`). Restored → passes.
+- **3 — the stable env key landed** (§4.14); the `ENV_ID`-per-worker half was re-recorded against
+  the harness's actual shape instead of built, and its trigger is still unfired.
+
+**What is NOT done, stated separately so the group is not read as closed.**
+
+- **1 — base = engine runtime only.** Still a deferred decision, and it has **grown a second
+  question**: the ancestor-`__init__` under-inclusion below is its premise, so item 1 now also owns
+  *how* the tree baseline reaches each environment (§4.8: a declared floor of file paths, plus a narrow
+  walk fix for sub-package entries).
+- **2 — AST within-family over-inclusion.** Unchanged deferred decision (§4.8, Options 1/2).
+- **3's other half — `ENV_ID` per test worker.** Deliberately not built: declarative node tests are
+  *clients* (the engine subprocess per task already has its own overlay), the in-process ones stub
+  `rocketlib`/`ai`/`pydantic`, and a bare `engine.exe -m pytest` never fires the C++ endpoint hook, so
+  an `ENV_ID` handed to a worker would activate nothing. The trigger — "the first node in the tree
+  incompatible with another" — remains unfired.
+- **`BaseLoader._dependencies_loaded`** — the sibling prerequisite to the stable key, still a
+  class-level bool. Untouched and *unexercised*: nothing in 2A-R put two environments in one
+  interpreter.
+- **Overlay churn is reduced, not eliminated** — 41 fresh directories per `=1` run became 4, all from
+  two hand-rolled documents outside the harness (§7 prerequisites).
+
+**Found while doing 2A-R; neither belongs to items 3/4/5.** The first is recorded where its
+consequences land rather than fixed in passing; the second had to be fixed here, because the work
+could not be verified otherwise:
+
+- **The AST walk never walks an ancestor `__init__.py`** — a real under-inclusion, three of whose five
+  affected providers are this feature's own bridge nodes. Full measurement, the two-half treatment and
+  its one-time cost are in **§4.8**; the choice is handed to residual item 1, whose premise it is.
+- **`nodes/test/venv/` was never collected by pytest** — the default `norecursedirs` contains `venv`,
+  so 67 tests had never run inside `builder nodes:test`. Fixed here by renaming to `venv_runtime`
+  (§8.3), because the new acceptance would otherwise have joined them.
+
+*Two traps measured while doing this, both worth carrying forward.* The `local_nodes` mechanism had
+**zero in-repo users and zero tests** (four files mentioned it: the doc and three C++ sites; landed
+2026-07-01, `96e5131d`), so a step-0 smoke check ran first, before a single file moved. And in dev
+mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — an A/B that edits the
+`dist` copy silently measures nothing and comes back green; verify by the child's command line.
 
 **Phase 2B — Venv runtime (the isolation feature), on top of 2A.**
 4. **Schema + UI — DONE except the creation entry.** The Virtual Environment container as a canvas
@@ -1758,10 +1877,13 @@ until the fixtures move.
    since engines from earlier runs linger and answer the same query: 3 of 3 carried the flag.
    *Adjacent defect, recorded not fixed:* the main-engine spawn inherits **two** flags from
    `startup_args()`, `--trace=` and `--node_path=`; the child spawn inherited neither. 8.4 fixes
-   `--trace=` because its own promise depends on it. `--node_path=` is the same root: a developer
-   pointing the engine at workspace-local nodes gets them resolved in main and **not** in any venv
-   child, so a pipeline that runs flat fails once a group is isolated, naming a provider the child
-   cannot find. Whoever hits that will otherwise debug the partitioner.
+   `--trace=` because its own promise depends on it. `--node_path=` was the same root and is **FIXED in 2A-R**: both
+   now come from one prefix-parameterized helper, `_effective_engine_arg`. Before the fix a
+   developer pointing the engine at workspace-local nodes got them resolved in main and **not** in
+   any venv child, so a pipeline that ran flat failed once a group was isolated -- and the message
+   named the bridge, not the provider (`Component venv_egress--v1--main input references unknown
+   component id: alpha_1`), which is why it read as a partitioner defect. That exact A/B is now the
+   measurement behind §7 item 5.
    *Increment 8.4B — **DONE, live-verified**: metrics.* `TaskMetrics` samples the main PID and its
    *recursive descendants*; venv children are spawned by the server, so they are **siblings** and
    the walk never reached them. `register_extra_pid(env_id, pid)` adds each child and its own
@@ -1997,8 +2119,19 @@ until the fixtures move.
     `processed` now per environment it becomes the *binding* constraint: it short-circuits before
     `depends()` is even called, so a model loader that ran in env A contributes nothing to env B's
     overlay. Convert it to a set of env keys.
-  - Per-node test environments need a **stable** env key — today's harness id is regenerated per run
-    (§4.14).
+  - ~~Per-node test environments need a **stable** env key~~ — **DONE in 2A-R**: the harness now
+    keys `project_id` by a digest of the built document (§4.14). The sibling above is **not** done,
+    and the pair must not be struck together: nothing in 2A-R put two environments in one
+    interpreter, so `_dependencies_loaded` was never exercised and stays exactly as it was.
+    *Measured, and the number is not zero.* `nodes:test` twice under `=1`, diffing
+    `dist/server/venvs/`: the first run added **19**, the second **4** — against a pre-change
+    measurement of 41 fresh directories on every single run. The residual 4 are not harness
+    documents: `test_lifecycle_order.py:110` mints `str(uuid.uuid4())` and
+    `tool_filesystem/test_live_anchor.py:56` a per-process `_RUN_ID` that also names its
+    workspace directory. Both do it deliberately, to dodge the resident-task token collision the
+    §8.3 acceptance solves instead with `use_existing=True` + `terminate()`. Converting them
+    would trade 4 directories for a risk of destabilising two live tests that pass today, so they
+    are left alone and counted here rather than silently absorbed into "0".
 - **Tests (§8) — all four DONE except GC, which is 2C:** partitioner **unit tests** (39, step 8.3);
   the **two-venv conflict-coexists** acceptance (`vtest_alpha`/`vtest_beta` split across venvs —
   **run for the first time in 8.7A**, both pins imported, each from its own overlay, none in main);
@@ -2074,9 +2207,8 @@ Three layers; each test is tagged with the phase that first makes it runnable (*
   and the §4.6 golden authoring→sub-docs example. [2B]
 
 ### 8.2 Test-fixture nodes (purpose-built, lightweight, decoupled from `ai/**`)
-Add a pair of **trivial pure-Python nodes** under the node-test tree (e.g.
-`nodes/test/fixtures/nodes/vtest_alpha`, `.../vtest_beta` — the extra `nodes/` mirrors the prod
-`nodes/src/nodes/` layout so `ProviderIndex` resolves them by the same rule). Each imports **only one tiny leaf package pinned to an
+A pair of **trivial pure-Python nodes** under the node-test tree at
+`nodes/test/fixtures/local_nodes/vtest_alpha`, `.../vtest_beta`. Each imports **only one tiny leaf package pinned to an
 exact, mutually-incompatible version** — e.g. `vtest_alpha` → `tabulate==0.8.10`, `vtest_beta` →
 `tabulate==0.9.0`. Pick a package **not used by the SDK or engine runtime** (`requests` would be a bad
 choice — the SDK depends on it, so the pin would collide with runtime deps and muddy the test).
@@ -2084,12 +2216,38 @@ choice — the SDK depends on it, so the pin would collide with runtime deps and
 and the conflict is isolated to the venv-scoping mechanism — fast, deterministic, no GPU/torch. These
 **replace `torch 2.0/2.1`** as the conflict fixture. [created 2A; used by 8.3]
 
-**Not staged by any build step (gap).** The fixtures are read straight from the source tree by the
-automated acceptance — `rocketlib-python/tests/test_scoping_acceptance.py`, which points `ast_deps`
-at `nodes/test/fixtures` and is gated on the engine interpreter, on `uv` being bootstrapped, and
-skipped when offline — but nothing copies them into `dist/server/nodes`, so no *pipeline* can
-reference them without a manual copy and `nodes:test` does not exercise them at all. Staging them
-is the prerequisite for the end-to-end acceptance in §8.3.
+**Home: `local_nodes` under `--node_path=` (2A-R item 4, DONE).** The directory is named
+`local_nodes` because that is the fixed name the engine scans: `--node_path=<dir>` puts `<dir>` on
+`sys.path` and registers `<dir>/local_nodes/**` as providers imported `local_nodes.<node>`
+(`python/init.cpp:160`, `services.cpp:1988`, user-facing in `docs/README-nodes.md`). §7 demanded a
+home satisfying **both roles** — pins visible to dependency resolution *and* providers registered.
+This satisfies both while **splitting the first role away from the startup glob**, and that split is
+the point rather than a dodge: the startup compile is installation-wide behind one base hash
+(§4.15), so *any* home the glob reaches makes two mutually unsatisfiable pins break every process in
+every mode. So the roles are three — providers **are** registered; the glob **cannot** reach the
+directory (it lives outside `dist/server`); and the **scoped resolver** reaches it because
+`ast_deps` takes a second provider root (`ProviderIndex(nodes_src, local_root=...)`), fed from
+`--node_path=` via `ast_deps.local_nodes_root(engLib.args())` in `depends.ensure_env_scoped`.
+Dependency resolution still sees the pins — the *per-environment* resolution, which is the only one
+that should ever have seen them. **No staging into `dist/server/nodes` or `nodes/src/nodes` at all**;
+`nodes:test` starts its server with `--node_path` pointed at `nodes/test/fixtures`, and that one
+flag is what makes the §8.3 acceptance runnable under the default mode.
+
+**Two properties of the fixtures that follow from the home, both deliberate.**
+The `__init__.py` files **do not call `depends()`**, unlike the local-node convention
+`README-nodes.md` documents: with one, the pin would arrive through the runtime backstop and §8.3
+would be proving the backstop rather than per-environment scoping. The consequence, which is a
+usage constraint rather than an accident: **their pins are installed only when scoping is active**
+— a document with an isolated group, or `=1`. Dropping one into a plain `auto` pipeline yields a
+`ModuleNotFoundError`, not a pin. (This is exactly why the step-0 smoke check for `local_nodes` used
+a throwaway node with no third-party import: run on `vtest_alpha` it would have died on
+`import tabulate` — *proving the mechanism worked*, since the module was found and executed — while
+reading as "`local_nodes` is broken".)
+
+*Superseded, kept because each was load-bearing somewhere:* "the extra `nodes/` mirrors the prod
+`nodes/src/nodes/` layout so `ProviderIndex` resolves them by the same rule" — the rule is now the
+`local_nodes` one; "**Not staged by any build step (gap)** … staging them is the prerequisite for
+the end-to-end acceptance in §8.3" — there is nothing to stage, and the acceptance is automated.
 
 **Both fixtures now report what they imported (8.7A).** Each appends
 `<name>=<version>@<file>` to the text it forwards, folded into the **same** text lane it already
@@ -2099,10 +2257,13 @@ already-imported `tabulate` are used deliberately — adding any *import* would 
 `requirement*.txt` into the discovery walk and turn `test_scoping_acceptance.py`'s
 "exactly one requirements file" assertion red for a reason that looks unrelated.
 
-**Manual staging measured (8.7A): it is two trees, not one.** `dist/server/nodes/` is the startup
-glob root, but **providers register from `nodes/src/nodes/`** — copied only into `dist`, the run
-dies inside the child with `input references unknown component id: <node>`. Copy into both, and
-remove afterwards: `nodes/src` is a committed tree.
+**Manual staging measured (8.7A): it was two trees, not one — and 2A-R retired the whole problem.**
+`dist/server/nodes/` is the startup glob root, but **providers register from `nodes/src/nodes/`** —
+copied only into `dist`, the run died inside the child with
+`input references unknown component id: <node>`. That message is still worth knowing: the
+`local_nodes` home reproduces it exactly when a **venv child** does not inherit `--node_path=`, so
+it now reads "a process is missing the flag" rather than "the partitioner is broken" (§7 item 5,
+measured).
 
 ### 8.3 Integration / acceptance
 
@@ -2133,11 +2294,64 @@ remove afterwards: `nodes/src` is a committed tree.
   distributions rather than one reported twice. Each overlay holds its own pin and not the other,
   and — the assertion that proves scoping rather than mere separation — **`main/site-packages`
   holds no `tabulate` at all**.
-  **Structurally `=1`-only, and that is the standing limit, not an oversight.** Staging the two
-  fixtures is what makes this acceptance possible, and staging them is what makes `auto`/`=0`
-  refuse to start (their pins join the startup glob and `ensure_constraints()` fails at import, in
-  every process). Re-running it under the default mode needs the fixtures to live where the glob
-  does not reach — §7 phase 2A. [2B → done]
+  **The `=1`-only limit is DISCHARGED (2A-R), and the acceptance is now automated under `auto`.**
+  It used to be structural: staging the two fixtures was what made this acceptance possible, and
+  staging them was what made `auto`/`=0` refuse to start (their pins joined the startup glob and
+  `ensure_constraints()` failed at import, in every process, `builder test` included). The fixtures
+  now live in `nodes/test/fixtures/local_nodes/`, which the glob cannot reach (§8.2), so nothing is
+  staged and every mode starts normally.
+  *Measured under `auto`, with no staging anywhere:*
+  `alpha=0.8.10@…/venvs/<proj>/v1/site-packages/tabulate.py` and
+  `beta=0.9.0@…/venvs/<proj>/v2/site-packages/tabulate/__init__.py`, `main/site-packages` holding
+  no `tabulate` at all. It runs in `builder test` as
+  `nodes/test/venv_runtime/test_venv_conflict_e2e.py` — the **first check in the gate that spawns
+  a venv child at all**, where before this the whole venv runtime was covered by nothing but
+  hand-run drivers. [2B → done, then 2A-R]
+
+  **A latent collection bug had to be fixed for that sentence to be true, and it had been
+  swallowing 67 other tests since the venv work began.** The directory was `nodes/test/venv/`,
+  and **pytest's default `norecursedirs` contains `venv`** — the conventional name of a Python
+  virtualenv. Directory recursion therefore never entered it, while naming it explicitly
+  (`pytest nodes/test/venv`) collected it fine, which is why nobody noticed: every targeted run
+  worked. Measured: `pytest nodes/test` collected **2835** with the old name and **2903** after
+  renaming to `nodes/test/venv_runtime/` — exactly the 68 files' worth of tests, of which 67
+  predate 2A-R and had never once run inside `builder nodes:test`. The repository already knew
+  this name was a trap in the *other* tool — `.gitignore` carries an explicit
+  `!nodes/test/venv/` un-ignore because `venv/` is ignored there too — so the same collision was
+  sitting in two toolchains and had been noticed in only one. Renaming was preferred over
+  overriding `norecursedirs`: dropping `venv` from that list globally would make pytest descend
+  into a developer's real virtualenv, and `.gitignore` shows they do create them.
+
+  **Three more findings, none of which a targeted run could produce.** The acceptance passed
+  standalone and errored inside `nodes:test`, which is the shape of every expensive bug in this
+  feature. Two were defects and are fixed; the third is a measured limit and is left standing.
+  1. *A stubbed `depends` in the worker.* Node tests stub `depends` (nodes do
+     `from depends import depends`), and under xdist this test shares a worker with them, so
+     `sys.modules['depends']` was already a `MagicMock`. `_uv_available()` then returned a truthy
+     mock — the skip never fired — `_uv_abs_path()` returned a mock, and `subprocess.run` handed
+     it to `CreateProcess`, which reported `FileNotFoundError: [WinError 2]`: a message pointing
+     at uv rather than at the stub. The test now loads `venv_env`/`depends` **from their files**
+     via `importlib.util.spec_from_file_location`, bypassing `sys.modules` entirely, and asserts
+     `_uv_abs_path()` is a real `str` before using it.
+  2. *A fixed `project_id` is a fixed token.* The acceptance keys a stable project id so its three
+     overlays are reused across gate runs — but the task token is `sha256({…, project_id, source})`
+     and `ttl=0` leaves the task resident, so the **second** run was refused with
+     `Pipeline is already running.` (§4.10's rake 3, arriving from a direction the plan had only
+     considered for concurrency). Fixed by `use_existing=True` plus a `terminate()` in `finally`,
+     which keeps warm overlays without leaving a task behind. Verified by running it twice
+     back-to-back.
+
+  3. *It flaked once, and only where the plan predicted.* Under **`=1` on a cold box** — the
+     first full `=1` suite, where 8 xdist workers compile and install overlays at once — the run
+     died with `No subprocess events received for 300 seconds. Task stuck in state 2
+     (INITIALIZING)`: CPU starvation, not a scoping defect. The warm re-run passed (748 s → 325 s
+     wall). Under **`auto`**, which is what `builder test` uses and where no other test creates an
+     overlay, it has now passed **four** times: two full gate runs and two standalone
+     `nodes:test`. Left as a hard failure rather than softened into a skip, deliberately: a venv
+     child that genuinely failed to start would produce this exact message, so a skip on it would
+     hide the feature breaking. The per-test budget the plan imagined does not exist —
+     `CONST_MAX_READY_TIME` (`ai/constants.py:51`) is one global constant with no override hook,
+     and raising it would delay stuck-task detection for every real user to buy a test result.
 - **Only-needed-installed (scoping).** (a) A pipeline using `vtest_alpha` only → its env has
   `tabulate==0.8.10`, **not** the other pin and **not** `whisper`/`faster-whisper`/`torch`. (b) A
   **no-audio** pipeline → `whisper`/`faster-whisper` **absent** from every env's install set; an audio
@@ -2174,14 +2388,26 @@ remove afterwards: `nodes/src` is a committed tree.
     executable directory (uv splits the value on whitespace, #1256), which cannot be expressed
     across drives — a `tmp_path` on another volume fails with `path is on mount 'C:'`.
 
-  **Still owed — the end-to-end level**, blocked on the `vtest_*` fixtures not being staged into
-  `dist/server/nodes` by any build step (and so not exercised by `nodes:test` either). Procedure
-  once staged: (1) run a `vtest_beta` pipeline under `=0`, which puts `tabulate==0.9.0` into base
-  *by legacy design* rather than by an ad-hoc `uv` call; (2) run a `vtest_alpha`-only pipeline under
-  `=1`; (3) assert the node reports `tabulate.__version__ == 0.8.10` and a `__file__` under
-  `venvs/<proj>/main/site-packages`, and that base still holds `0.9.0`. Step 3 needs the fixture to
-  emit the version and path it imported — today it forwards text unchanged, so nothing observable
-  crosses the boundary. [2A]
+  **The end-to-end level is DONE (2A-R) — and its written recipe had to be replaced, not just
+  unblocked.** The stated blocker was the fixtures not being staged into `dist/server/nodes`; the
+  `local_nodes` home removes it. But the recipe beside it does not survive the move, for two
+  independent reasons, and following it would have produced a green result that measured nothing.
+  It said: "(1) run a `vtest_beta` pipeline under `=0`, which puts `tabulate==0.9.0` into base *by
+  legacy design* rather than by an ad-hoc `uv` call". That worked only while the fixtures sat where
+  the startup glob reached them — in `local_nodes` the glob reaches them in no mode, so step 1
+  installs nothing. And independently: **the base runtime holds no `tabulate` at all** (measured),
+  so the check would have compared base against nothing.
+  *Replacement, automated in the same run as the conflict acceptance:* a fixture installs
+  `tabulate==0.8.9` into **base** and removes it in `finally`. A **third** version on purpose —
+  were base to hold `0.8.10`, an overlay that silently fell through to base would still report
+  `0.8.10` and the assertion would pass while measuring nothing, the "green test that stopped
+  measuring" failure this feature has already produced once. Four assertions: alpha reports
+  `0.8.10` from v1's overlay, beta `0.9.0` from v2's, main's overlay holds no `tabulate`, and
+  **base still holds `0.8.9`** — nothing wrote through.
+  *Residual, stated rather than buried:* the test **mutates the base runtime**, which a suite
+  should be reluctant to do. It is acceptable here for a specific reason and not in general —
+  §8.2 chose `tabulate` because nothing in the SDK or engine runtime uses it, so even a leaked
+  leftover is an unused pure-Python package at a version nothing pins. [2A → done]
 - **Lifecycle.** Purge, delete-with-nodes, and pipeline-delete reclaim the right `venvs/...` dirs and are
   **blocked while a run is active**. Image lanes cross a venv boundary (all-lane bridge). [2B]
 - **Partitioner — VERIFIED on a live engine, not just in unit tests.** A container document driven
@@ -2238,8 +2464,9 @@ remove afterwards: `nodes/src` is a committed tree.
 - `packages/ai/src/ai/modules/data/data_conn.py` — canonical lane serialization to reuse in the bridge.
 - **Testing:** `nodes/test/framework/pipeline.py` (declarative node tests are mini-pipelines → run
   through the same partitioner); `builder nodes:test` (per-node isolation); `server:run-engtest`
-  (embedding invariant). New: `nodes/test/fixtures/nodes/vtest_alpha`/`vtest_beta` (the conflict fixture,
-  §8.2). **Implemented (2A increment 1):** `.../rocketlib-python/lib/ast_deps.py` (provider→module
+  (embedding invariant). `nodes/test/fixtures/local_nodes/vtest_alpha`/`vtest_beta` (the conflict fixture, §8.2 --
+  reached via `--node_path=`, never staged); `nodes/test/venv_runtime/test_venv_conflict_e2e.py` (the §8.3
+  acceptance, automated in `nodes:test`). **Implemented (2A increment 1):** `.../rocketlib-python/lib/ast_deps.py` (provider→module
   resolution + transitive AST walk) with `test_ast_deps.py` — the §4.8 prototype is now a passing unit
   test (13 tests green).
 - `packages/server/engine-lib/rocketlib-python/lib/depends.py` — `ensure_constraints` /

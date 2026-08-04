@@ -55,8 +55,10 @@ from typing import Iterable, Optional
 _ENTRY_BASENAMES = ('__init__.py', 'IGlobal.py', 'IInstance.py', 'IEndpoint.py')
 
 # First-party import roots we recurse INTO; anything else is a third-party leaf we
-# record (torch, rfdetr, ...) but never follow.
-_FIRST_PARTY = ('nodes', 'ai')
+# record (torch, rfdetr, ...) but never follow. Documentation only -- the live set is the
+# `roots` dict each walk is handed, which additionally carries `local_nodes` when the
+# engine was started with `--node_path=`.
+_FIRST_PARTY = ('nodes', 'ai', 'local_nodes')
 
 # Stdlib / framework tops that are never pip requirements — pruned from third-party.
 _NON_REQUIREMENT_TOPS = frozenset(
@@ -218,35 +220,47 @@ class ProviderIndex:
     nodes with no ``path``.
     """
 
-    def __init__(self, nodes_src: str):
-        """Build the index by scanning every ``services*.json`` under ``nodes_src``.
+    def __init__(self, nodes_src: str, local_root: Optional[str] = None):
+        """Build the index by scanning every ``services*.json`` under the node roots.
 
         Args:
             nodes_src: The ``nodes`` package source root (its child ``nodes/`` holds
                 the node packages), e.g. ``.../nodes/src``.
+            local_root: Optional ``--node_path=<dir>`` value, whose child ``local_nodes/``
+                holds workspace-local node packages imported as ``local_nodes.<node>``.
+                Named ``local_root`` and not ``node_path`` on purpose: in this module
+                ``NodeEntry.node_path`` already means the dotted module path.
         """
         self._nodes_src = os.path.abspath(nodes_src)
+        # Top-level package name -> the directory that CONTAINS it. Insertion order is the
+        # scan order, and built-in `nodes` goes first so a name collision resolves to the
+        # shipped node -- the same precedence the C++ loader has (services.cpp scans the
+        # built-in root before local_nodes).
+        self._roots: dict[str, str] = {'nodes': self._nodes_src}
+        if local_root:
+            self._roots['local_nodes'] = os.path.abspath(local_root)
         # logicalType -> node_path ('nodes.webhook') or None for native nodes.
         self._by_provider: dict[str, Optional[str]] = {}
         self._scan()
 
     def _scan(self) -> None:
-        pattern = os.path.join(self._nodes_src, 'nodes', '**', 'services*.json')
-        for path in glob(pattern, recursive=True):
-            try:
-                with open(path, 'r', encoding='utf-8') as fh:
-                    data = json.loads(strip_jsonc(fh.read()))
-            except (OSError, ValueError):
-                continue
-            protocol = data.get('protocol')
-            if not isinstance(protocol, str):
-                continue
-            logical = protocol.split('://', 1)[0].rstrip(':')
-            if not logical:
-                continue
-            node_path = data.get('path')
-            # First definition wins; multiple services*.json may share one dir.
-            self._by_provider.setdefault(logical, node_path if isinstance(node_path, str) else None)
+        for top, base in self._roots.items():
+            pattern = os.path.join(base, top, '**', 'services*.json')
+            for path in glob(pattern, recursive=True):
+                try:
+                    with open(path, 'r', encoding='utf-8') as fh:
+                        data = json.loads(strip_jsonc(fh.read()))
+                except (OSError, ValueError):
+                    continue
+                protocol = data.get('protocol')
+                if not isinstance(protocol, str):
+                    continue
+                logical = protocol.split('://', 1)[0].rstrip(':')
+                if not logical:
+                    continue
+                node_path = data.get('path')
+                # First definition wins; multiple services*.json may share one dir.
+                self._by_provider.setdefault(logical, node_path if isinstance(node_path, str) else None)
 
     def known(self) -> list[str]:
         """Return all provider (logical-type) strings the index resolved."""
@@ -267,7 +281,11 @@ class ProviderIndex:
         node_path = self._by_provider[provider]
         if not node_path:
             return NodeEntry(provider=provider, node_path=None, entry_files=[], native=True)
-        pkg_dir = os.path.join(self._nodes_src, *node_path.split('.'))
+        # The dotted path names its own root: `nodes.webhook` resolves under nodes_src,
+        # `local_nodes.my_node` under the --node_path dir. Unknown tops fall back to
+        # nodes_src so no existing resolution changes.
+        base = self._roots.get(node_path.split('.', 1)[0], self._nodes_src)
+        pkg_dir = os.path.join(base, *node_path.split('.'))
         entry_files = [
             os.path.join(pkg_dir, base) for base in _ENTRY_BASENAMES if os.path.isfile(os.path.join(pkg_dir, base))
         ]
@@ -427,13 +445,35 @@ def discover(entry_files: Iterable[str], roots: dict[str, str]) -> DiscoveryResu
     )
 
 
-def discover_for_providers(providers: Iterable[str], nodes_src: str, ai_src: str) -> DiscoveryResult:
+def local_nodes_root(argv: Iterable[str]) -> Optional[str]:
+    """The ``--node_path=`` directory from an engine argv, when it holds ``local_nodes/``.
+
+    Mirrors the C++ condition rather than approximating it: ``services.cpp`` and
+    ``python/init.cpp`` both act only when ``<dir>/local_nodes`` exists and is a directory,
+    so a bare ``--node_path`` pointing somewhere else contributes no providers here either.
+    Takes the **first** match, like the main-engine spawn's inheritance loop.
+
+    Pure and argv-in so the module stays stdlib-only and testable without an engine.
+    """
+    for arg in argv or ():
+        if isinstance(arg, str) and arg.startswith('--node_path='):
+            value = arg[len('--node_path=') :].strip()
+            if value and os.path.isdir(os.path.join(value, 'local_nodes')):
+                return value
+            return None
+    return None
+
+
+def discover_for_providers(
+    providers: Iterable[str], nodes_src: str, ai_src: str, local_root: Optional[str] = None
+) -> DiscoveryResult:
     """High-level: resolve providers and walk their combined dependency graph.
 
     Args:
         providers: The set of node ``provider`` strings used by one environment.
         nodes_src: ``nodes`` package source root (e.g. ``.../nodes/src``).
         ai_src: ``ai`` package source root (e.g. ``.../packages/ai/src``).
+        local_root: Optional ``--node_path=<dir>`` holding ``local_nodes/``.
 
     Returns:
         A merged ``DiscoveryResult`` for the whole environment. Providers unknown
@@ -444,8 +484,12 @@ def discover_for_providers(providers: Iterable[str], nodes_src: str, ai_src: str
     OpenAI or several Frame Grabber nodes) are collapsed up front, so each provider
     is resolved and walked exactly once.
     """
-    index = ProviderIndex(nodes_src)
+    index = ProviderIndex(nodes_src, local_root)
     roots = {'nodes': os.path.abspath(nodes_src), 'ai': os.path.abspath(ai_src)}
+    if local_root:
+        # First-party too, so a local node importing another local node is followed like
+        # any other in-tree import rather than recorded as a third-party leaf.
+        roots['local_nodes'] = os.path.abspath(local_root)
     seeds: list[str] = []
     unresolved: list[str] = []
     for provider in dict.fromkeys(providers):  # unique, first-seen order
