@@ -2373,7 +2373,7 @@ measured).
   process count was **3** — server, driver, main engine — where two children would have made it 5.
   So the isolated groups were **demoted, not errored**: the permanent opt-out works on exactly the
   documents it exists for (§4.15).
-- **A node's own pin beats the base — AUTOMATED at two levels, end-to-end still owed.** The other
+- **A node's own pin beats the base — AUTOMATED at all three levels (end-to-end closed in 2A-R).** The other
   cases prove two nodes conflict *with each other*; this one proves a node gets **its** version
   whatever base holds. `tests/test_scoping_acceptance.py` (engine interpreter, real `uv`; skips
   rather than fails when the index is unreachable):
