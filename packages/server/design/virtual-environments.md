@@ -795,9 +795,10 @@ variant — so the backstop is a narrow safety net, not the primary mechanism.
   one** dynamic import — `preprocessor_code/code.py`'s `importlib.import_module(modmap[lang_key])`, a
   **static lang→module dict** whose targets the walk can enumerate (or the runtime `depends()` backstop
   covers). Static AST is sound across the tree, modulo that one enumerable case.
-- **A REAL under-inclusion, found in 2A-R and narrower than the claim above reads — the walk never
-  *walks* an ancestor package's `__init__.py`.** Say it that way or the next reader hunts for a bug in
-  the `depends()` detection rule: the rule is fine, the file it would fire on is never opened.
+- **A REAL under-inclusion, found in 2A-R and CLOSED by item 1 — the walk never *walked* an ancestor
+  package's `__init__.py`.** Kept in full because the shape of the miss is the argument for the rule
+  that replaced it. Say it that way or the next reader hunts for a bug in
+  the `depends()` detection rule: the rule is fine, the file it would fire on was never opened.
   `discover()` collects `requirement*.txt` co-located with each **walked** file, and the walk starts at
   the provider's entry module and follows imports. But Python, executing `import nodes.venv.client`,
   **must** first run `nodes/__init__.py` and `nodes/venv/__init__.py` — those are not anyone's import,
@@ -817,43 +818,72 @@ variant — so the backstop is a narrow safety net, not the primary mechanism.
   `anonymize` prototype — all leaves — so it was never wrong, only narrower than it reads.
   **Three of the five affected providers are this feature's own bridge nodes.**
 
-  **The gap is two independent halves, and they want different treatments.** Netting out the overlaps
-  matters, because the raw list of missing files overstates it:
-  1. **The tree baseline** — `nodes/requirements.txt` (15 infrastructure packages: `certifi`,
-     `cryptography`, `numpy`, `requests`, `httpx`, `fastapi`, `uvicorn`, `pydantic`, `safetensors`,
-     `Cython`, …) is invisible to **every** provider, leaves included. *Treatment: a declared floor,
-     not a walk rule.* Python **guarantees** `nodes/__init__.py` runs on any node import, so the
-     baseline is needed by every environment **by construction** — declaring that states a fact, while
-     rediscovering it by walk re-derives the same fact and can miss. It does not weaken "if whisper
-     isn't needed it isn't installed": the baseline is needed by all, without exception. **Declare
-     file *paths*, never package names** — a name list in code is a second source of truth that drifts
-     silently the moment someone edits the file.
-  2. **Per-node files behind a sub-package entry** — `nodes/venv/requirements.txt`,
-     `nodes/remote/requirements.txt` (identical: `fastapi`, `nest-asyncio`, `websockets`).
-     *Treatment: fix the walk* — seed ancestor `__init__.py` files **below** the package root, stopping
-     before `nodes/__init__.py`. Hardcoding these two paths would patch the symptom; the next node with
-     a sub-package entry reopens the same hole, and without this record beside it. Netted out, the cost
-     is nearly nothing: `fastapi` is already in the baseline and `websockets` is also in
-     `ai/web/requirements.txt`, leaving **`nest-asyncio` as the only genuinely orphaned package in the
-     tree**.
+  **The hole is wider than `nodes/`, which the first measurement missed.** The same fact holds for
+  every root: Python runs `ai/__init__.py` before any `ai.*` module and `ai/common/__init__.py`
+  before any `ai.common.*` one, and each installs its own co-located file. Swept over all
+  python-backed providers, the files never reaching an environment were `nodes/requirements.txt`
+  (all of them), `ai/requirements.txt` (105), `ai/common/requirements.txt` (17),
+  `ai/web/requirements.txt` (15), plus the two sub-package files above. The `ai` side was invisible
+  only because `ai/**` stays in the base compile — the very cushion residual item 1 removes.
 
-  **Not a live defect today, and the cushion is measured, not assumed.** `depends()` fires at import and
-  installs into the active overlay at env-resolved versions (§4.9) — late, unlocked and per-process
-  instead of once at compile time, but it arrives. Independently, the startup glob's
-  `nodes/**/requirement*.txt` **does** match `nodes/requirements.txt` (`**` matches zero directories),
-  so the baseline sits in the base runtime under `=0`/`auto`. Both cushions are removed by exactly one
-  thing: residual item 1 ("base = engine runtime only"). That is why the fix belongs there and the
-  choice is handed to it rather than taken here.
+  **CLOSED (2A-R item 1), as one rule rather than two treatments.** `discover()` now harvests the
+  `requirement*.txt` co-located with **every package directory on the path from the root down to a
+  walked file** — root-inclusive, never the root itself (in the deployed engine the root *is* the
+  exe dir, whose own requirement files belong to the base compile). An earlier draft split this
+  into "a declared floor for `nodes/requirements.txt`" plus "a narrow walk fix for sub-package
+  entries"; that was rejected on review. The fact being modelled belongs to Python's import
+  machinery and the walker already owns its sibling ("a walked file's co-located file belongs to
+  the env"), so a declared path list would be a second representation of one fact in a second
+  place — and it was already provably incomplete, naming only `nodes/` while the same fact held
+  for `ai/`. One fact, one owner. The root is not special to the import machinery; treating it
+  specially is what produced the two-halves reading in the first place.
 
-  **What it costs when it lands — one-time per environment, not per run.** `plan_install` compares
+  **Ancestors are harvested, never queued, and that is a deliberate trade with a measured floor.**
+  Queuing them would walk `ai/common/models/__init__.py`, whose eager barrel re-exports every
+  family: `detect` 12 → 28 files, `audio_transcribe` 7 → 29 — undoing exactly what Option A above
+  bought. Not queuing them is safe only because executing that barrel needs nothing an environment
+  lacks: a module-level-only walk from it reaches 30 files whose sole third-party imports are
+  `numpy` (in the tree baseline), `wave` (stdlib) and `rocketride` (shipped). That is a property of
+  the tree rather than a promise, so it is pinned by a unit test; if it ever fails, harvest-only has
+  become an under-inclusion and either the barrel goes lazy or the rule changes.
+
+  **One residual, named rather than hoped away.** An ancestor `__init__` that imports a *foreign*
+  first-party subtree keeps that subtree's files out of the compile. Five of the six ancestors this
+  adds import only stdlib + `depends`; the sixth, `ai/web/__init__.py`, does
+  `from ai.account import AccountInfo`, so an env reaching `ai.web` runs `ai/account/__init__.py`
+  while `ai/account/requirements.txt` never enters its set. Not a new hole — the old walk missed it
+  identically — and not live: that `__init__` calls `depends()` on its own file, which installs
+  into the active overlay at env-resolved constraints. It is the same import-closure precision
+  question as the barrel and goes to residual item 2 with it.
+
+  **Measured effect of the rule** (155 python-backed providers, post-rebase): `nodes/requirements.txt`
+  +155, `ai/requirements.txt` +105, `ai/common/` +17, `ai/web/` +15, `nodes/venv/` +3,
+  `nodes/remote/` +2, and **nothing lost** — a per-provider diff of the old and new walks shows only
+  additions, which is the whole safety argument: every added file is a shipped one, every shipped
+  file is in the legacy union, and a union that must compile for the engine to start under `=0`
+  cannot be made unsatisfiable by taking a subset of it.
+
+  **What it cost when it landed — one-time per environment, not per run.** `plan_install` compares
   `requirements_hash(...)` against `<env>/requirements.hash` and skips compile+install on a match, so
   adding the baseline drifts each overlay's hash **once**; the rebuild happens on that environment's
-  next use and the new hash is committed. Two caveats worth carrying: the hash includes `mtime_ns`, so
+  next use and the new hash is committed. Three caveats worth carrying: the hash includes `mtime_ns`, so
   making one shared file part of every environment's set means a future edit to it rebuilds **all**
   overlays at once instead of none (`syncDir` compares content byte-for-byte and skips unchanged files,
-  so ordinary rebuilds do not disturb the mtime); and the baseline's names are unpinned, so folding
+  so ordinary rebuilds do not disturb the mtime); the baseline's names are unpinned, so folding
   `numpy`/`safetensors`/`Cython` into every environment's resolution can surface a compile-time
-  conflict the runtime path tolerated.
+  conflict the runtime path tolerated; and the §8.3 acceptance's `v1`/`v2` overlays go from one tiny
+  pin to that pin plus the floor, because an environment is the union over its providers and every
+  venv env also holds the shipped bridges. That third one was expected to make the first scoped run
+  the slow one, possibly into `CONST_MAX_READY_TIME`. **It did not fire** — the first `nodes:test`
+  after the change came back green at 2:59, counters identical to the floor. Recorded as an outcome
+  rather than left standing as a hazard: an unfired prediction reads as a known danger forever.
+
+  **The price of Option A, concretely.** The abstract claim above — "a 4-node change, not a
+  refactor" — has one measured consequence beyond those four files: an outside test that stubs the
+  barrel breaks. `develop`'s `nodes/test/ocr/test_reader_to_bytes.py` stubs `ai.common.models` as a
+  flat module, which the barrel import satisfied and the full-path import does not
+  (`'ai.common.models' is not a package`). Fixed by making the stub a package with an `ocr`
+  submodule. Anything else stubbing the barrel will need the same.
 
 **The backstop is not free** — an under-include means a possibly multi-GB `depends()` install happens
 *mid-run* inside the venv child. Specify timing/failure: prefer resolving all reachable variants
@@ -920,14 +950,24 @@ imports live **exclusively in the local (no-model-server) branch**. Implications
 biggest lever venvs pull is *not sharing one constraint resolution*.
 
 - `<exe>/cache/constraints.txt` (**global**) governs **only** the base runtime and the legacy path
-  (`ROCKETRIDE_SERVER_USE_VENV=0` / auto-without-venv). Under `=1` the **`nodes/**` glob is dropped from
-  this startup compile** (`_SCOPED_EXCLUDED_GLOBS`) and it is compiled from `ai/**` + the root
-  requirements alone; node dependencies then arrive exclusively through per-env scoped installs.
-  **This gating is load-bearing, not an optimization (VERIFIED live).** While `nodes/**` stayed in the
-  glob, every node in the installation had to be mutually satisfiable: two nodes pinning incompatible
-  versions made `ensure_constraints()` fail at import of `ai/__init__.py`, so **the engine could not
-  start at all** — before any pipeline, endpoint, or per-env logic ran. Per-env scoping cannot deliver
-  its headline benefit while the startup compile still unions the whole node universe.
+  (`ROCKETRIDE_SERVER_USE_VENV=0` / auto-without-venv). Under `=1` the **`nodes/**` glob is narrowed,
+  not dropped** (`_SCOPED_GLOB_REPLACEMENTS`: `nodes/**/requirement*.txt` → `nodes/requirement*.txt`):
+  the per-node files leave and it is compiled from `ai/**` + the root requirements + the **tree
+  baseline**. Node dependencies still arrive exclusively through per-env scoped installs — the
+  baseline is not one. It is the Python-backend floor the engine process itself runs on
+  (`fastapi`, `uvicorn`, `numpy`, `pydantic`, `cryptography`, …, and its own header says "common to
+  all python modules, including nodes, ai module, etc"), and `nodes/**` matched it only by accident,
+  since `**` matches zero directories. Dropping it was collateral damage of the exclusion, and its
+  cost was real: under `=1` base resolved those 15 packages **unpinned**, `cryptography>=46.0.7,<47`
+  among them — a pin that exists for three GHSAs. *Measured, before → after:* the `=1` base compile
+  went from 29 sources and **not one** from the node tree, to 30 with exactly the baseline and still
+  no per-node file; `=0` is unchanged at 151.
+  **This gating is load-bearing, not an optimization (VERIFIED live).** While the per-node globs stayed
+  in the glob, every node in the installation had to be mutually satisfiable: two nodes pinning
+  incompatible versions made `ensure_constraints()` fail at import of `ai/__init__.py`, so **the engine
+  could not start at all** — before any pipeline, endpoint, or per-env logic ran. Per-env scoping cannot
+  deliver its headline benefit while the startup compile still unions the whole node universe. Narrowing
+  keeps that intact: only per-node files can conflict, and they are still out.
 - `venvs/<project_id>/<env_id>/constraints.txt` (**per-env**) is compiled from **that env's
   `combined.txt` alone — no global base** — so it resolves versions solely from the requirement files its
   nodes reach. The scoped install **and** the runtime `depends()` calls active in that env both resolve
@@ -946,9 +986,27 @@ biggest lever venvs pull is *not sharing one constraint resolution*.
   `depends()` installs via `uv --target <overlay>` and `-c <env constraints>` (not `-c cache/…`), so
   node model-loads and the AST-miss backstop land **in the overlay at the env-resolved versions** (no
   version churn), keeping base untouched.
-**Residual: base is not yet runtime-only — DEFERRED, with the reasoning recorded so the decision is
-re-openable rather than re-derived.** Constraints are already fully per-env; base *today* still
-receives `ai/**` at startup bootstrap. Two shrinks are possible and they cost very different things:
+**Residual: base is not yet runtime-only — item 1's premise is CLOSED, the `ai/**` shrink itself
+stays DEFERRED, and the trigger is now written out rather than gestured at.** Two of the three
+things this residual owed are done: the ancestor hole is closed (§4.8), and the base side is
+*correct in the direction we own* — the tree baseline is back in the `=1` compile, so base no longer
+resolves its own floor unpinned. What remains is the shrink proper: base still receives `ai/**` at
+startup bootstrap.
+
+**Ownership is the frame, and it explains why the remaining half waits.** Base owns what the engine
+process itself needs; environments own what nodes need. Base was failing that in *both* directions —
+holding `ai/**`, which is not its, and having lost the Python-backend floor, which is. Restoring the
+floor is a fix we can make and verify here. Dropping `ai/**` is not a shrink but a move from
+over-specified to under-specified, because a base process would then install those packages
+*unpinned* rather than not at all.
+
+**Trigger to reopen — either is sufficient.** (a) The saas model server, or any base process that
+loads models, **acquires an environment**: that removes the half-shrink outcome and makes the glob
+change safe. (b) A **real conflict inside base's `ai/**` union blocks a shipped pair**, which turns
+the shrink from cleanup into a fix. Absent both, the residual stays shut: base being over-specified
+costs footprint, not correctness.
+
+Two shrinks are possible and they cost very different things:
 
 - **Half shrink — rejected.** Drop the pins from the startup compile while base is still allowed to
   *install* those packages (which is what happens whenever a model loads with no overlay active).
@@ -970,6 +1028,16 @@ hand-maintained — the thing the glob avoided; and `_FIRST_PARTY` is `('nodes',
 cross-repository change. In favour of the effort: **no** module of the OSS base process (`ai/web`,
 `ai/modules`, `ai/account`, `ai/eaas.py`) imports `ai.common.models`, `ai.common.torch` or the
 image/avi/opencv helpers (VERIFIED), so the true runtime set really is small.
+
+**A collision to hold this design against, found while closing item 1's premise.**
+`.github/workflows/lock-node-deps.yml` builds a committed **universal** lock over every
+`nodes/src/nodes/**/requirements.txt`, and its own header names the planned follow-up: "depends()
+installing with `-c constraints.lock` and skipping the per-machine recompute". That is a whole-tree
+resolution — precisely the global union per-env scoping exists to dissolve. Applied to an overlay it
+would re-couple every node's pins and undo the isolation, so if that follow-up lands it must apply
+to the **base** compile only, never to `venvs/<proj>/<env>/`. Nothing to fix today: the follow-up has
+not landed, and the lock as a CI lint gate is orthogonal. Recorded here rather than in the workflow
+because this is the design it would break.
 
 Findings behind the cost estimate, to re-verify when the question is reopened:
 
@@ -1383,9 +1451,11 @@ teaching `venv_env` to parse the file.
   `constraints.txt` path**. Byte-for-byte today's behavior; **never an error**, even if the document
   contains isolated groups. This is the escape hatch for downstream consumers.
 - **`=1` = force on.** Enables the venv machinery and per-env scoping (still a no-op partition if the
-  pipeline genuinely has no isolated groups, but per-env `main` scoping applies). It **also drops
-  `nodes/**` from the global startup compile** (§4.9), which is what actually lets nodes with
-  conflicting pins coexist in one installation.
+  pipeline genuinely has no isolated groups, but per-env `main` scoping applies). It **also narrows
+  the `nodes/**` glob in the global startup compile to `nodes/requirement*.txt`** (§4.9): the
+  per-node files leave, which is what actually lets nodes with conflicting pins coexist in one
+  installation, while the tree baseline stays because it is the Python-backend floor rather than a
+  node dependency. The coexistence argument is untouched — only per-node files could conflict.
 
 **Known limit of `auto` (honest) — restated after 8.7B, because its old reason stopped being
 true.** It used to blame **timing**: "the startup compile happens at process init, before any
@@ -1464,13 +1534,17 @@ elsewhere that carry `environment`.
   isolated groups). Under the default (unset, no venvs) **nothing changes** — §4.15 semantics. The
   radius becomes "every pipeline" only if/when a later release flips auto to scoped-by-default.
 - 🟢 **AST correctness PROVEN and precision prerequisite DONE (§4.8 Prototype result).**
-  `ast_deps.py` (implemented, 13 tests) resolves providers and does the transitive walk; over the three
+  `ast_deps.py` resolves providers and does the transitive walk; over the three
   hardest nodes it reached **every** ground-truth requirement file with **zero under-includes and zero
-  dynamic imports**. The over-inclusion residual (the `ai.common.models` barrel `__init__`) is **fixed
+  dynamic imports**. That "zero under-includes" was measured on leaves only, and 2A-R found the
+  exception it could not see: the walk never opened an ancestor package's `__init__.py`. **Closed by
+  item 1** — the walk now harvests every package directory from the root down to each walked file
+  (§4.8). The over-inclusion residual (the `ai.common.models` barrel `__init__`) is **fixed
   via Option A** — the 4 barrel importers (`anonymize`, `audio_transcribe`, `embedding_transformer`,
   `ocr`) now import by full path; measured `audio_transcribe` **24→7** files, `anonymize` **23→5**, no
   cross-family leaks. A whole-tree sweep (481 files) found only **1** dynamic import (`preprocessor_code`,
-  enumerable). Was 🔴 → 🟠 (prototype) → 🟢 (barrel fix applied).
+  enumerable). Was 🔴 → 🟠 (prototype) → 🟢 (barrel fix applied). *No test count is quoted here on
+  purpose: it went stale twice, and `builder test`'s `rocketlib` counter is the live number.*
 - **Scoping should be model-server-aware (footprint optimization, §4.8).** Under `--modelserver` a
   proxied node needs no `ai/**` heavy deps (facades take the `ModelClient` branch; `gpu_guard` blocks
   `import torch`); pruning them shrinks venvs and removes most conflicts. Prerequisite: node
@@ -1578,7 +1652,7 @@ fixtures** where the startup glob does not reach; and **`--node_path=` inheritan
 children**. They were deferred together rather than picked off, because 3 and 4 are mutually
 entangled and 4 depends on 5.
 
-**Items 4 and 5 are DONE; item 3 is partly done. Items 1 and 2 remain deferred decisions.**
+**Items 1, 4 and 5 are DONE; item 3 is partly done. Item 2 remains a deferred decision.**
 
 - **4 — the home is `local_nodes` under `--node_path=`** (§8.2). Nothing is staged anywhere; the
   §8.3 acceptance now runs under `auto` inside `builder test`, which is the lever this item
@@ -1592,14 +1666,22 @@ entangled and 4 depends on 5.
   (`InvalidParam`, `pipeline_config.cpp:212`). Restored → passes.
 - **3 — the stable env key landed** (§4.14); the `ENV_ID`-per-worker half was re-recorded against
   the harness's actual shape instead of built, and its trigger is still unfired.
+- **1 — the premise is closed and the shrink is decided, not merely deferred again.** The item had
+  grown a second question — the ancestor-`__init__` under-inclusion is its premise — and both halves
+  are answered. The hole is closed by **one** rule in the walker (§4.8), not the declared floor plus
+  narrow walk fix an earlier draft proposed: a declared path list would have been a second
+  representation of one fact, and it was already incomplete, covering `nodes/` while the same fact
+  held for `ai/`. On the base side the tree baseline is back in the `=1` compile — it is the
+  Python-backend floor, and `nodes/**` had been matching it only by accident. The `ai/**` shrink
+  itself stays deferred **with a written trigger** (§4.9), because a base process that loads models
+  has no environment yet and dropping the pins would leave it installing unpinned rather than not at
+  all. What it does not deliver: OCR/Surya is **not** on this path — that is item 2 plus 2A-4, since
+  an OCR env pulls all four engine files into one constraint set regardless of what base holds.
+- **2 — AST within-family over-inclusion.** Unchanged deferred decision (§4.8, Options 1/2), now
+  also carrying the ancestor import-closure residual item 1 handed it (`ai/web/__init__` →
+  `ai.account`, backstop-covered).
 
 **What is NOT done, stated separately so the group is not read as closed.**
-
-- **1 — base = engine runtime only.** Still a deferred decision, and it has **grown a second
-  question**: the ancestor-`__init__` under-inclusion below is its premise, so item 1 now also owns
-  *how* the tree baseline reaches each environment (§4.8: a declared floor of file paths, plus a narrow
-  walk fix for sub-package entries).
-- **2 — AST within-family over-inclusion.** Unchanged deferred decision (§4.8, Options 1/2).
 - **3's other half — `ENV_ID` per test worker.** Deliberately not built: declarative node tests are
   *clients* (the engine subprocess per task already has its own overlay), the in-process ones stub
   `rocketlib`/`ai`/`pydantic`, and a bare `engine.exe -m pytest` never fires the C++ endpoint hook, so
@@ -2174,6 +2256,19 @@ Three layers; each test is tagged with the phase that first makes it runnable (*
   (`__init__` package vs module). Plus: `provider → path` resolution (aliases `chat`/`dropper`→`webhook`;
   sub-package `remote`→`remote/client`; name≠dir; native no-`path` skip); dynamic `importlib` flagged;
   **barrel-`__init__` over-inclusion guard** (full-path import stays tight, barrel import is detected). [2A]
+  **Ancestor-package rule (item 1, implemented in `test_ast_deps.py`):** every nodes-rooted provider
+  carries the tree baseline, leaf and sub-package entries alike; a sub-package entry reaches its
+  parent package's file (`venv`, `venv_server`, `remote_server`); the golden sets name
+  `nodes/requirements.txt` and `ai/requirements.txt` explicitly, because a subset assertion keeps
+  passing when the rule stops finding them; cross-family exclusion is asserted for
+  **`audio_transcribe`** and not only `detect` — `detect` imports by full path and was never at
+  risk, while `audio_transcribe` is a converted barrel importer and is where a mis-scoped rule would
+  re-admit the barrel. Two cases build a `tmp_path` tree because the shipped one cannot express
+  them: a namespace ancestor (no `__init__.py`) is **skipped, not a stop**, and root matching
+  prefers the **longest** base so the walker and `_pkg_of` cannot disagree about which root owns a
+  file when `--node_path` nests inside the exe dir. One more pins the trade the rule rests on: the
+  `ai.common.models` barrel needs nothing beyond the baseline at **import** time (`numpy`, `wave`,
+  `rocketride`) — if that stops holding, harvest-only has become an under-inclusion.
 - **`depends.py` per-env parameterization** — env-keyed paths / lock / `_processed` / progress;
   `requirements.hash` drift → reinstall; default-env fallback when no `project_id`; base =
   engine-runtime-only. [2A] **Implemented cases (`test_depends_scoping.py`, engine interpreter;

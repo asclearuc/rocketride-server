@@ -29,9 +29,12 @@ Resolves each node ``provider`` to its entry module (via the ``path`` field of
 ``nodes`` and ``ai`` packages to collect exactly the ``requirement*.txt`` files that
 environment needs, instead of globbing every requirement in the tree.
 
-Two things the walk must get right: it follows nested/in-function imports, not just
-module-level ones, and resolves relative imports against the right package
-(``__init__`` vs regular module).
+Three things the walk must get right: it follows nested/in-function imports, not just
+module-level ones; it resolves relative imports against the right package (``__init__``
+vs regular module); and it collects what the import graph *declares*, which includes the
+ancestor packages Python executes on the way in -- ``nodes/__init__.py`` before any node,
+``ai/__init__.py`` and ``ai/common/__init__.py`` before any ``ai.common.*`` module. Those
+files are nobody's import statement, so following imports alone never opens them.
 
 The result is a sound over-approximation — within a shared package directory it may
 pick up sibling requirement files, but it never under-includes. Dynamic
@@ -321,16 +324,59 @@ def _module_to_file(dotted: str, roots: dict[str, str]) -> Optional[str]:
     return None
 
 
+def _root_of(path: str, roots: dict[str, str]) -> Optional[str]:
+    """The root directory ``path`` sits under, **longest match first**.
+
+    One answer for one question, shared by everything that has to decide which root a file belongs
+    to. Longest-first is not cosmetic: with ``--node_path=`` pointing inside the exe dir, `nodes`
+    and `ai` both map to the exe dir, and plain iteration order would claim a `local_nodes` file
+    before its own root ever got a look.
+    """
+    best: Optional[str] = None
+    for base in roots.values():
+        if path.startswith(base) and (best is None or len(base) > len(best)):
+            best = base
+    return best
+
+
 def _pkg_of(path: str, roots: dict[str, str]) -> str:
     """Return the dotted *package* a file belongs to (``__init__`` vs module aware)."""
-    for base in roots.values():
-        if path.startswith(base):
-            rel = os.path.relpath(path, base).replace(os.sep, '.')
-            if rel.endswith('.__init__.py'):
-                return rel[: -len('.__init__.py')]  # pkg/__init__.py -> pkg
-            if rel.endswith('.py'):
-                return '.'.join(rel[:-3].split('.')[:-1])  # a.b.mod -> a.b
+    base = _root_of(path, roots)
+    if base is None:
+        return ''
+    rel = os.path.relpath(path, base).replace(os.sep, '.')
+    if rel.endswith('.__init__.py'):
+        return rel[: -len('.__init__.py')]  # pkg/__init__.py -> pkg
+    if rel.endswith('.py'):
+        return '.'.join(rel[:-3].split('.')[:-1])  # a.b.mod -> a.b
     return ''
+
+
+def _package_dirs_to(path: str, roots: dict[str, str]) -> list[str]:
+    """Every package directory Python executes on the way to ``path``, root-inclusive.
+
+    Importing ``a.b.c`` runs ``a/__init__.py`` and then ``a/b/__init__.py`` before the module
+    itself, and each of those installs its own co-located ``requirement*.txt``. Those files are
+    nobody's import statement, so a walk that only follows imports never opens them -- which is
+    how the tree baseline stayed invisible to every environment.
+
+    Root-**inclusive**, because the top-level package is not special to the import machinery, but
+    never the root *itself*: in the deployed engine the root IS the exe dir, whose own
+    ``requirement*.txt`` belongs to the base compile, not to any environment.
+
+    A directory without ``__init__.py`` is skipped, not a stop -- PEP 420 makes it a namespace
+    package that executes nothing while its own ancestors still run.
+    """
+    base = _root_of(path, roots)
+    if base is None:
+        return []
+    parts = os.path.relpath(path, base).replace(os.sep, '/').split('/')[:-1]
+    dirs = []
+    for depth in range(1, len(parts) + 1):
+        directory = os.path.join(base, *parts[:depth])
+        if os.path.isfile(os.path.join(directory, '__init__.py')):
+            dirs.append(directory)
+    return dirs
 
 
 def _import_targets(node: ast.AST, cur_file: str, roots: dict[str, str]) -> list[str]:
@@ -380,8 +426,12 @@ def discover(entry_files: Iterable[str], roots: dict[str, str]) -> DiscoveryResu
     reached: set[str] = set()
     third: set[str] = set()
     dynamic: list[str] = []
+    harvested: set[str] = set()
 
     def _add_req_dir(directory: str) -> None:
+        if directory in harvested:  # every directory is globbed once per walk
+            return
+        harvested.add(directory)
         for rq in glob(os.path.join(directory, 'requirement*.txt')):
             reqs.add(os.path.abspath(rq))
 
@@ -392,6 +442,10 @@ def discover(entry_files: Iterable[str], roots: dict[str, str]) -> DiscoveryResu
         seen.add(cur)
         cur_dir = os.path.dirname(cur)
         _add_req_dir(cur_dir)  # a node's / ai module's co-located requirement*.txt
+        # The packages Python runs on the way in. Harvested, never queued: queuing them would walk
+        # ai.common.models' eager barrel and drag every model family back into every environment.
+        for pkg_dir in _package_dirs_to(cur, roots):
+            _add_req_dir(pkg_dir)
         try:
             tree = ast.parse(open(cur, encoding='utf-8').read())
         except (OSError, SyntaxError, ValueError):
