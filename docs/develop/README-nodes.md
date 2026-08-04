@@ -417,6 +417,17 @@ Build the node exactly as in [Adding a New Node](#adding-a-new-node) -- its
 `IGlobal` installs the node's own `requirements.txt`, so dependencies work the
 same as any built-in node.
 
+`--node_path` is inherited by every engine the run starts, not just the first: the
+task subprocess and any virtual-environment child both receive it, so a local node
+keeps working when you drop it into an isolated group. Without that inheritance the
+child cannot resolve the provider and the run fails naming the *bridge* node rather
+than your node, which is a confusing place to start debugging.
+
+Note that a local node's dependencies come from the `depends()` call in its
+`__init__.py` -- the engine's startup requirements scan does **not** reach outside
+the installation, by design, so pins in a `local_nodes` tree never disturb the
+shared runtime.
+
 To ship a node so it becomes part of RocketRide, clone the
 [rocketride-server](https://github.com/rocketride-org/rocketride-server) repo,
 move your node into `nodes/src/nodes/<node>/`, change its `services.json`

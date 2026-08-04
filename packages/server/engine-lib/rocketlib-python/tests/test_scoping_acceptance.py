@@ -12,9 +12,10 @@ Two levels, both automated and both talking to the real ``uv``:
 * the **result** — a node's requirement set is discovered, compiled and installed into
   its own overlay at its own version, while the base runtime is left alone.
 
-The end-to-end level (a real pipeline, driven through a running server) is a manual
-procedure until the ``vtest_*`` fixtures are staged into ``dist/server/nodes`` by the
-build; the steps are written down in design §8.3.
+The end-to-end level (a real pipeline, driven through a running server) lives in
+``nodes/test/venv_runtime/`` and runs inside ``builder nodes:test``: the fixtures no longer need
+staging into ``dist/server/nodes``, because the nodes-test server is started with
+``--node_path`` pointed at ``nodes/test/fixtures`` and reaches them as local nodes.
 
 These run under the engine interpreter (``builder server:run-rocketlib-test``) and need
 a package index; they skip rather than fail when either is unavailable.
@@ -43,7 +44,7 @@ except ImportError:  # engLib is built into engine.exe
 pytestmark = pytest.mark.skipif(not _HAVE_ENGLIB, reason='depends needs engLib (engine interpreter)')
 
 # The fixture node pins this exact version; the value is the assertion, so keep it
-# in lockstep with nodes/test/fixtures/nodes/vtest_alpha/requirements.txt.
+# in lockstep with nodes/test/fixtures/local_nodes/vtest_alpha/requirements.txt.
 _ALPHA_PIN = '0.8.10'
 
 
@@ -52,8 +53,14 @@ def _repo_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), *([os.pardir] * 5)))
 
 
-def _fixtures_nodes_src() -> str:
-    """Node source root holding the ``vtest_*`` fixtures (``<root>/nodes/<name>/``)."""
+def _fixtures_local_root() -> str:
+    """``--node_path`` root holding the ``vtest_*`` fixtures (``<root>/local_nodes/<name>/``).
+
+    The fixtures moved out of the ``nodes/`` layout so the engine's startup glob, which is
+    rooted at the executable directory, can never reach their mutually unsatisfiable pins.
+    They are reached instead the way the engine reaches any workspace-local node: as a
+    second provider root under ``--node_path=<dir>``.
+    """
     return os.path.join(_repo_root(), 'nodes', 'test', 'fixtures')
 
 
@@ -130,13 +137,16 @@ def test_target_install_does_not_treat_base_as_satisfying(tmp_path):
 @pytest.fixture
 def alpha_requirements():
     """The requirement set the AST walk reaches from the ``vtest_alpha`` fixture."""
-    nodes_src = _fixtures_nodes_src()
-    if not os.path.isdir(os.path.join(nodes_src, 'nodes', 'vtest_alpha')):
+    local_root = _fixtures_local_root()
+    if not os.path.isdir(os.path.join(local_root, 'local_nodes', 'vtest_alpha')):
         pytest.skip('vtest_alpha fixture is not present in this checkout')
+    # Both roots at once, which is stricter than the old fixtures-only index: it proves the
+    # shipped tree and the local one coexist rather than that one of them works alone.
     found = ast_deps.discover_for_providers(
         ['vtest_alpha'],
-        nodes_src=nodes_src,
+        nodes_src=os.path.join(_repo_root(), 'nodes', 'src'),
         ai_src=os.path.join(_repo_root(), 'packages', 'ai', 'src'),
+        local_root=local_root,
     )
     assert found.unresolved_providers == []
     return found.requirement_files

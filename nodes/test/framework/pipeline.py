@@ -21,8 +21,9 @@
 # SOFTWARE.
 # =============================================================================
 
+import hashlib
+import json
 import os
-import uuid
 from typing import List, Dict, Any, Optional
 from .discovery import NodeTestConfig, get_node_test_config
 
@@ -309,7 +310,6 @@ class PipelineBuilder:
         Returns:
             Pipeline configuration dict ready for client.use()
         """
-        project_id = f'test_{self.config.node_name}_{uuid.uuid4().hex[:8]}'
         components = []
 
         # Start with webhook
@@ -364,6 +364,22 @@ class PipelineBuilder:
         # Add response nodes for each output lane
         response_components = self._build_response_components(prev_id)
         components.extend(response_components)
+
+        # Keyed by a digest of the built document, not by uuid4 and not by node name alone.
+        #
+        # uuid4 made every scoped (`=1`) suite run mint a brand-new overlay set — a measured
+        # run added 41 directories to an existing 41, and nothing reclaims them; §7 lists a
+        # stable env key as one of the two prerequisites the 2A state uncovered.
+        #
+        # A bare `test_{node}` would be too stable: the task token is
+        # sha256({..., project_id, source}), so one id per node is one TOKEN per node, and a
+        # second test of that node alive at the same time is refused with "Pipeline is
+        # already running." Per-document keying keeps distinct tests distinct, bounds the
+        # directory count, and makes a second suite run warm.
+        digest = hashlib.sha256(
+            json.dumps({'source': webhook_id, 'components': components}, sort_keys=True, default=str).encode()
+        ).hexdigest()[:8]
+        project_id = f'test_{self.config.node_name}_{digest}'
 
         pipeline = {'project_id': project_id, 'source': webhook_id, 'components': components}
         if self.config.avoid_mocks:

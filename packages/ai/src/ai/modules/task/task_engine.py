@@ -884,20 +884,23 @@ class Task(DAPBase):
             port_by_env[env_id] = port
         return port_by_env
 
-    def _effective_trace_arg(self) -> Optional[str]:
-        """The ``--trace=`` this run actually uses, or ``None`` when it never set one.
+    def _effective_engine_arg(self, prefix: str) -> Optional[str]:
+        """The engine flag starting with ``prefix`` this run actually uses, or ``None``.
 
         Mirrors the precedence the main-engine spawn applies: an explicit flag in the launch
         request's ``args`` wins, and the server's own ``startup_args()`` is only the
-        fallback. Kept as one helper so the child cannot drift from main by inheriting just
-        the fallback half.
+        fallback. Parameterized by prefix rather than written once per flag, because that is
+        exactly how the child drifted from main in the first place -- ``--trace=`` was given
+        an inheritance loop and ``--node_path=`` was not, so a developer pointing the engine
+        at workspace-local nodes got them in main and in no venv child, and the run failed
+        naming a provider rather than the missing flag.
         """
         for arg in self._launch_args.get('args', []) or []:
             for part in shlex.split(arg) if ' ' in arg else [arg]:
-                if part.startswith('--trace='):
+                if part.startswith(prefix):
                     return part
         for arg in startup_args():
-            if arg.startswith('--trace='):
+            if arg.startswith(prefix):
                 return arg
         return None
 
@@ -936,9 +939,18 @@ class Task(DAPBase):
         # raises the level to debug something. Effective, not just startup_args(): the main
         # engine takes a --trace= from the launch request first and only falls back to the
         # server's own, so inheriting the fallback alone recreates the asymmetry.
-        trace_arg = self._effective_trace_arg()
+        trace_arg = self._effective_engine_arg('--trace=')
         if trace_arg:
             child_args.append(trace_arg)
+
+        # Inherit --node_path= too. Workspace-local nodes are registered per process from
+        # <dir>/local_nodes, so without this a child cannot resolve a provider main resolved
+        # fine -- a pipeline that runs flat breaks the moment a group is isolated. Measured:
+        # the child dies naming the BRIDGE ("Component venv_egress--v1--main input references
+        # unknown component id: alpha_1"), never the missing provider.
+        node_path_arg = self._effective_engine_arg('--node_path=')
+        if node_path_arg:
+            child_args.append(node_path_arg)
 
         child_env = build_child_env(
             os.environ,

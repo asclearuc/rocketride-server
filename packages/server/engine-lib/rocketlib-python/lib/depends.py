@@ -51,7 +51,7 @@ else:
     import fcntl
 
 # engLib is built into engine.exe, always available
-from engLib import debug, monitorStatus, error
+from engLib import args as engine_args, debug, monitorStatus, error
 
 # Sibling stdlib-only modules backing the per-environment scoped install.
 import ast_deps
@@ -1604,7 +1604,11 @@ def ensure_env_scoped(
 
     def _discover(provs):
         # In the deployed engine both the nodes and ai packages sit under the exe dir.
-        return ast_deps.discover_for_providers(provs, exe_dir, exe_dir).requirement_files
+        # Workspace-local nodes live wherever --node_path points, so the scoped resolver
+        # has to be told: the startup glob is rooted at the exe dir and cannot reach them.
+        # Read from argv rather than sys.path so the condition matches the C++ one exactly.
+        local_root = ast_deps.local_nodes_root(engine_args())
+        return ast_deps.discover_for_providers(provs, exe_dir, exe_dir, local_root).requirement_files
 
     def _compile_and_install(plan):
         with FileLock(plan.paths.lock_file):  # one lock per overlay, not the global one

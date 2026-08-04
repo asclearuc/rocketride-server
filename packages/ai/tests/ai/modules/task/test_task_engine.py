@@ -1215,35 +1215,57 @@ def _fanin_task(*, trace_level=None, main_started=False):
     return t
 
 
-def test_effective_trace_arg_prefers_the_launch_request():
+def test_effective_engine_arg_prefers_the_launch_request():
     """Main takes --trace= from the launch args first and only falls back to the server's
     own, so a child inheriting just the fallback would carry a different level than main.
     """
     t = _task()
     t._launch_args = {'args': ['--trace=3']}
     with patch('ai.modules.task.task_engine.startup_args', return_value=['--trace=1']):
-        assert Task._effective_trace_arg(t) == '--trace=3'
+        assert Task._effective_engine_arg(t, '--trace=') == '--trace=3'
 
 
-def test_effective_trace_arg_splits_combined_launch_args():
+def test_effective_engine_arg_splits_combined_launch_args():
     t = _task()
     t._launch_args = {'args': ['--verbose --trace=2']}
     with patch('ai.modules.task.task_engine.startup_args', return_value=[]):
-        assert Task._effective_trace_arg(t) == '--trace=2'
+        assert Task._effective_engine_arg(t, '--trace=') == '--trace=2'
 
 
-def test_effective_trace_arg_falls_back_to_startup_args():
+def test_effective_engine_arg_falls_back_to_startup_args():
     t = _task()
     t._launch_args = {'args': []}
     with patch('ai.modules.task.task_engine.startup_args', return_value=['--other', '--trace=1']):
-        assert Task._effective_trace_arg(t) == '--trace=1'
+        assert Task._effective_engine_arg(t, '--trace=') == '--trace=1'
 
 
-def test_effective_trace_arg_is_none_when_the_run_set_no_level():
+def test_effective_engine_arg_is_none_when_the_run_set_no_level():
     t = _task()
     t._launch_args = {}
     with patch('ai.modules.task.task_engine.startup_args', return_value=['--port=5566']):
-        assert Task._effective_trace_arg(t) is None
+        assert Task._effective_engine_arg(t, '--trace=') is None
+
+
+# The prefix parameter is what item 5 added: venv children now inherit --node_path= by the
+# same rule as --trace=, so a workspace-local node resolves inside a child too.
+
+
+def test_effective_engine_arg_reads_node_path_from_startup_args():
+    """The nodes-test server passes --node_path= on its own command line, never per launch."""
+    t = _task()
+    t._launch_args = {}
+    startup = ['--port=5566', '--node_path=e:\\repo\\nodes\\test\\fixtures']
+    with patch('ai.modules.task.task_engine.startup_args', return_value=startup):
+        assert Task._effective_engine_arg(t, '--node_path=') == '--node_path=e:\\repo\\nodes\\test\\fixtures'
+
+
+def test_effective_engine_arg_keeps_the_two_prefixes_independent():
+    """One helper, two flags: asking for one must not answer with the other."""
+    t = _task()
+    t._launch_args = {'args': ['--trace=2']}
+    with patch('ai.modules.task.task_engine.startup_args', return_value=['--node_path=/w']):
+        assert Task._effective_engine_arg(t, '--trace=') == '--trace=2'
+        assert Task._effective_engine_arg(t, '--node_path=') == '--node_path=/w'
 
 
 @pytest.mark.asyncio
