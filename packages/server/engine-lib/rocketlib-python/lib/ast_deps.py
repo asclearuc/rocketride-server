@@ -36,10 +36,14 @@ ancestor packages Python executes on the way in -- ``nodes/__init__.py`` before 
 ``ai/__init__.py`` and ``ai/common/__init__.py`` before any ``ai.common.*`` module. Those
 files are nobody's import statement, so following imports alone never opens them.
 
-The result is a sound over-approximation — within a shared package directory it may
-pick up sibling requirement files, but it never under-includes. Dynamic
-``importlib``/``__import__`` calls that cannot be resolved statically are flagged so
-the caller can fall back to the runtime ``depends()`` backstop.
+Attribution is per directory, with one exception. A directory in which some walked file
+declares a ``_REQUIREMENTS_FILE`` resolving to a file that exists is *self-describing*:
+there, only the declared files are collected. That is what stops a node inheriting its
+family's siblings -- ``detect`` no longer gets ``rtmlib`` from ``pose``. Everywhere else
+the blanket co-location stands, and both ways the rule can fail to fire (nothing resolves,
+or no declaring module was walked) leave the directory globbed, so the result stays a sound
+over-approximation. Dynamic ``importlib``/``__import__`` calls that cannot be resolved
+statically are flagged so the caller can fall back to the runtime ``depends()`` backstop.
 
 Stdlib only, with the package roots passed in explicitly, so it is testable in
 isolation.
@@ -408,6 +412,34 @@ def _string_consts(value: ast.AST) -> list[str]:
     return []
 
 
+def _requirement_basenames(value: ast.AST) -> list[str]:
+    """Basenames of the ``.txt`` files a ``_REQUIREMENTS_FILE`` assignment names.
+
+    Never a plain string in this tree: every declaration is
+    ``os.path.join(os.path.dirname(__file__), 'x.txt')``, a list of those, or
+    ``dirname + '/x.txt'``, so Call arguments and BinOp operands have to be looked
+    through to reach the constant. The directory half is always the declaring module's
+    own, hence the basename.
+    """
+    raw: list[str] = []
+
+    def _collect(node: ast.AST) -> None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            raw.append(node.value)
+        elif isinstance(node, (ast.List, ast.Tuple)):
+            for elt in node.elts:
+                _collect(elt)
+        elif isinstance(node, ast.Call):
+            for arg in node.args:
+                _collect(arg)
+        elif isinstance(node, ast.BinOp):
+            _collect(node.left)
+            _collect(node.right)
+
+    _collect(value)
+    return [os.path.basename(s) for s in raw if s.endswith('.txt')]
+
+
 def discover(entry_files: Iterable[str], roots: dict[str, str]) -> DiscoveryResult:
     """Walk the import graph from ``entry_files`` and collect requirement files.
 
@@ -422,18 +454,13 @@ def discover(entry_files: Iterable[str], roots: dict[str, str]) -> DiscoveryResu
     """
     seen: set[str] = set()
     queue: list[str] = [os.path.abspath(f) for f in entry_files]
-    reqs: set[str] = set()
+    reqs: set[str] = set()  # named by an explicit depends()/load_depends() literal
+    declared: set[str] = set()  # named by a walked _REQUIREMENTS_FILE
+    co_located: set[str] = set()  # candidate directories; globbed after the walk
+    self_describing: set[str] = set()
     reached: set[str] = set()
     third: set[str] = set()
     dynamic: list[str] = []
-    harvested: set[str] = set()
-
-    def _add_req_dir(directory: str) -> None:
-        if directory in harvested:  # every directory is globbed once per walk
-            return
-        harvested.add(directory)
-        for rq in glob(os.path.join(directory, 'requirement*.txt')):
-            reqs.add(os.path.abspath(rq))
 
     while queue:
         cur = queue.pop()
@@ -441,11 +468,11 @@ def discover(entry_files: Iterable[str], roots: dict[str, str]) -> DiscoveryResu
             continue
         seen.add(cur)
         cur_dir = os.path.dirname(cur)
-        _add_req_dir(cur_dir)  # a node's / ai module's co-located requirement*.txt
+        co_located.add(cur_dir)  # a node's / ai module's co-located requirement*.txt
         # The packages Python runs on the way in. Harvested, never queued: queuing them would walk
         # ai.common.models' eager barrel and drag every model family back into every environment.
         for pkg_dir in _package_dirs_to(cur, roots):
-            _add_req_dir(pkg_dir)
+            co_located.add(pkg_dir)
         try:
             tree = ast.parse(open(cur, encoding='utf-8').read())
         except (OSError, SyntaxError, ValueError):
@@ -478,6 +505,19 @@ def discover(entry_files: Iterable[str], roots: dict[str, str]) -> DiscoveryResu
                                 cand = os.path.join(cur_dir, s)
                                 if os.path.isfile(cand):
                                     reqs.add(os.path.abspath(cand))
+            # The model-loader convention, matched exactly: it is what makes a directory
+            # self-describing, and the loose branch above would drag in every `requirements`
+            # local in ai/ if it were widened to reach these Call/BinOp values.
+            if isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name) and tgt.id == '_REQUIREMENTS_FILE':
+                        for name in _requirement_basenames(node.value):
+                            cand = os.path.join(cur_dir, name)
+                            # Keyed on the resolved path: a declaration naming a file that is
+                            # not there must leave the directory globbed, not empty it.
+                            if os.path.isfile(cand):
+                                declared.add(os.path.abspath(cand))
+                                self_describing.add(cur_dir)
             # imports: recurse first-party, record third-party leaves
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 for mod in _import_targets(node, cur, roots):
@@ -490,6 +530,13 @@ def discover(entry_files: Iterable[str], roots: dict[str, str]) -> DiscoveryResu
                             queue.append(nxt)
                     elif top and top not in _NON_REQUIREMENT_TOPS:
                         third.add(top)
+
+    for directory in co_located:
+        if directory in self_describing:
+            continue
+        for rq in glob(os.path.join(directory, 'requirement*.txt')):
+            reqs.add(os.path.abspath(rq))
+    reqs |= declared
 
     return DiscoveryResult(
         requirement_files=sorted(reqs),

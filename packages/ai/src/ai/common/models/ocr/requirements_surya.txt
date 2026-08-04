@@ -3,3 +3,4 @@
 # Direct imports only
 
 surya-ocr
+Pillow

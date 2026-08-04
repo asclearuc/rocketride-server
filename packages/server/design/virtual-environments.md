@@ -773,19 +773,86 @@ variant — so the backstop is a narrow safety net, not the primary mechanism.
   walk without a matching walker change (`ast.walk` still traverses the `TYPE_CHECKING` re-export block,
   or under-includes if that block is removed). Measured effect: `audio_transcribe` **24 → 7** files,
   `anonymize` **23 → 5**, zero cross-family leaks.
-- **Residual: within-family over-inclusion (DEFERRED decision — revisit after the engine call-site).**
-  Cross-family isolation is exact — verified on the **real engine**: the `audio_transcribe` overlay
-  dropped **183 → 114** packages, no `rfdetr`/`gliner`/`easyocr`/`surya`/`timm`. But a node still pulls
-  **siblings within its own model family**, because the walk co-locates every `requirements*.txt` in a
-  reached `ai/` directory — e.g. `audio_transcribe` pulls `kokoro` (TTS, `audio` family), `detect` pulls
-  `rtmlib` (pose, `vision` family). Sound over-approximation, never under-includes; cosmetic (siblings
-  are small). To tighten later, pick one:
-  - **Option 1 (node-local):** the node imports the *specific* submodule
-    (`from ai.common.models.audio.whisper import Whisper`) instead of the family `__init__` → drops the
-    sibling for that node.
-  - **Option 2 (walker):** in `ast_deps`, for `ai/` model dirs collect only files named by
-    `_REQUIREMENTS_FILE` constants instead of blanket directory co-location → drops all siblings
-    globally, but must re-verify it never under-includes.
+- **Within-family over-inclusion — CLOSED (2A-R item 2), and Options 1/2 were not alternatives.**
+  Cross-family isolation was already exact — verified on the **real engine**: the `audio_transcribe`
+  overlay dropped **183 → 114** packages, no `rfdetr`/`gliner`/`easyocr`/`surya`/`timm`. Within a
+  family it was not: the walk co-located every `requirements*.txt` in a reached `ai/` directory, so
+  `audio_transcribe` pulled `kokoro` (TTS) and `detect` pulled `rtmlib` (pose). This entry used to
+  call that cosmetic and offer a choice between two options. Measurement refused the choice — the
+  two are halves of one fix, and the item is not cosmetic because it is what holds OCR:
+
+  | variant | req-file slots (155 providers) | `detect` | `audio_transcribe` | `embedding_image` | `ocr` |
+  | --- | --- | --- | --- | --- | --- |
+  | before | 870 | 14 | 9 | 15 | 13 |
+  | Option 1 alone (node full-path imports) | **870** | 14 | 9 | 15 | 13 |
+  | Option 2 alone (walker rule) | 839 | 9 | 9 | 15 | 13 |
+  | **both — shipped** | **824** | **9** | **8** | **9** | 13 |
+
+  **Option 1 alone is worth exactly zero**: a node already importing by full path still drags its
+  siblings, because the directory glob does not care how the file was reached. **Option 2 alone
+  never reaches a barrel importer**: the family `__init__` re-exports every module, so every module
+  is walked and between them they declare every file in the directory. 46 slots leave 11 providers,
+  and **nothing is gained anywhere** — the per-provider diff is additions-free, which is the whole
+  safety argument.
+
+  **The rule.** A directory in which some walked file declares a `_REQUIREMENTS_FILE` **that
+  resolves to a file which exists** is *self-describing*: there, only the declared files are
+  collected. Every other directory keeps the blanket co-location. Data-driven rather than a
+  `ai/common/models/` path constant, because `_REQUIREMENTS_FILE` **is** the model-loader
+  convention and appears nowhere else — 16 declaring files, all under `ai/common/models/`, and not
+  one under `nodes/src`. (A grep finds 17: the seventeenth is `base.py`'s
+  `_REQUIREMENTS_FILE: Optional[...] = None`, an `ast.AnnAssign` the walker's `ast.Assign` branch
+  does not see — and which the resolved-path clause below would neutralise anyway, since `None`
+  names no file.) Two implementation facts are load-bearing. The value is never a plain
+  string (`os.path.join(dirname(__file__), 'x.txt')`, a list of those, or `dirname + '/x.txt'`), so
+  `_requirement_basenames` looks through Call arguments and BinOp operands; and it hangs off a
+  **new branch keyed on the exact name**, never the pre-existing `'REQUIREMENT' in id.upper()`
+  substring, which would also catch the lowercase `requirements` local in `ai/common/`,
+  `ai/common/opencv/`, `ai/web/` and `ai/` and make those self-describing too.
+
+  **Degradation, stated exactly.** A declaring module the walk never reached is safe by
+  construction. A declaration resolving to nothing is safe when it is the directory's only one —
+  the directory stays globbed. The one shape that does not degrade safely is a failed declaration
+  *beside a valid one*: the valid sibling suppresses the glob and the typo'd module's real file
+  drops out. The walker cannot tell a typo from an intentionally absent file, so that is closed by
+  test instead (`test_a_declaring_module_names_every_sibling_it_needs`), which fails whenever a
+  declarer needs a top covered only by a sibling it does not successfully name.
+
+  **The gap the rule exposed, fixed in the same change.** Making `_REQUIREMENTS_FILE` load-bearing
+  makes an incomplete declaration harmful. A completeness audit over `ai/common/models/**` found
+  exactly one: `easyocr.py`, `doctr.py`, `surya.py` and `utils.py` import `PIL`, but `Pillow` was
+  declared only in `requirements_trocr.txt` — blanket co-location had been supplying it. Added bare
+  to the other three. A walk seeded at `surya.py` reaches `ai.common.opencv`, `ai.common.torch` and
+  `ai.web.metrics` but **not** `ai.common.image`, so nothing else would have.
+
+  **`ocr` is unchanged at 13 files, by design.** `nodes/ocr/ocr.py` imports all four engines
+  unconditionally — the engine is a *runtime* config choice, so all four are genuinely statically
+  reachable and the walk is right to keep them. The payoff is conditional and measured: a walk
+  seeded at `ai/common/models/ocr/surya.py`, which is what a 2A-4 `nodes.ocr.surya` component would
+  look like, goes from all four engine files to `requirements_surya.txt` alone. That is the
+  precondition 2A-4 rests on, pinned by `test_an_ocr_engine_module_scopes_to_its_own_requirements`.
+  It removes one of Surya's two blockers: the same walk still keeps
+  `ai/common/opencv/requirements_{1,2}.txt` at `4.13.0.92`, and demoting that shim is 2A-4's
+  prerequisite 3, not this item's.
+
+  **The barrels stay; the invariant moved to the nodes.** A family barrel is a public surface with
+  an explicit `__all__`, and PEP 562 would not help the walk anyway (see the Option B note above).
+  What matters is not that a barrel is thin but that **a node imports a model *module*, never a
+  model *package*** — one assertion covering both the family barrels and `ai.common.models` above
+  them, pinned in `test_a_node_imports_a_model_module_never_a_model_package`. The nine converted
+  lines are the complete set, not a sample: `nodes/src` holds 16 `ai.common.models*` import sites,
+  7 of `…models.base` (a module, and legal) and 9 family barrels.
+
+  **What it cost elsewhere.** `nodes/test/ocr/test_reader_to_bytes.py` stubbed
+  `ai.common.models.ocr` as a flat module, which a per-engine import rejects with
+  `'ai.common.models.ocr' is not a package` — the same break Option A caused one level up, fixed
+  the same way. Nothing else needed relaxing, which is itself evidence the change is a subset.
+
+  **The rule travels further than its guards.** It keys on a name, so a `--node_path=` tree that
+  adopted `_REQUIREMENTS_FILE` would be attributed per-declaration too — correct behaviour, but
+  reaching code this repo cannot see, and the completeness checks sweep only the in-repo tree. That
+  asymmetry is the one thing a path constant would have made impossible, and it is the price of
+  keeping the walker tree-agnostic.
 - **Blast radius + generalization (whole node-tree sweeps, VERIFIED).** The barrel fix is **small and
   bounded: exactly 4 nodes** import via the barrel — `anonymize`, `audio_transcribe`,
   `embedding_transformer`, `ocr` — vs **9 already on full path** (`detect`, `ner`, `pose_estimation`,
@@ -853,8 +920,24 @@ variant — so the backstop is a narrow safety net, not the primary mechanism.
   `from ai.account import AccountInfo`, so an env reaching `ai.web` runs `ai/account/__init__.py`
   while `ai/account/requirements.txt` never enters its set. Not a new hole — the old walk missed it
   identically — and not live: that `__init__` calls `depends()` on its own file, which installs
-  into the active overlay at env-resolved constraints. It is the same import-closure precision
-  question as the barrel and goes to residual item 2 with it.
+  into the active overlay at env-resolved constraints.
+
+  **CLOSED with item 2, on a stronger fact than "backstop-covered."** `ai/account/requirements.txt`
+  is `{aiofiles, tenacity}`; `aiofiles` is already in `ai/web/requirements.txt` and `tenacity` in
+  `ai/requirements.txt`, and every provider reaching `ai.web` carries both. The residual is empty
+  **in package terms**, not merely survivable. A tree-wide sweep generalises it: across `ai/` and
+  `nodes/` there are 14 foreign-subtree imports in 13 `__init__.py` files (`ai/modules/remote` has
+  two), and every one contributes zero package names beyond the tree baseline — so harvest-only
+  ancestors under-include *nothing* here. That is a property of the tree rather than of the rule,
+  so it is pinned by `test_a_harvested_ancestor_never_hides_an_uncovered_package`.
+
+  The narrow fix — one hop into foreign subtrees from an ancestor `__init__` — was measured
+  (839 → 854; adds exactly `ai/account/requirements.txt` on 15 providers, nothing else) and **not
+  taken**: it buys zero packages, and it is not a second fact but an approximation of the correct
+  rule ("an executed `__init__` is code, so walk it") bent around one eager barrel. The correct
+  rule stays refuted by number — full transitive closure is 839 → **950**, dragging the whole model
+  universe back and undoing Option A. When the test above ever fails, the fix is the principled one
+  (queue ancestors behind a genuinely lazy barrel), not the hop.
 
   **Measured effect of the rule** (155 python-backed providers, post-rebase): `nodes/requirements.txt`
   +155, `ai/requirements.txt` +105, `ai/common/` +17, `ai/web/` +15, `nodes/venv/` +3,
@@ -1663,7 +1746,7 @@ fixtures** where the startup glob does not reach; and **`--node_path=` inheritan
 children**. They were deferred together rather than picked off, because 3 and 4 are mutually
 entangled and 4 depends on 5.
 
-**Items 1, 4 and 5 are DONE; item 3 is partly done. Item 2 remains a deferred decision.**
+**Items 1, 2, 4 and 5 are DONE; item 3 is partly done.**
 
 - **4 — the home is `local_nodes` under `--node_path=`** (§8.2). Nothing is staged anywhere; the
   §8.3 acceptance now runs under `auto` inside `builder test`, which is the lever this item
@@ -1686,11 +1769,23 @@ entangled and 4 depends on 5.
   Python-backend floor, and `nodes/**` had been matching it only by accident. The `ai/**` shrink
   itself stays deferred **with a written trigger** (§4.9), because a base process that loads models
   has no environment yet and dropping the pins would leave it installing unpinned rather than not at
-  all. What it does not deliver: OCR/Surya is **not** on this path — that is item 2 plus 2A-4, since
-  an OCR env pulls all four engine files into one constraint set regardless of what base holds.
-- **2 — AST within-family over-inclusion.** Unchanged deferred decision (§4.8, Options 1/2), now
-  also carrying the ancestor import-closure residual item 1 handed it (`ai/web/__init__` →
-  `ai.account`, backstop-covered).
+  all. What it does not deliver: OCR/Surya is **not** on this path — an OCR env pulls all four
+  engine files into one constraint set regardless of what base holds. Item 2 has since shipped and
+  did **not** change that either, deliberately: the `ocr` node reaches all four engines statically,
+  so the walk is right to keep them. What item 2 did deliver is that a *per-engine* component
+  scopes to its own engine, which leaves 2A-4 as the only remaining step for Surya.
+- **2 — AST within-family over-inclusion is closed, and the deferred *decision* dissolved rather
+  than being made.** §4.8 offered Options 1/2 as a choice; measurement showed they are halves of
+  one fix — Option 1 alone moves nothing (870 → 870), Option 2 alone never reaches a barrel
+  importer. Both shipped: the walker's self-describing-directory rule plus nine node imports moved
+  off the family barrels, 870 → 824 req-file slots over 155 providers with **nothing gained
+  anywhere**. Two things came with it. The rule made `_REQUIREMENTS_FILE` load-bearing and so
+  exposed one incomplete declaration — `Pillow` named only in `requirements_trocr.txt` while three
+  engines import `PIL` — fixed in the same change. And the ancestor import-closure residual item 1
+  handed over (`ai/web/__init__` → `ai.account`) closed on a stronger fact than backstop coverage:
+  it is empty in package terms, tree-wide, and pinned by a test. What it deliberately does not
+  deliver is `ocr` itself, still at 13 files because the node reaches all four engines statically;
+  what it does deliver is that a 2A-4 per-engine component finally scopes to its own engine.
 
 **What is NOT done, stated separately so the group is not read as closed.**
 - **3's other half — `ENV_ID` per test worker.** Deliberately not built: declarative node tests are
