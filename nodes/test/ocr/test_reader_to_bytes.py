@@ -36,6 +36,7 @@ _STUB_NAMES = (
     'ai.common',
     'ai.common.config',
     'ai.common.models',
+    'ai.common.models.ocr',
     'ai.common.reader',
     'numpy',
     'PIL',
@@ -105,7 +106,17 @@ def _install_min_stubs() -> None:
 
     _mk('ai.common.config', Config=_Config)
     _mk('ai.common.reader', ReaderBase=_ReaderBase)
-    _mk('ai.common.models', EasyOCR=_Engine, DocTR=_Engine, Surya=_Engine, TrOCR=_Engine)
+
+    # ocr.py imports the engines by full submodule path -- `from ai.common.models.ocr import ...`
+    # -- so this stub has to be a package with that submodule. A flat `ai.common.models` carrying
+    # the four names is what the barrel import needed and raises "'ai.common.models' is not a
+    # package" against the full-path one.
+    models = types.ModuleType('ai.common.models')
+    models.__path__ = []  # mark as package so the submodule resolves
+    sys.modules['ai.common.models'] = models
+    _mk('ai.common.models.ocr', EasyOCR=_Engine, DocTR=_Engine, Surya=_Engine, TrOCR=_Engine)
+    models.ocr = sys.modules['ai.common.models.ocr']
+
     _mk('numpy', ndarray=_NDArray)
 
     pil = types.ModuleType('PIL')
