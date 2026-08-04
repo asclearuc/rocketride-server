@@ -4,3 +4,4 @@
 # opencv is handled by ai.common.opencv module
 
 python-doctr[torch]
+Pillow

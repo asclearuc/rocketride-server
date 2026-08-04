@@ -30,7 +30,7 @@ depends(requirements)
 
 import numpy as np
 from typing import Dict, Any, List
-from ai.common.models.vision import CLIPModel, ViTModel
+from ai.common.models.vision.vision import CLIPModel, ViTModel
 from ai.common.config import Config
 from ai.common.image.image import Image
 

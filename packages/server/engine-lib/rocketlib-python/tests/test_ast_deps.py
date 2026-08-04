@@ -9,8 +9,10 @@ Tests needing the real node/ai source tree are skipped when it is not reachable.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
+import re
 
 import pytest
 
@@ -123,11 +125,19 @@ def test_golden_requirement_sets(provider, must_include):
 @pytest.mark.parametrize(
     'provider, foreign',
     [
-        # detect imports its model submodule by full path and was never at risk -- it is the
-        # control. audio_transcribe is one of the four barrel importers Option A converted, so it
-        # is where a mis-scoped ancestor rule would re-admit ai.common.models' eager barrel and
-        # pull every family back in.
-        ('detect', {'requirements_whisper.txt', 'requirements_gliner.txt'}),
+        # detect imports its model submodule by full path and was never at risk across families --
+        # it is the control there. audio_transcribe is one of the four barrel importers Option A
+        # converted, so it is where a mis-scoped ancestor rule would re-admit ai.common.models'
+        # eager barrel and pull every family back in.
+        #
+        # The WITHIN-family names (pose for detect, kokoro for audio_transcribe, detection for
+        # embedding_image) were impossible to assert before the self-describing rule: blanket
+        # co-location handed every walked file its whole directory, so a vision node got rtmlib
+        # and an audio node got a TTS engine.
+        (
+            'detect',
+            {'requirements_whisper.txt', 'requirements_gliner.txt', 'requirements_pose.txt'},
+        ),
         (
             'audio_transcribe',
             {
@@ -136,7 +146,12 @@ def test_golden_requirement_sets(provider, must_include):
                 'requirements_surya.txt',
                 'requirements_detection.txt',
                 'requirements_pose.txt',
+                'requirements_kokoro.txt',
             },
+        ),
+        (
+            'embedding_image',
+            {'requirements_detection.txt', 'requirements_pose.txt', 'requirements_segmentation.txt'},
         ),
     ],
 )
@@ -151,6 +166,278 @@ def test_dynamic_import_is_flagged():
     # preprocessor_code resolves its module from a config-driven dict at runtime
     res = A.discover_for_providers(['preprocessor_code'], _NODES_SRC, _AI_SRC)
     assert res.dynamic_imports
+
+
+# --- self-describing directories --------------------------------------------
+# A directory in which some walked file declares a `_REQUIREMENTS_FILE` resolving to a file that
+# EXISTS is self-describing: there, only the declared files are collected. Everywhere else the
+# blanket co-location stands, which is what a walked file used to get unconditionally -- and why
+# a vision node came away with rtmlib and an audio node with a TTS engine.
+
+# import top -> distribution name, for the handful the tree spells differently. Everything else
+# is handled by casefolding and `-`/`_` normalisation (that is what makes faster_whisper match
+# faster-whisper), so this table stays short on purpose.
+_DIST_ALIASES = {'pil': 'pillow', 'surya': 'surya_ocr', 'doctr': 'python_doctr'}
+
+
+def _dist_names(req_file):
+    """Distribution names a requirement file declares, normalised for comparison."""
+    out = set()
+    with open(req_file, encoding='utf-8') as fh:
+        for line in fh:
+            line = line.split('#')[0].split(';')[0].strip()  # comment, then environment marker
+            if not line or line.startswith('-'):
+                continue
+            name = re.split(r'[<>=!~\[\s]', line, maxsplit=1)[0].strip()
+            if name:
+                out.add(name.lower().replace('-', '_'))
+    return out
+
+
+def _as_dist(import_top):
+    top = import_top.lower().replace('-', '_')
+    return _DIST_ALIASES.get(top, top)
+
+
+def _baseline_dists():
+    """Packages every environment carries anyway: the files on the path from each root down.
+
+    Nothing in here can go missing from an environment, so a module needing one of them is never
+    under-included no matter which sibling happens to name it too -- numpy is the live case, sitting
+    in nodes/requirements.txt and also in requirements_whisper.txt.
+    """
+    out = set()
+    for path in (
+        os.path.join(_AI_SRC, 'ai', 'requirements.txt'),
+        os.path.join(_AI_SRC, 'ai', 'common', 'requirements.txt'),
+        os.path.join(_AI_SRC, 'ai', 'web', 'requirements.txt'),
+        os.path.join(_NODES_SRC, 'nodes', 'requirements.txt'),
+    ):
+        if os.path.isfile(path):
+            out |= _dist_names(path)
+    return out
+
+
+def _declared_and_imported(path, directory):
+    """(_REQUIREMENTS_FILE basenames that exist, third-party tops, same-directory modules)."""
+    declared, third, siblings = set(), set(), set()
+    try:
+        tree = ast.parse(open(path, encoding='utf-8').read())
+    except (OSError, SyntaxError, ValueError):
+        return declared, third, siblings
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == '_REQUIREMENTS_FILE':
+                    for base in A._requirement_basenames(node.value):
+                        if os.path.isfile(os.path.join(directory, base)):
+                            declared.add(base)
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                third.add(alias.name.split('.')[0])
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            (siblings if node.level == 1 else third).add(node.module.split('.')[0])
+    return declared, third, siblings
+
+
+def test_requirement_basenames_reads_the_shapes_the_tree_actually_uses():
+    def names(src):
+        return A._requirement_basenames(ast.parse(src).body[0].value)
+
+    joined = "os.path.join(os.path.dirname(__file__), 'requirements_x.txt')"
+    assert names(joined) == ['requirements_x.txt']
+    assert names(f"[{joined}, os.path.join(d, 'requirements_y.txt')]") == [
+        'requirements_x.txt',
+        'requirements_y.txt',
+    ]
+    assert names("os.path.dirname(f) + '/requirements.txt'") == ['requirements.txt']
+    assert names("'requirements_plain.txt'") == ['requirements_plain.txt']
+    # `= None` has to resolve to nothing: base.py declares it that way, and a subclass doing the
+    # same in a requirements-bearing directory would otherwise empty it.
+    assert names('None') == []
+    assert names("os.path.join(d, 'model.bin')") == []
+
+
+def _write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding='utf-8')
+
+
+_DECLARES = 'import os\n\n\nclass L:\n    _REQUIREMENTS_FILE = os.path.join(os.path.dirname(__file__), {0!r})\n'
+
+
+def _self_describing_tree(tmp_path):
+    """Three directories, one per behaviour the rule has to show. Returns the local root.
+
+    Self-describing is a property of a directory given the seed set, so the first
+    decline-to-fire case is `fam/` walked from a narrower seed; the other two differ in what the
+    directory CONTAINS and need their own.
+    """
+    root = tmp_path / 'root'
+    base = root / 'local_nodes'
+    _write(base / '__init__.py', '')
+
+    # fam/ -- two declarers, one non-declaring helper, and a stray nobody names
+    _write(base / 'fam' / '__init__.py', '')
+    _write(base / 'fam' / 'alpha.py', _DECLARES.format('requirements_alpha.txt'))
+    _write(base / 'fam' / 'beta.py', _DECLARES.format('requirements_beta.txt'))
+    _write(base / 'fam' / 'helper.py', 'X = 1\n')
+    _write(base / 'fam' / 'requirements_alpha.txt', 'alpha\n')
+    _write(base / 'fam' / 'requirements_beta.txt', 'beta\n')
+    _write(base / 'fam' / 'requirements_extra.txt', 'extra\n')
+
+    # typo/ -- the only declarer names a file that is not there
+    _write(base / 'typo' / '__init__.py', '')
+    _write(base / 'typo' / 'mod.py', _DECLARES.format('requirements_missing.txt'))
+    _write(base / 'typo' / 'requirements_real.txt', 'real\n')
+
+    # loose/ -- a lowercase `requirements` local, which is what the legacy substring branch matches
+    _write(base / 'loose' / '__init__.py', '')
+    _write(
+        base / 'loose' / 'mod.py',
+        "import os\n\nrequirements = os.path.dirname(__file__) + '/requirements.txt'\n",
+    )
+    _write(base / 'loose' / 'requirements.txt', 'named\n')
+    _write(base / 'loose' / 'requirements_other.txt', 'unnamed\n')
+    return root
+
+
+def test_a_self_describing_directory_yields_only_declared_files(tmp_path):
+    root = _self_describing_tree(tmp_path)
+    roots = {'local_nodes': str(root)}
+    local = root / 'local_nodes'
+
+    def collected(*seeds):
+        res = A.discover([str(s) for s in seeds], roots)
+        return {os.path.basename(p) for p in res.requirement_files}
+
+    # The rule firing: the stray nobody declares stays out, and one declarer alone takes only its
+    # own -- which is the whole point, `detect` not inheriting `pose`.
+    assert collected(local / 'fam' / 'alpha.py', local / 'fam' / 'beta.py') == {
+        'requirements_alpha.txt',
+        'requirements_beta.txt',
+    }
+    assert collected(local / 'fam' / 'alpha.py') == {'requirements_alpha.txt'}
+
+    # Three ways it must DECLINE to fire; together they are its entire safety margin, because
+    # every one of them leaves the directory over-including rather than under-including.
+    #
+    # 1. no declarer walked -> the same directory blanket-globs, stray included
+    assert collected(local / 'fam' / 'helper.py') == {
+        'requirements_alpha.txt',
+        'requirements_beta.txt',
+        'requirements_extra.txt',
+    }
+    # 2. the only declaration resolves to nothing -> globbed, not emptied. Keyed on the assignment
+    #    instead of the resolved path this would be set(), turning a typo into a silent under-install.
+    assert collected(local / 'typo' / 'mod.py') == {'requirements_real.txt'}
+    # 3. a lowercase `requirements` local is not the convention -> globbed. Were the legacy
+    #    substring branch taught to resolve BinOp, this would be {'requirements.txt'} alone.
+    assert collected(local / 'loose' / 'mod.py') == {'requirements.txt', 'requirements_other.txt'}
+
+
+@_needs_tree
+def test_an_ocr_engine_module_scopes_to_its_own_requirements():
+    """The precondition 2A-4 rests on, and the reason this item is not cosmetic.
+
+    A 2A-4 Surya component would seed its walk here. Today an `ocr` environment gets all four
+    engine files, so the resolver holds opencv at 4.13 and backtracks surya-ocr to 0.16.1 while
+    surya.py targets the 0.17 API: splitting the node buys nothing until the walk stops handing
+    the environment every engine.
+    """
+    roots = {'nodes': _NODES_SRC, 'ai': _AI_SRC}
+    seed = os.path.join(_AI_SRC, 'ai', 'common', 'models', 'ocr', 'surya.py')
+    names = {os.path.basename(p) for p in A.discover([seed], roots).requirement_files}
+    assert 'requirements_surya.txt' in names
+    assert not names & {
+        'requirements_easyocr.txt',
+        'requirements_doctr.txt',
+        'requirements_trocr.txt',
+    }
+
+
+@_needs_tree
+def test_a_node_imports_a_model_module_never_a_model_package():
+    """Stated as package-vs-module rather than a list of banned family names.
+
+    One assertion then covers both `from ai.common.models import EasyOCR` (the whole model
+    universe, which Option A removed) and `from ai.common.models.ocr import Surya` (the family),
+    while leaving `ai.common.models.base` alone -- a module, carrying no requirement file.
+    """
+    roots = {'nodes': _NODES_SRC, 'ai': _AI_SRC}
+    offenders = []
+    for dirpath, _dirs, files in os.walk(os.path.join(_NODES_SRC, 'nodes')):
+        if '__pycache__' in dirpath:
+            continue
+        for name in sorted(f for f in files if f.endswith('.py')):
+            path = os.path.join(dirpath, name)
+            try:
+                tree = ast.parse(open(path, encoding='utf-8').read())
+            except (OSError, SyntaxError, ValueError):
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                    continue
+                for mod in A._import_targets(node, path, roots):
+                    if mod != 'ai.common.models' and not mod.startswith('ai.common.models.'):
+                        continue
+                    resolved = A._module_to_file(mod, roots)
+                    if resolved and os.path.basename(resolved) == '__init__.py':
+                        rel = os.path.relpath(path, _REPO).replace(os.sep, '/')
+                        offenders.append(f'{rel} imports {mod}')
+    assert not offenders, (
+        'these node files import a model PACKAGE, not a model module: '
+        + '; '.join(offenders)
+        + '. Importing a package runs its __init__, which re-exports every module beneath it, and '
+        'each of those declares its own requirements into this node environment. Import the '
+        'specific submodule instead.'
+    )
+
+
+@_needs_tree
+def test_a_declaring_module_names_every_sibling_it_needs():
+    """The rule makes `_REQUIREMENTS_FILE` load-bearing, so an incomplete declaration stops being
+    harmless: what the module needs from an unnamed sibling silently leaves the environment.
+
+    This is the check that found Pillow declared only in requirements_trocr.txt while three of the
+    four engines import PIL themselves. Scoped to SIBLINGS on purpose -- torch legitimately
+    arrives from ai/common/torch/ and numpy from the tree baseline, so asserting over every
+    third-party top would fail on every loader. A declared file that does not exist contributes no
+    coverage, which is what also makes this the guard for a typo beside a valid declarer.
+    """
+    problems = []
+    baseline = _baseline_dists()
+    for dirpath, _dirs, files in os.walk(os.path.join(_AI_SRC, 'ai', 'common', 'models')):
+        if '__pycache__' in dirpath:
+            continue
+        req_files = {f for f in files if f.startswith('requirement') and f.endswith('.txt')}
+        if not req_files:
+            continue
+        modules = {
+            name: _declared_and_imported(os.path.join(dirpath, name), dirpath)
+            for name in sorted(f for f in files if f.endswith('.py'))
+        }
+        for name, (declared, third, siblings) in modules.items():
+            if not declared:
+                continue
+            # Fold in a non-declaring same-directory helper's imports: its coverage rides entirely
+            # on whoever imports it. Empty class today, and cheap while we are here.
+            needed = set(third)
+            for sib in siblings:
+                helper = modules.get(f'{sib}.py')
+                if helper and not helper[0]:
+                    needed |= helper[1]
+            covered = set().union(*(_dist_names(os.path.join(dirpath, b)) for b in declared))
+            covered |= baseline  # the floor is in every environment, whoever else names it
+            unnamed = set()
+            for base in req_files - declared:
+                unnamed |= _dist_names(os.path.join(dirpath, base))
+            for top in sorted(needed):
+                dist = _as_dist(top)
+                if dist in unnamed and dist not in covered:
+                    rel = os.path.relpath(os.path.join(dirpath, name), _REPO).replace(os.sep, '/')
+                    problems.append(f'{rel} imports {top}, declared only in a sibling it does not name')
+    assert not problems, '; '.join(problems)
 
 
 # --- ancestor packages ------------------------------------------------------
@@ -244,6 +531,58 @@ def test_the_models_barrel_needs_nothing_beyond_the_baseline_at_import_time():
     # numpy ships in the tree baseline every environment now carries; wave is stdlib; rocketride is
     # the SDK shipped beside the engine. Anything else would be a package nobody installed.
     assert third <= {'numpy', 'wave', 'rocketride'}, f'barrel needs {third} at import time'
+
+
+@_needs_tree
+def test_a_harvested_ancestor_never_hides_an_uncovered_package():
+    """The residual item 1 handed over, closed by measurement rather than by hope.
+
+    Ancestors are harvested and never walked, so an ancestor ``__init__`` that imports a FOREIGN
+    first-party subtree keeps that subtree's requirement files out of the compile --
+    ``ai/web/__init__`` does exactly that with ``from ai.account import AccountInfo``. It is not a
+    hole only because everything such an import would add is already in the tree baseline every
+    environment carries. That is a property of the tree, so it is asserted, not asserted-in-prose:
+    the day one of these brings an uncovered package, harvest-only has become an under-inclusion
+    and the fix is to queue ancestors behind a genuinely lazy barrel.
+    """
+    roots = {'nodes': _NODES_SRC, 'ai': _AI_SRC}
+    baseline = _baseline_dists()
+    uncovered = set()
+    for base, top in ((_AI_SRC, 'ai'), (_NODES_SRC, 'nodes')):
+        for dirpath, _dirs, files in os.walk(os.path.join(base, top)):
+            if '__pycache__' in dirpath or '__init__.py' not in files:
+                continue
+            init = os.path.join(dirpath, '__init__.py')
+            own = A._pkg_of(init, roots)
+            try:
+                tree = ast.parse(open(init, encoding='utf-8').read())
+            except (OSError, SyntaxError, ValueError):
+                continue
+            for node in tree.body:  # module level only -- that is what the import machinery runs
+                if isinstance(node, ast.ImportFrom) and node.level:
+                    continue  # relative, so inside its own subtree and harvested anyway
+                if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                    continue
+                for mod in A._import_targets(node, init, roots):
+                    if mod.split('.', 1)[0] not in roots:
+                        continue
+                    if not own or mod == own or mod.startswith(own + '.'):
+                        continue
+                    target = A._module_to_file(mod, roots)
+                    if not target:
+                        continue
+                    for directory in A._package_dirs_to(target, roots) + [os.path.dirname(target)]:
+                        for name in sorted(os.listdir(directory)) if os.path.isdir(directory) else []:
+                            if not (name.startswith('requirement') and name.endswith('.txt')):
+                                continue
+                            extra = _dist_names(os.path.join(directory, name)) - baseline
+                            if extra:
+                                uncovered.add(f'{own} -> {mod}: {sorted(extra)}')
+
+    assert not uncovered, (
+        'a harvested ancestor imports a foreign first-party subtree whose packages are not in the '
+        'tree baseline, so nothing puts them in the compile: ' + '; '.join(sorted(uncovered))
+    )
 
 
 def test_root_matching_prefers_the_longest_base(tmp_path):

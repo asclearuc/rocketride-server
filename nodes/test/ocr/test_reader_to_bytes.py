@@ -30,6 +30,8 @@ import pytest
 # numpy/PIL are stubbed too: the bytes-like branch under test touches neither, and
 # a fresh OSS dist has no Pillow (the image nodes are in skip_nodes, so nothing
 # triggers its depends()). Requiring them would make this guard skip silently there.
+_OCR_ENGINES = (('easyocr', 'EasyOCR'), ('doctr', 'DocTR'), ('surya', 'Surya'), ('trocr', 'TrOCR'))
+
 _STUB_NAMES = (
     'rocketlib',
     'ai',
@@ -37,6 +39,7 @@ _STUB_NAMES = (
     'ai.common.config',
     'ai.common.models',
     'ai.common.models.ocr',
+    *(f'ai.common.models.ocr.{_mod}' for _mod, _ in _OCR_ENGINES),
     'ai.common.reader',
     'numpy',
     'PIL',
@@ -107,15 +110,20 @@ def _install_min_stubs() -> None:
     _mk('ai.common.config', Config=_Config)
     _mk('ai.common.reader', ReaderBase=_ReaderBase)
 
-    # ocr.py imports the engines by full submodule path -- `from ai.common.models.ocr import ...`
-    # -- so this stub has to be a package with that submodule. A flat `ai.common.models` carrying
-    # the four names is what the barrel import needed and raises "'ai.common.models' is not a
-    # package" against the full-path one.
+    # ocr.py imports each engine by its own module -- `from ai.common.models.ocr.easyocr import
+    # ...` -- so `ocr` has to be a package here too. A flat module carrying the four names is
+    # what the family-barrel import needed, and raises "'ai.common.models.ocr' is not a package"
+    # against the per-engine one. Same break as the Option A round, one level down.
     models = types.ModuleType('ai.common.models')
     models.__path__ = []  # mark as package so the submodule resolves
     sys.modules['ai.common.models'] = models
-    _mk('ai.common.models.ocr', EasyOCR=_Engine, DocTR=_Engine, Surya=_Engine, TrOCR=_Engine)
-    models.ocr = sys.modules['ai.common.models.ocr']
+    ocr = types.ModuleType('ai.common.models.ocr')
+    ocr.__path__ = []
+    sys.modules['ai.common.models.ocr'] = ocr
+    models.ocr = ocr
+    for mod, cls in _OCR_ENGINES:
+        _mk(f'ai.common.models.ocr.{mod}', **{cls: _Engine})
+        setattr(ocr, mod, sys.modules[f'ai.common.models.ocr.{mod}'])
 
     _mk('numpy', ndarray=_NDArray)
 

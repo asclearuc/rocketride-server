@@ -30,7 +30,7 @@ RocketRide model server's transformers pipeline support.
 
 from typing import Dict, Any, List
 from ai.common.config import Config
-from ai.common.models.transformers import pipeline
+from ai.common.models.transformers.transformers import pipeline
 
 
 class NERRecognizer:

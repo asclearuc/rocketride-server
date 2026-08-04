@@ -1,7 +1,7 @@
 """
 Tests for the embedding_image node (in skip_nodes: excluded from default run).
 
-Requires ai.common.models.vision. Marked @pytest.mark.skip_node so they are
+Requires ai.common.models.vision.vision. Marked @pytest.mark.skip_node so they are
 excluded by default (same as other skip_nodes). Run with:
 
     builder nodes:test-full --pytest="-m skip_node -k embedding_image"
@@ -12,9 +12,13 @@ import pytest
 
 
 def _vision_available():
-    """Check if ai.common.models.vision is available."""
+    """Check if ai.common.models.vision.vision is available.
+
+    Probes the module the node imports, not the family barrel: the guard has to track the
+    node's real dependency or it can pass while the node cannot import.
+    """
     try:
-        from ai.common.models.vision import CLIPModel, ViTModel  # noqa: F401
+        from ai.common.models.vision.vision import CLIPModel, ViTModel  # noqa: F401
 
         return True
     except ImportError:
@@ -28,7 +32,7 @@ def test_embedding_image_create_embedding():
     embedding from a small image. Skips if vision module is not implemented.
     """
     if not _vision_available():
-        pytest.skip('ai.common.models.vision not available')
+        pytest.skip('ai.common.models.vision.vision not available')
 
     from PIL import Image
     import numpy as np
