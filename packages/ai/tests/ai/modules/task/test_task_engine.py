@@ -1541,8 +1541,44 @@ def test_main_env_strips_mocks_only_under_avoid_mocks():
 
 
 def test_main_env_does_not_mutate_the_base():
-    # The call site passes os.environ itself, so a missing copy would pop the variables out of
-    # the SERVER's own environment and degrade every later run.
+    # Purity is the function's contract, not a property of today's caller: the call site now hands
+    # it a fresh dict from _build_subprocess_env, but it took os.environ directly until the two
+    # were chained, and a caller that does so again must not pop keys out of the SERVER's own
+    # environment.
     base = {VENV_ENV_ID_ENV: 'v1', VENV_ISOLATED_ENV: '1', 'ROCKETRIDE_MOCK': '/m'}
     build_main_env(base, 'tok', False, avoid_mocks=True)
     assert base == {VENV_ENV_ID_ENV: 'v1', VENV_ISOLATED_ENV: '1', 'ROCKETRIDE_MOCK': '/m'}
+
+
+@pytest.mark.asyncio
+async def test_main_env_composes_credential_hygiene_with_the_venv_keys(monkeypatch):
+    """The spawn chains ``_build_subprocess_env`` into ``build_main_env``; only the pair is correct.
+
+    Both halves are covered alone above and in the ``_build_subprocess_env`` section, and that is
+    precisely why this exists: every one of those tests stays green if the chain is broken in
+    either direction. Passing ``os.environ`` instead of the scrubbed env leaks the DB broker
+    credential — which resolves ANY tenant's DSN — into user pipeline code; skipping
+    ``build_main_env`` lets an operator-exported environment id send the main engine installing
+    into another environment's overlay. The seam is what the rebase created, so the seam is what
+    is asserted: real ``os.environ`` in, both effects out.
+    """
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_URL', 'https://broker.example')
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', 'super-secret')
+    monkeypatch.setenv(VENV_ENV_ID_ENV, 'v1')
+
+    async def fake_resolve(client_id):
+        return 'postgresql://tenant@pooler/db'
+
+    _patch_resolve(monkeypatch, fake_resolve)
+
+    scrubbed = await Task._build_subprocess_env(_env_task(pipeline=_DB_PIPELINE))
+    env = build_main_env(scrubbed, 'tok-1', True, avoid_mocks=False)
+
+    # Credential hygiene survives the second step.
+    assert 'ROCKETRIDE_DB_BROKER_URL' not in env
+    assert 'ROCKETRIDE_DB_BROKER_TOKEN' not in env
+    assert env['ROCKETRIDE_DB_DSN'] == 'postgresql://tenant@pooler/db'
+    # The venv keys are still applied, over an environment the first step produced.
+    assert VENV_ENV_ID_ENV not in env
+    assert env[VENV_TOKEN_ENV] == 'tok-1'
+    assert env[VENV_ISOLATED_ENV] == '1'
