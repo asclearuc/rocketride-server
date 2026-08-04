@@ -1434,6 +1434,17 @@ teaching `venv_env` to parse the file.
   venv child *is* an isolated group, one per group and never otherwise. `ensure_env_scoped` **ORs**
   the variable with its parameter, so the C++ hook keeps calling it with three positional arguments
   and no engine rebuild is needed.
+  **Main's environment is built by two functions in sequence, and only the pair is correct
+  (recorded because nothing else states it).** `_build_subprocess_env()` comes first: it scrubs the
+  RocketRide DB broker credential — which resolves **any** tenant's DSN and must never reach node
+  subprocesses running user pipeline code — and injects the one per-tenant DSN for pipelines that
+  actually contain a DB node. `build_main_env()` then takes that result and applies the venv keys:
+  bridge token in, environment id out, isolated flag both ways. Chaining is not an implementation
+  detail. Passing `os.environ` to the second function instead of the first's output leaks the broker
+  credential and drops the DSN; skipping the second lets an operator-exported
+  `ROCKETRIDE_VENV_ENV_ID` send main installing into another environment's overlay. Both halves have
+  unit tests that stay green either way — the seam is covered by its own case in
+  `test_task_engine.py`, and that case is the only thing that fails if the chain is broken.
   **Why the raw fact and not the resolved decision** — a broadcast *answer* would move the `=0`
   floor from a function every process calls onto the discipline of whoever stamps the variable.
   `scoping_enabled(USE_OFF, True)` is `False` by its first branch, so the raw form cannot switch
