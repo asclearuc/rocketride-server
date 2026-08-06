@@ -1,6 +1,12 @@
 # Design: Virtual Environments for RocketRide Pipelines
 
-**Status:** Draft (design round — no implementation yet)
+**Status:** Living document — largely implemented. Phase 2A (per-environment scoping) and Phase 2B
+(the venv runtime, steps 4–8.7) are shipped and live-verified; what remains open is named where it
+lives — §4.9's base shrink, §4.10's second-run-collision question, the client half of `rrext_venv`
+(§7), Phase 2C, and 2A-4 (§4.16, in progress). Each increment's record sits with its section, so
+"is this built?" is answered locally rather than here. *This field read "Draft (design round — no
+implementation yet)" through the whole of 2A and 2B; a status nobody updates is worse than none,
+which is why it now points at the sections that carry the truth instead of restating it.*
 **Scope:** Engine (C++ + embedded Python), `depends.py`, the `remote` sub-pipeline mechanism,
 the pipeline canvas (shared-ui / VS Code), and the test/CLI harnesses.
 **Audience:** Engine + tooling engineers. This is an *internal* design document, not user-facing
@@ -16,8 +22,8 @@ CPython interpreter). Every node module is imported into that single interpreter
 `lib/site-packages` pinned by **one** `cache/constraints.txt`.
 
 That constraints file is built by globbing **all** node and `ai/` requirements
-(`REQUIREMENTS_GLOBS = ['requirement*.txt', 'nodes/**/requirement*.txt', 'ai/**/requirement*.txt']`,
-`depends.py:58`), concatenating them (`_combine_requirements`), and running **`uv pip compile` over
+(`REQUIREMENTS_GLOBS = ['requirement*.txt', 'nodes/**/requirement*.txt', 'ai/**/requirement*.txt']`
+in `depends.py`), concatenating them (`_combine_requirements`), and running **`uv pip compile` over
 the union** (`ensure_constraints`). So if two nodes need incompatible versions (e.g. `torch==2.0` vs
 `torch==2.1`), the unified compile **fails at engine startup** (`_compile_constraints` →
 *"Failed to compile constraints"*), before any pipeline runs.
@@ -227,7 +233,8 @@ environment, which is what lets a venv→venv edge be cut twice rather than rela
 
 **What deliberately does not appear in view 2:** a child's **events** — status, traces, metrics,
 warnings — do not travel on these sockets at all. They are drained from the child's **stdout**,
-classified, and fanned into the run (§4.4, step 8.4). Drawing them as frames would suggest the
+classified, and fanned into the run (§7, increment 8.4A — there is no §4.x home for it). Drawing
+them as frames would suggest the
 bridge carries observability, and the first person to debug a missing trace would look at the wrong
 transport.
 
@@ -410,7 +417,7 @@ Env-cycle detection is now implemented on the `scoped=True` cut (see Increment 2
 
 Covered cases: lane fan-out across envs, multiple lanes on one boundary, A→B→main chains and
 diamonds, a venv feeding two venvs, source/sink
-placement (§4.11). **Invoke/control edges never cross a boundary** (the editor's `isValidConnection`
+placement (§4.13). **Invoke/control edges never cross a boundary** (the editor's `isValidConnection`
 requires equal `parentId` for invoke handles; data lanes cross freely) — so cross-env tool-call RPC is
 out of v1 *by construction*. **This is editor-only — C++ does not check `parentId` on invoke edges
 (verified)** — so **the partitioner must enforce it as a hard validation** (reject cross-boundary
@@ -832,16 +839,22 @@ variant — so the backstop is a narrow safety net, not the primary mechanism.
   look like, goes from all four engine files to `requirements_surya.txt` alone. That is the
   precondition 2A-4 rests on, pinned by `test_an_ocr_engine_module_scopes_to_its_own_requirements`.
   It removes one of Surya's two blockers: the same walk still keeps
-  `ai/common/opencv/requirements_{1,2}.txt` at `4.13.0.92`, and demoting that shim is 2A-4's
-  prerequisite 3, not this item's.
+  `ai/common/opencv/requirements_{1,2}.txt` at `4.13.0.92`, and removing that shim — **deleted
+  outright, not demoted to a re-export**, since nothing imports it afterwards — is 2A-4's business
+  (§7, scope item 4), not this item's.
 
   **The barrels stay; the invariant moved to the nodes.** A family barrel is a public surface with
   an explicit `__all__`, and PEP 562 would not help the walk anyway (see the Option B note above).
   What matters is not that a barrel is thin but that **a node imports a model *module*, never a
   model *package*** — one assertion covering both the family barrels and `ai.common.models` above
   them, pinned in `test_a_node_imports_a_model_module_never_a_model_package`. The nine converted
-  lines are the complete set, not a sample: `nodes/src` holds 16 `ai.common.models*` import sites,
-  7 of `…models.base` (a module, and legal) and 9 family barrels.
+  lines were the complete set at the time, not a sample: `nodes/src` then held 16 `ai.common.models*`
+  import sites, 7 of `…models.base` (a module, and legal) and 9 family barrels.
+  *That count is a snapshot and has since grown with the node tree — 26 sites as of 2026-08-06, still
+  7 of them `…models.base` and **zero** importing a package.* Which is the point: the number is
+  evidence about one conversion, while the **invariant** is what the test holds, and only the test
+  stays true as nodes are added. Re-count if you want the current figure; do not read the old one as
+  a ceiling.
 
   **What it cost elsewhere.** `nodes/test/ocr/test_reader_to_bytes.py` stubbed
   `ai.common.models.ocr` as a flat module, which a per-engine import rejects with
@@ -1004,6 +1017,9 @@ imports live **exclusively in the local (no-model-server) branch**. Implications
 
 ### 4.9 Directory layout, identity & keying
 - `<exe>/lib/site-packages` — **base = engine runtime only** (engLib + bundled deps); **no node deps**.
+  *The target, not today's state:* node deps are already out, but base still receives `ai/**` at
+  startup bootstrap — the residual and its reopening trigger are below, under "base is not yet
+  runtime-only". Stated here because this list is what a reader takes as the layout.
 - `<exe>/venvs/<project_id>/<env_id>/` — **per-environment overlay** for EVERY env, a **top-level
   `venvs/` dir** (sibling of `lib/`, `cache/` — **not** under `cache/`). `env_id ∈ { main, <group_id> }`
   → main lives at `venvs/<project_id>/main`. Each holds `site-packages/` + its own scoped `combined.txt`,
@@ -1140,8 +1156,13 @@ Findings behind the cost estimate, to re-verify when the question is reopened:
    order-dependent (`uv --dry-run` reports the first-installed version as satisfied).
 4. Base loses early conflict detection: two conflicting model families fail loudly at startup today,
    quietly and late afterwards.
-5. Checked and **not** an issue: `onnxruntime-gpu==1.20.1` is pinned **explicitly** in both
-   `requirements_whisper.txt` and `requirements_pose.txt`, not inherited from the union.
+5. Checked and **not** an issue: `onnxruntime-gpu` is pinned **explicitly**, not inherited from the
+   union. *Corrected — the original entry said `1.20.1` in "both `requirements_whisper.txt` and
+   `requirements_pose.txt`", and both halves have moved: the version is `1.22.0` (1.20.1 was
+   withdrawn from PyPI for the `-gpu` build), and the pin is copied across **five** files —
+   `requirements_whisper.txt`, `requirements_gliner.txt`, `requirements_pose.txt`,
+   `nodes/anonymize/` and `nodes/audio_transcribe/`. The finding's conclusion is unchanged; the
+   duplication it undercounted is what §4.16's second family exists to remove.*
 
 **Key by stable IDs; name is metadata.**
 
@@ -1152,6 +1173,10 @@ Findings behind the cost estimate, to re-verify when the question is reopened:
 - **Consequence: NO rename logic needed** — renaming a venv changes only metadata, not the path.
 - **Requirements drift** detected by a `requirements.hash` inside the env dir (reusing
   `depends.py`'s `_compute_hash`/`_load_stored_hash`/`_save_hash`); mismatch → update install in place.
+  The hash is **not** purely a function of the requirement files: an environment holding a
+  shared-namespace package family also folds in that family's declaration, so editing a declared
+  version rebuilds the environments that contain it and no others (§4.16). One holding none keeps
+  byte-identical bytes and does not rebuild.
 - **MAX_PATH (decision, not a note):** a 36-char GUID nested above `site-packages` + deep torch/nvidia
   paths **will** exceed Windows 260, and long-path support is host-opt-in/unreliable → **default to a
   shortened id segment** (e.g. first 8 hex of the `project_id` GUID; likewise `group_id`). Point all
@@ -1211,6 +1236,23 @@ starts — is drawn in **§3.1, view 1**.*
   different and weaker reason — nothing here needs it, and it would widen the blast radius of a
   spawn bug. Left as written, the paragraph names a blocker that no longer exists, and the next
   reader either takes the expired argument at face value or re-derives the whole question.
+- **The port a child is given is not checked for bindability, and the failure reads as ours
+  (measured 2026-08-06).** `TaskServer.assign_port` walks `base_port … base_port+9999` and returns the
+  first port **it has not itself handed out** — it never asks whether the port can be bound. On
+  Windows with Hyper-V/WSL/Docker the OS reserves whole ranges
+  (`netsh int ipv4 show excludedportrange protocol=tcp`), recomputed at boot and when those services
+  start, so a base port can silently land inside one: `bind()` fails with `WinError 10013`, the child
+  never listens, and the parent reports a refused connection after its wait. Measured on this
+  machine — 30000, 30001 and 30020 unbindable while 20000 and 40000 were fine, with the reservations
+  covering nearly all of 30xxx.
+  Two reasons this belongs here rather than only in the port broker's own notes. The venv child spawn
+  is a **caller** (`task_engine.py`, `assign_port` before `_spawn_one_venv_child`), so the symptom is
+  *"venv child failed to start"* — indistinguishable from a scoping or partitioner defect, and it
+  survives a clean rebuild and a branch change, which is what makes it expensive. And it is the same
+  shape as 8.7B's DNS rake (§7): an environmental failure wearing this feature's error message. The
+  fix — try the bind, skip on failure, and distinguish "all ports busy" from "all ports forbidden" —
+  belongs to the broker rather than to venvs and is tracked as **#1879**; the working handoff is
+  `NEXT-STEP-port-allocation-prompt.md` (untracked, like every `NEXT-STEP-*` sibling).
 - **Concurrent-install lock (race fix):** process-per-run + a shared cached env dir + install-on-drift
   could let two concurrent runs both `uv install --target` into the same `site-packages` → corruption.
   `depends.py` **already** has the `FileLock`/`install.lock` mechanism — **scope it per env dir** (one
@@ -1310,6 +1352,15 @@ real SDKs) and ahead of everything else.
 from the previous overlay stays in `sys.modules`, so this does **not** make one interpreter safely
 multi-environment — which is exactly why each environment gets its own child process (§4.10).
 
+That limit is no longer only documented: for a **shared-namespace package family** it is detected.
+Under the default `auto` the parent runs base pipelines *and* builds overlays, so the case is live
+there rather than hypothetical — base and an overlay align over different input sets and can hold
+different versions of the same namespace. The family step compares the loaded module's version
+against the one the environment provides and **refuses the run** with a restart-required message
+instead of letting the pipeline quietly use the build the parent had loaded (§4.16). It is the one
+failure measurement cannot catch from inside the environment: the environment is right and the
+*process* is wrong.
+
 **Two doors, deliberately separate.** `depends.use_env(ctx)` switches *installation targeting* only
 — lock, constraints, `uv --target`, the installed record — and never touches `sys.path`.
 `ensure_env_scoped()` is the one entry point that does both. A caller that switches the first
@@ -1331,7 +1382,8 @@ the pywin32 path hack).
 ### 4.12 Response & failure merge-back
 A venv node's final response and any `objectFailed`/`completionError` must be shipped back and **merged
 into the root entry** the client reads (`data_conn.py:_close`), or venv-produced results/failures
-silently vanish. This is what allows an **end/return node to live in a venv** (§4.11 asymmetry).
+silently vanish. This is what allows an **end/return node to live in a venv** (the source/sink
+asymmetry in §4.13).
 **Implemented in step 8.1.1's successor, 8.2** — the shape below is what shipped.
 
 - **The `entry` frame.** When a child object ends, `venv_server` ships `entry.toDict()` plus the two
@@ -1571,6 +1623,154 @@ Open-source/default posture: with the var unset, a consumer who never creates an
 exactly today's engine; `=0` additionally guarantees legacy behavior even for documents authored
 elsewhere that carry `environment`.
 
+### 4.16 Shared-namespace package families (`lib/pkg_families/`)
+
+**The problem no resolver can see.** Some distributions write the *same* import directory. All four
+`opencv-*` wheels provide `cv2`; `onnxruntime` and `onnxruntime-gpu` both provide `onnxruntime`. uv
+treats them as independent distributions and will never report a conflict between them, so the last
+one installed silently owns the namespace — and a subset arriving after a superset takes modules
+away from an environment that had them (`cv2.ximgproc` disappearing from a directory that had it).
+
+What the resolver cannot give is imposed from outside it, as **data** rather than as the two
+different hand-written hacks that still carry it today: which members may be installed at all, one
+version among those that co-install, and a fixed install order with a known winner. Those two hacks
+— the `ai.common.opencv` shim's four pins and the hard-coded `onnxruntime` line in
+`_write_excludes_file` — are removed by later increments, not by the one that built this mechanism.
+
+| family | members (subset → superset) | shape | state |
+| --- | --- | --- | --- |
+| `cv2` | `-headless`, `opencv-python`, `-contrib-headless`, **`-contrib`** | the members this environment resolves install, in declared order; the last one wins | registered |
+| `onnxruntime` | `onnxruntime` (Darwin), **`onnxruntime-gpu`** (non-Darwin) | one installs per platform; the other is excluded | **declared, not registered** |
+
+Two is the whole population, checked rather than assumed: sweeping every distribution named in every
+`requirement*.txt` under `packages/ai/src` and `nodes/src` turns up no third namespace-sharing set.
+
+**Why onnxruntime is written but withheld from the registry.** A family changes what its
+environments install the moment it appears there, and for this one the change would not be neutral:
+an environment whose only consumer is transitive installs *nothing* today, and registering the
+family without also declaring its version would have the owner fallback install `onnxruntime-gpu` at
+a **derived** version — plain onnxruntime's own, several minor releases above anything this tree has
+pinned. It registers together with the declaration and the deletion of the copied pins, which is one
+change; until then the static exclusion keeps doing its job alone.
+
+**The four steps.** After an environment's normal compile, *detect* families from the produced
+`constraints.txt` (never from declarations — both real cases arrive transitively); *align* on one
+version `V`; *couple and verify* by appending `<member>==V` to the already-generated `combined.txt`
+under a `# derived by pkg_families` block and compiling again; then *install in order* by explicit
+uv runs, widest last. A fifth act — **proving the built environment by running code inside it** —
+belongs to the same mechanism and lands with the probes; the `Probe` declaration exists here, and
+nothing runs it yet.
+
+`pkg_families` is **stdlib-only**, by the precedent `venv_env` already sets: `depends` reads the
+registry and `depends` needs `engLib`, so the rules stay unit-testable under bare `pytest` — and the
+package is read during bootstrap, before anything is installed, so it cannot depend on a wheel
+either (which is why it carries a small marker evaluator instead of using `packaging`).
+
+**Environment facts** (`pkg_families/facts.py`) — python and platform from the interpreter, the CUDA
+this build targets parsed out of `ai/common/torch/requirements.txt` rather than declared twice, and
+GPU presence plus driver version behind a guarded `pynvml` import in the shape
+`ai/modules/task/task_metrics.py` already uses. Two properties of that are load-bearing:
+
+- **the CUDA parse is marker-aware.** That file carries `torch==2.10.0` under a Darwin marker beside
+  `torch==2.10.0+cu128` under `platform_system != 'Darwin'`; a naive `+cuNNN` search reports CUDA
+  12.8 on a Mac, where the selected wheel has no CUDA at all. On Darwin the fact is **absent**, not
+  `12.8`, and a unit test reads the real file and pins both branches;
+- **the GPU fact resolves lazily.** Its own provider, `nvidia-ml-py`, is installed by
+  `ai/__init__.py`'s `depends(CONST_AI_REQUIREMENTS)` — the *first* `depends()` call of startup.
+  Resolved eagerly at import, that call reports "no GPU" on a machine that has one. And "unknown" is
+  a third answer, never folded into "absent".
+
+#### Rules that are easy to undo by accident
+
+Each was found by tracing a path rather than by reading this document, which is exactly why the next
+person will not re-derive them.
+
+- **The install set is the applicable members of the *environment's resolution*** — with the owner
+  (the last applicable member) as a fallback for the empty case and **never as an addition**. Adding
+  the owner puts a non-headless contrib build into an environment that asked for headless, which
+  then fails `import cv2` on a host with no `libGL`; narrowing the set to what one *call* touches
+  lets a subset arriving later be the only member written, taking the namespace from a superset that
+  was already there. The empty case is not a corner: an environment whose only onnxruntime consumer
+  is transitive (`agent_crewai` → `crewai` → `chromadb`) resolves the *plain* distribution, which
+  does not apply on Linux, and without the fallback nothing is installed at all.
+- **When the step fires and what it installs are different questions.** *When* comes from the
+  install's dry-run; *what* comes from the environment's resolution. Take the trigger from the
+  resolution and the very first `depends()` of startup — `ai/requirements.txt`, which wants nothing
+  from opencv — drags every opencv wheel the installation resolves into that bootstrap.
+- **That dry-run must not carry the family exclusions.** `_install_dry_run` passes `--excludes`, so
+  handing it the family set makes its answer "no member will be installed" by construction: the
+  trigger can never fire, the ordered passes never run, and the namespace vanishes from every
+  environment as an `ImportError` rather than a build failure. It gets the **base** set only.
+- **The early return subtracts family members** from that list, or a member excluded *by design*
+  (plain `onnxruntime` on Linux) reads as permanently missing and every call reinstalls the world.
+  Whether the family itself has work is answered from the target's `*.dist-info` directory names — a
+  directory listing, not a `uv` run, because `builder nodes:test` makes that cost real.
+- **The excludes file is content-addressed** (`cache/excludes-<hash>.txt`, written if absent). Its
+  content stopped being a constant — it depends on which families a call installs, which under the
+  base runtime varies per *requirements file* — and the trigger needs the smaller base set alive at
+  the same moment as an install's larger one. One rewritten path would have two callers clobber each
+  other; a per-environment path fixes neither, since the varying axis in the base is the call.
+- **The last member of the install set is force-relaid** (`--reinstall-package`) whenever an earlier
+  one was actually installed. Order alone does not make the widest member win — the *write* does, and
+  uv skips the write for a distribution it already considers satisfied. Decided from the
+  `*.dist-info` listing before any pass starts, not by reading uv's output afterwards.
+- **`_target_site()`, never the env var**, decides base-versus-overlay behaviour. The switch has
+  three states and the default is `auto`, where both kinds of environment exist in one installation.
+- **A declared `namespace_version` skips derivation entirely** — no minimum, no derived block, no
+  second compile. A block naming a member nothing resolves would make the second pass run on *every*
+  recompile forever, doubling a compile that resolves the whole tree; and the ordered install passes
+  the declared version explicitly, so the resolution never needs to mention it.
+- **The derived block goes in as requirements, never as `-c`.** A constraint on a distribution
+  nothing requests is a no-op, so it would never check that `V` exists for a member no consumer
+  names — and checking exactly that is the point. (A learned ceiling, when narrowing lands, is the
+  exact inverse and must be `-c`. The two rules look contradictory side by side and are the same
+  rule applied to opposite intents; getting either backwards is silent.)
+- **The `# via` annotations of the compiled constraints are load-bearing**, not decoration: they are
+  where "who asked for this version" comes from, so `--no-annotate` must never be added to either
+  compile as a tidiness measure.
+- **A failed aligned compile is only a *conflict* when it names a family member.** Otherwise it is an
+  ordinary compile failure that happened to surface in the second pass, and it is reported as one —
+  sending a user to build a Virtual Environment container over an unreachable index would be worse
+  than a generic error. When `V` was **declared**, a member that cannot be installed is not a
+  conflict either: nobody's consumers disagree, the authored number is wrong (a release can be
+  withdrawn, as onnxruntime `1.20.1` was for the `-gpu` build), and the message names the declaration.
+- **The family declarations enter the drift hash**, by content and **per family**, folded into the
+  environments that actually contain them. They live in `lib/` where `_compute_hash` never looks, so
+  without this an operator edits a declared version and watches nothing happen. Per family rather
+  than one blob for §4.8's reason — one shared input in every environment's set rebuilds them all —
+  and an environment holding no family member keeps its hash **byte-identical**, so it does not
+  rebuild once for a mechanism it never uses. The digest is read from the environment's *previous*
+  resolution, the only thing that knows which families it holds before the compile that would say so
+  again.
+- **When the namespace is already imported in this process, the environment is finished and
+  *recorded*, and then the run is refused.** A loaded extension module cannot be replaced under a
+  live interpreter: on Windows the write fails on the locked file, on Linux it succeeds while the
+  running process keeps serving the old module — the silent half, and the worse one. Recording
+  first is what stops the restart from repeating the whole build, so the condition travels out of
+  `_compile_and_install` as a returned exception that `run_scoped_install` re-raises *after*
+  `mark_installed`. The base path has no such bookkeeping and raises directly.
+- **And that check runs outside every gate.** Base and an overlay align over different input sets —
+  the base over the union of every requirement file, an overlay over its own consumers — so they
+  legitimately hold different versions, and a `sys.path` insert does not re-import what is already
+  loaded. Shadowing is therefore *most* likely when there is nothing to do: an overlay whose hash
+  matched is never rebuilt and a satisfied `depends()` returns at its gate. Behind either, the common
+  case is never noticed and the pipeline silently uses the build the parent had loaded. The check
+  costs a `sys.modules` lookup per registered family and reads the resolution only past that.
+
+#### Windows locks: (ii) quiesce
+
+A drift-rebuild is refused while the environment is in use, with a named error rather than uv's
+access-denied; main-environment drift on a resident engine therefore requires a restart. This
+relates to 8.6's active-run gate and inherits its check-then-act residual. **Recorded here as the
+decision; building it is a named follow-up** — INVESTIGATE §8 asks for the decision, and the
+lifecycle surface in §4.10 is where the implementation belongs.
+
+The forced re-lay of the widest member makes the hazard **more reachable** rather than new: a rebuild
+might once have left `cv2/` untouched because uv found it satisfied; now, when the family changes, it
+is written on purpose. The base-environment sibling is *not* deferred — the already-imported check
+above ships with the family step, because without it a Linux base runtime writes a new member under a
+live interpreter and then reports success for a version it is not running.
+
 ---
 
 ## 5. Open questions — resolved (with residual verification noted)
@@ -1677,7 +1877,9 @@ elsewhere that carry `environment`.
    constraints/lock/`requirements.hash`; the overlay hook (a **swap**, §4.11); default-env fallback when
    no `project_id`; the module-global install state resolved into `EnvContext` + `use_env()`, an
    install-operation progress stack, and a reentrant `FileLock` (§4.9). One install-argv builder serves
-   both paths, and `-r` includes are handled when combining (§4.8).
+   both paths — now including the ordered package-family passes, which install explicit specs rather
+   than a requirements file and can force a re-lay (§4.16); a second builder is exactly the drift it
+   exists to prevent. `-r` includes are handled when combining (§4.8).
    *Still open:* **base = engine runtime only**, deferred with its reasoning in §4.9 — it needs the
    non-pipeline entry points (saas model server first) to get environments, or it degrades into the
    rejected half shrink.
@@ -1717,21 +1919,47 @@ elsewhere that carry `environment`.
    venv *runtime* is primarily for **internal / no-model-server mode**, where conflicting nodes share one
    in-process interpreter. This sharpens sequencing: ship 2A broadly, prioritize 2B for internal-mode
    users.
-**2A-4 — OCR opencv de-conflict (investigated; DEFERRED, sequenced after 2B).** Full written
-analysis + verified fact base + change list + verification plan live in
-`packages/server/design/INVESTIGATE-opencv-ocr-venv.md` (bilingual; entry prompt for the work chat:
-`NEXT-STEP-2A-ocr-opencv-prompt.md`). Scope: split the `ocr` node into per-services components
-(standard EasyOCR+DocTR+tables in `services.json`, Surya in `services.surya.json`, TrOCR
-proxied-only), demote the `ai.common.opencv` shim to a pure re-export, pin engines honestly, and
-add `--overrides` (+ a =1 contrib-last ordered opencv install) so each engine resolves its true
-OpenCV instead of the silent shim-forced downgrade. **Why it can wait:** it is NOT on the critical
-path — under =1 an OCR env still COMPILES today (unpinned engines backtrack silently, opencv stays
-4.13, the shim `depends()` is a no-op), so the venv runtime runs OCR on the existing shim hack with
-no crash. It is an independently-shippable Phase 2A quality/correctness item; the silent
-surya→0.16.1 downgrade is a dormant issue (surya/trocr are `contract-check: disable`, and OCR is
-proxied in model-server deployments). **Trigger to pull it forward:** a near-term product need for
-local Surya/TrOCR usability, or evidence the silent downgrade is actually biting a local load.
-Do 2B (partitioner cut → spawn → orchestrator) first.
+**2A-4 — shared-namespace package families, environment facts and probes (IN PROGRESS).** Not "OCR
+opencv de-conflict" any more: the OCR split is the framework's *first consumer*, not its subject.
+The mechanism is §4.16; the investigation that produced it, its verified fact base and its
+verification plan live in `packages/server/design/INVESTIGATE-opencv-ocr-venv.md` (bilingual).
+2B is closed, so the old "DEFERRED, sequenced after 2B" and "Do 2B first" no longer apply.
+
+Scope, in the order it lands. **Done: 1. Remaining: 2–6** — keep this line current, because a phase
+entry that says "next" long after the thing shipped is how §7 went stale before.
+
+1. **`lib/pkg_families/`** *(landed)* — the registry, environment facts, alignment and the ordered install,
+   with `cv2` as its only registered inhabitant. Verified by resolving and installing **identically
+   to today**: the shim still pins all four opencv members, so the machinery is provably inert
+   before anything depends on it. onnxruntime is declared here but deliberately *not* registered —
+   registering a family changes what its environments install, and for that one the change is not
+   neutral until its version is declared.
+2. **Probes** — subprocess proof of the environment just built, three verdicts, and one
+   probe-strictness lever.
+3. **TrOCR and `craft-text-detector` leave the tree**, which has to precede the opencv move:
+   craft's `opencv-python < 4.5.4.62` and Surya 0.17's `opencv-python-headless == 4.11.0.86` cannot
+   share one namespace once the shim stops overriding both, and uv reports no conflict between them
+   because they are different distributions. Half of it is out of this repository — see the saas
+   step below.
+4. **The opencv ownership move** — the `ai.common.opencv` shim is deleted outright rather than
+   demoted to a re-export (nothing imports it afterwards, in this repo or in saas), its two
+   requirement files go with it, and the two nodes that were riding its pins declare
+   `opencv-python-headless<5` of their own. **No base-environment override**: the base aligns
+   exactly as an overlay does and moves from `4.13.0.92` to `4.11.0.86` in every installation.
+5. **onnxruntime as the second family** — the ten copied `onnxruntime-gpu==1.22.0` /
+   `onnxruntime==1.22.0` lines across five requirement files become one `namespace_version`, and
+   the hard-coded exclusion in `_write_excludes_file` becomes data.
+6. **The OCR node split** (Layout S, granularity M) and the honest `surya-ocr>=0.17,<0.18` range.
+
+**A new numbered step, because half of it is out of this repository:** *remove TrOCR from the saas
+side, first.* This repo deletes the loader, its requirements and the barrel exports;
+`rocketride-saas` drops `ModelType.TROCR`, `TrOCRLoader` from the shared
+`from ai.common.models import (...)` in `model_manager.py` and its mapping row, plus two comment
+lists in `warmup_models.py`. Ordering is the point: that import serves **every** model type, so the
+export deleted here and still named there is not "TrOCR breaks", it is model loading breaking for
+everything — lazily, at first load in a running deployment, where this repository's CI cannot see
+it. If the saas change cannot land first, the fallback is a deprecation stub in the barrel, deleted
+once it has.
 
 - **Tests (§8.1–8.3):** AST-walk / resolution-rule / `depends`-parameterization / model-server-pruning
   **unit tests**; the `vtest_alpha`/`vtest_beta` **fixture nodes**; the **no-venv-conflict-fails** and
@@ -2375,6 +2603,32 @@ Three layers; each test is tagged with the phase that first makes it runnable (*
   file when `--node_path` nests inside the exe dir. One more pins the trade the rule rests on: the
   `ai.common.models` barrel needs nothing beyond the baseline at **import** time (`numpy`, `wave`,
   `rocketride`) — if that stops holding, harvest-only has become an under-inclusion.
+- **Shared-namespace package families (§4.16)** — two files, and the split between them is the
+  stdlib-only rule made visible. `test_pkg_families.py` runs under **bare `pytest`**, no engine: the
+  alignment minimum over *every* member that appeared (including the case a "matching members only"
+  rule gets wrong, which is invisible in production until onnxruntime stops declaring its version);
+  a declared `namespace_version` returned without derivation; the install set drawn from the
+  environment's resolution with the owner only as an empty-case fallback; the declared member order
+  with `-headless` ahead of the GUI build, and the forced re-lay of the widest member exactly when
+  something earlier is laid down; the derived block absent for a declared family; the drift-hash
+  contribution present for an environment holding a family and **byte-absent** for one that does
+  not; the CUDA fact parsed from the real torch file and **absent under Darwin markers rather than
+  wrong**; the GPU fact resolved lazily and answering *unknown* rather than *absent*. Every input is
+  injected, so none of it needs a GPU, `uv`, or a network.
+  `test_depends_families.py` needs `engLib` and runs under the engine: the trigger's dry-run is
+  given the **base** exclusion set and never the family one (the single easiest way to implement the
+  whole thing wrongly and still see green unit tests); a dry-run naming only members still counts as
+  nothing to do; an ordered pass is never handed its own family to exclude — measured on the live
+  engine, because `--excludes` excludes from *resolution* and a pass that excludes its own target
+  reports success while installing nothing; and shadowing in both of its refusing shapes — a write
+  about to land under a loaded module, and an environment merely *providing* a different version
+  with **nothing to install** — each paired with the case that must stay silent, since a check that
+  only ever fires is indistinguishable from one that always fires. The nothing-to-install pair is
+  the load-bearing one: it is where a gated check would never run at all.
+  The **orchestration** half sits in `test_venv_env.py` rather than either, because that is where
+  `run_scoped_install` lives: a returned refusal is re-raised only *after* `mark_installed`, and the
+  restart that follows finds a matching hash and rebuilds nothing. Both assertions are needed — the
+  first alone passes if the environment is recorded and the second start rebuilds anyway.
 - **`depends.py` per-env parameterization** — env-keyed paths / lock / `_processed` / progress;
   `requirements.hash` drift → reinstall; default-env fallback when no `project_id`; base =
   engine-runtime-only. [2A] **Implemented cases (`test_depends_scoping.py`, engine interpreter;
@@ -2537,8 +2791,9 @@ measured).
   2. *A fixed `project_id` is a fixed token.* The acceptance keys a stable project id so its three
      overlays are reused across gate runs — but the task token is `sha256({…, project_id, source})`
      and `ttl=0` leaves the task resident, so the **second** run was refused with
-     `Pipeline is already running.` (§4.10's rake 3, arriving from a direction the plan had only
-     considered for concurrency). Fixed by `use_existing=True` plus a `terminate()` in `finally`,
+     `Pipeline is already running.` (the same rake 8.7A hit first, in §7 — arriving here from a
+     direction §4.10 had only considered for concurrency, since nothing about this is concurrent:
+     one run, twice, in sequence). Fixed by `use_existing=True` plus a `terminate()` in `finally`,
      which keeps warm overlays without leaving a task behind. Verified by running it twice
      back-to-back.
 
@@ -2675,6 +2930,12 @@ measured).
   `model_cache_dir` / `FileLock`; the AST **walk** (over the entry-module paths the partitioner
   resolves — `depends.py` itself never reads the `.pipe`) + per-env parameterization + overlay hook
   land here.
+- `packages/server/engine-lib/rocketlib-python/lib/pkg_families/` — the shared-namespace family
+  registry (§4.16): `__init__.py` (rules, resolution parsing, drift-hash contribution), `facts.py`
+  (python/platform/CUDA/GPU), `markers.py` (a small PEP 508 evaluator, because this package is read
+  during bootstrap and cannot depend on a wheel), and one module per family. **Stdlib-only** — it is
+  read by `depends.py`, so importing anything from the engine side would make the rules untestable
+  under bare `pytest`; the same reason `venv_env.py` mirrors helpers instead of importing `depends`.
 - UI: `packages/shared-ui/src/components/canvas/util/graph.ts` (`getProjectComponents`),
   `.../context/FlowGraphContext.tsx` (`onNodeDragStop`, `isValidConnection`),
   `.../node/node-group/NodeGroup.tsx`, `packages/client-typescript/src/client/types/pipeline.ts`,
