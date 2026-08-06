@@ -27,7 +27,7 @@ import signal
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, FrozenSet, List, NamedTuple, Optional
+from typing import Any, Callable, Deque, Dict, FrozenSet, List, NamedTuple, Optional
 
 # Per-run shared bridge secret. Delivered to the main engine and every child via an
 # inherited env var (never argv, never the on-disk task file); the child's /venv/pipe
@@ -297,6 +297,7 @@ async def await_child_ready(
     process: 'asyncio.subprocess.Process',
     silence_ceiling: float = 30.0,
     interval: float = 0.25,
+    clock: Callable[[], float] = time.monotonic,
 ) -> str:
     """Wait until the child proves ``/venv/pipe`` is mounted; return how well it was proved.
 
@@ -326,6 +327,11 @@ async def await_child_ready(
         silence_ceiling: Seconds of total quiet tolerated in either phase (default matches the
             old 120 x 0.25 s budget). Injectable so tests do not sleep out real ceilings.
         interval: Poll period for both phases.
+        clock: Source of monotonic time, injectable for the same reason the ceiling is — and for
+            one more. A test that drives the ceiling with real ``asyncio.sleep`` is racing the
+            scheduler: on a loaded machine a pause longer than the ceiling reads as silence and
+            a healthy child is reported degraded. Feeding a clock the test advances itself makes
+            "did the child speak" independent of whether the box was busy.
 
     Returns:
         ``READY_CONFIRMED`` when the child announced itself; ``READY_DEGRADED`` when the socket
@@ -337,11 +343,11 @@ async def await_child_ready(
         RuntimeError: the child exited during startup, or nothing ever accepted on ``port``
             while the child stayed silent.
     """
-    started = time.monotonic()
+    started = clock()
 
     def quiet_for() -> float:
         """Seconds since the last sign of life (the wait's own start counts as one)."""
-        return time.monotonic() - max(child.last_event_at, started)
+        return clock() - max(child.last_event_at, started)
 
     def _bail_if_dead() -> None:
         if process.returncode is not None:
