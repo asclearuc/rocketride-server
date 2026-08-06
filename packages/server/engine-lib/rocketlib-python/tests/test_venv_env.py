@@ -458,6 +458,76 @@ def test_run_scoped_install_auto_needs_isolated_group(tmp_path):
     assert V.run_scoped_install(str(tmp_path), 'p', 'main', ['x'], has_isolated_group=True, **base) is not None
 
 
+def test_run_scoped_install_records_the_environment_before_re_raising_a_deferred_error(tmp_path):
+    """Restart-required is recorded *then* refused, or the restart repeats the whole build.
+
+    The condition travels back as a returned exception rather than being thrown from inside
+    ``compile_and_install``, precisely because ``mark_installed`` lives on this side. Raising
+    first would leave the hash unwritten, so the restart the message asks for rebuilds
+    everything and the operator watches the fix appear not to take.
+    """
+    req = _req(tmp_path, 'r.txt', 'tabulate==0.8.10\n')
+    refusal = RuntimeError('cv2 is already imported in this process')
+    overlaid = []
+
+    def ci(plan):
+        open(plan.paths.constraints, 'w').close()
+        return refusal
+
+    with pytest.raises(RuntimeError) as raised:
+        V.run_scoped_install(
+            str(tmp_path),
+            'p',
+            'main',
+            ['x'],
+            discover=_stub_discover([req]),
+            compile_and_install=ci,
+            on_overlay=overlaid.append,
+            mode=V.USE_ON,
+        )
+    assert raised.value is refusal
+    paths = V.env_paths(V.env_dir(str(tmp_path), 'p', 'main'))
+    assert os.path.isfile(paths.hash_file), 'recorded before the refusal'
+    assert overlaid == [], 'the run is refused, so the overlay is never applied'
+
+
+def test_run_scoped_install_second_start_does_not_rebuild_after_a_deferred_error(tmp_path):
+    """The other half of the same rule: having recorded, the restart proceeds without work."""
+    req = _req(tmp_path, 'r.txt', 'tabulate==0.8.10\n')
+    calls = []
+
+    def ci(plan):
+        open(plan.paths.constraints, 'w').close()
+        calls.append(1)
+        return RuntimeError('restart required') if len(calls) == 1 else None
+
+    kwargs = dict(discover=_stub_discover([req]), compile_and_install=ci, mode=V.USE_ON)
+    with pytest.raises(RuntimeError):
+        V.run_scoped_install(str(tmp_path), 'p', 'main', ['x'], **kwargs)
+    V.run_scoped_install(str(tmp_path), 'p', 'main', ['x'], **kwargs)
+    assert calls == [1], 'the second start found a matching hash and did nothing'
+
+
+def test_a_family_declaration_change_drifts_only_environments_holding_that_family(tmp_path):
+    """The declarations live in ``lib/pkg_families/*.py``, where the requirement-file walk never
+    looks. Without them in the hash an operator edits a declared version and nothing happens.
+    """
+    req = _req(tmp_path, 'r.txt', 'tabulate==0.8.10\n')
+    paths = V.env_paths(V.env_dir(str(tmp_path), 'p', 'main'))
+    os.makedirs(os.path.dirname(paths.constraints), exist_ok=True)
+
+    with open(paths.constraints, 'w', encoding='utf-8') as fh:
+        fh.write('tabulate==0.8.10\n')
+    without_family = V.plan_install(str(tmp_path), 'p', 'main', [req]).current_hash
+
+    with open(paths.constraints, 'w', encoding='utf-8') as fh:
+        fh.write('tabulate==0.8.10\nopencv-python-headless==4.13.0.92\n')
+    with_family = V.plan_install(str(tmp_path), 'p', 'main', [req]).current_hash
+
+    assert with_family != without_family
+    assert ':' not in without_family, 'a family-free environment keeps its bytes and does not rebuild'
+
+
 def test_run_scoped_install_skips_when_no_requirements(tmp_path):
     # nothing to scope (source-only / native-only env): must not compile an absent file
     installed = []

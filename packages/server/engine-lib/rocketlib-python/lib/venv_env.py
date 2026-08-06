@@ -42,6 +42,10 @@ if os.name == 'nt':
 else:
     import fcntl
 
+# Stdlib-only sibling, so importing it keeps this module free of engLib (the reason the
+# hash/combine helpers below are mirrored from depends rather than imported).
+import pkg_families
+
 # env_id for the always-present base-of-the-pipeline environment.
 MAIN_ENV = 'main'
 # Used when there is no project_id (engtest, CLI, ad-hoc runs).
@@ -443,6 +447,12 @@ def plan_install(
     # Hash over the includes too: a `-r`-referenced file shapes the resolution and must
     # therefore be able to invalidate it.
     current = requirements_hash(resolve_includes(req_files)) if req_files else ''
+    # And over the declarations of the families this environment holds, which live in
+    # lib/pkg_families/*.py where the file walk above never looks. Read from the environment's
+    # *previous* resolution, the only thing that knows which families it contains before the
+    # compile that would tell us again. An environment holding none keeps its bytes unchanged.
+    if current:
+        current = pkg_families.combine_hash(current, pkg_families.hash_contribution(paths.constraints))
     stored = _read_text(paths.hash_file)
     needs = (current != stored) or not os.path.exists(paths.constraints)
 
@@ -466,34 +476,54 @@ def mark_installed(plan: InstallPlan) -> None:
 def build_install_argv(
     uv_path: str,
     python_exe: str,
-    requirements_path: str,
+    requirements_path: Optional[str] = None,
     target_site: Optional[str] = None,
     constraints_path: Optional[str] = None,
     excludes_path: Optional[str] = None,
+    specs: Optional[list[str]] = None,
+    reinstall_packages: tuple[str, ...] = (),
 ) -> list[str]:
     """Construct the ``uv pip install`` argv, optionally targeting an overlay.
 
-    The single builder for both install paths: ``target_site=None`` installs into the
+    The single builder for **every** install path: ``target_site=None`` installs into the
     base runtime, a path installs into that environment's overlay. Keeping them one
     function is the point — while there were two, a flag added to one silently diverged
     from the other.
+
+    Takes **either** a requirements file (``-r``) or explicit ``specs``. The ordered
+    package-family passes install named members rather than a file, and giving them a
+    second builder — or a throwaway temp requirements file whose only purpose is to satisfy
+    this signature — is how a third divergence would start.
+
+    ``reinstall_packages`` maps to ``--reinstall-package``. Order alone does not make the
+    widest member of a family win: the *write* does, and uv skips the write for a
+    distribution it already considers satisfied.
 
     Pure (returns the list; the caller runs it) so it is unit-testable. ``uv`` splits
     ``-c`` and ``--excludes`` values on whitespace, so pass those already relative to the
     directory the command will run in.
     """
+    if bool(requirements_path) == bool(specs):
+        raise ValueError('build_install_argv takes exactly one of requirements_path or specs')
+
     argv = [
         uv_path,
         'pip',
         'install',
         '--python',
         python_exe,
-        '-r',
-        requirements_path,
+    ]
+    if requirements_path:
+        argv += ['-r', requirements_path]
+    else:
+        argv += list(specs or ())
+    argv += [
         '--index-strategy',
         'unsafe-best-match',
         '--no-build-isolation',
     ]
+    for name in reinstall_packages:
+        argv += ['--reinstall-package', name]
     if target_site:
         argv += ['--target', target_site]
     if constraints_path:
@@ -528,6 +558,13 @@ def run_scoped_install(
     the overlay (it receives the whole :class:`EnvPaths`, not just the site-packages
     directory, so the caller does not have to re-derive the constraints path from it).
 
+    ``compile_and_install`` may **return** an exception instead of raising one, for the case
+    where the environment is correct but this process cannot use it (a shared namespace
+    already imported here). Recording has to come first there: raise before
+    :func:`mark_installed` and the restart the message asks for repeats the whole build, and
+    the operator watches the fix appear not to take. The exception is constructed by the
+    caller and merely re-raised here, so this module stays free of engine error types.
+
     Installs only when the requirement set drifted. Returns ``None`` when scoping does
     not apply, leaving the caller on the base runtime.
     """
@@ -542,8 +579,10 @@ def run_scoped_install(
         return None
     plan = plan_install(exe_dir, project_id, env_id, req_files)
     if plan.needs_rebuild:
-        compile_and_install(plan)
+        deferred = compile_and_install(plan)
         mark_installed(plan)
+        if isinstance(deferred, BaseException):
+            raise deferred
     if on_overlay is not None:
         on_overlay(plan.paths)
     return plan.paths.site_packages

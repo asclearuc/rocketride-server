@@ -41,6 +41,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from glob import glob
 from typing import Optional
 
@@ -55,6 +56,7 @@ from engLib import args as engine_args, debug, monitorStatus, error
 
 # Sibling stdlib-only modules backing the per-environment scoped install.
 import ast_deps
+import pkg_families
 import venv_env
 
 # ---------------------------------------------------------------------------
@@ -872,8 +874,23 @@ def _combine_requirements(file_paths: list[str], output_path: str):
     venv_env.write_combined(file_paths, output_path)
 
 
-def _compile_constraints(constraints_path: str):
-    """Use uv pip compile to generate constraints file."""
+class CompileFailed(RuntimeError):
+    """A ``uv pip compile`` that returned non-zero, carrying uv's own explanation.
+
+    The detail is kept as an attribute because the second, aligned compile has to read it:
+    a failure naming a family member is a namespace conflict with a container remedy, and a
+    failure naming nothing of the sort is an ordinary compile failure that merely surfaced
+    there. Reporting the second as the first would send an operator to split a pipeline over
+    an unreachable index.
+    """
+
+    def __init__(self, detail: str):
+        super().__init__(f'Failed to compile constraints: {detail[:800]}')
+        self.detail = detail
+
+
+def _run_uv_compile(combined_path: str, constraints_path: str) -> None:
+    """One ``uv pip compile`` pass, ``combined_path`` -> ``constraints_path``."""
     if not _uv_available():
         raise RuntimeError('uv executable not found')
 
@@ -884,9 +901,9 @@ def _compile_constraints(constraints_path: str):
         _uv_abs_path(),
         'pip',
         'compile',
-        _get_combined_path(),
+        combined_path,
         '--output-file',
-        _get_constraints_path(),
+        constraints_path,
         '--python',
         sys.executable,  # Explicitly specify Python version to avoid mismatch
         '--index-strategy',
@@ -910,9 +927,14 @@ def _compile_constraints(constraints_path: str):
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or '').strip()
         error(f'Failed to compile constraints: {detail}')
-        raise RuntimeError(f'Failed to compile constraints: {detail[:800]}')
+        raise CompileFailed(detail)
 
     debug(f'Constraints compiled: {constraints_path}')
+
+
+def _compile_constraints(constraints_path: str):
+    """Compile the global union, then align any package family it turned up."""
+    _compile_constraints_at(_get_combined_path(), constraints_path)
 
 
 def ensure_constraints() -> str:
@@ -935,10 +957,16 @@ def ensure_constraints() -> str:
         debug('No requirement files found')
         return constraints_path
 
-    # Hash the includes too: a `-r`-referenced file shapes the resolution, so it has to
-    # be able to invalidate it. Overrides shape it exactly as much, so they go through the
-    # same walk rather than being appended beside it.
-    current_hash = _compute_hash(venv_env.resolve_includes(req_files + override_files))
+    # Hash the includes too: a `-r`-referenced file shapes the resolution, so it has to be
+    # able to invalidate it, and an override shapes it exactly as much — so both go through
+    # the same walk. And the family declarations, which live in lib/ where the walk never
+    # looks: without that, editing a declared namespace version changes nothing and the
+    # documented remedy silently does nothing. Environments holding no family member keep
+    # their bytes unchanged and do not rebuild for this.
+    current_hash = pkg_families.combine_hash(
+        _compute_hash(venv_env.resolve_includes(req_files + override_files)),
+        pkg_families.hash_contribution(constraints_path),
+    )
     stored_hash = _load_stored_hash(hash_file)
 
     # Check if rebuild is needed. The derived overrides cache is part of the
@@ -979,24 +1007,49 @@ def ensure_constraints() -> str:
 # ---------------------------------------------------------------------------
 
 
-def _excludes_content() -> str:
-    """Content of uv's resolution-excludes file for this platform.
+def _base_excludes() -> tuple[str, ...]:
+    """The exclusions that hold for every install, family machinery aside.
 
-    Excludes `uv` (bootstrapped by depends.py; pip-installing it crashes on Windows)
-    and, on non-Darwin, plain `onnxruntime` (it clobbers onnxruntime-gpu in the same
-    folder; the gpu build provides `import onnxruntime`).
+    `uv` is bootstrapped by depends.py and pip-installing it crashes on Windows. Plain
+    `onnxruntime` clobbers onnxruntime-gpu in the same folder on non-Darwin; that line is
+    a hand-written family rule and moves into `pkg_families` with the declaration.
     """
-    excludes = 'uv\n'
+    excludes = ['uv']
     if platform.system() != 'Darwin':
-        excludes += 'onnxruntime\n'
-    return excludes
+        excludes.append('onnxruntime')
+    return tuple(excludes)
 
 
-def _write_excludes_file() -> str:
-    """Write uv's resolution-excludes file (rewritten each call) and return its path."""
-    excludes_path = os.path.join(engine_cache_dir(), 'excludes.txt')
-    with open(excludes_path, 'w', encoding='utf-8') as f:
-        f.write(_excludes_content())
+def _write_excludes_file(extra: tuple[str, ...] = ()) -> str:
+    """Write uv's resolution-excludes file **content-addressed** and return its path.
+
+    One rewritten `cache/excludes.txt` was safe only while the content was a constant and
+    every caller wanted the same bytes. Neither holds now: the set depends on which
+    families *this* install covers — which under the base runtime varies per requirements
+    file, not per environment — and the trigger's dry-run needs the smaller base set alive
+    at the same moment as an install's larger one.
+
+    So the path is derived from the content: callers computing the same exclusions land on
+    the same bytes at the same path, callers computing different ones cannot overwrite each
+    other, and "who might be writing this file right now" stops being a question rather than
+    getting an answer. Written via a temporary file and renamed, so a concurrent reader
+    never sees a partial one.
+    """
+    seen: set[str] = set()
+    lines: list[str] = []
+    for name in tuple(_base_excludes()) + tuple(extra):
+        key = name.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            lines.append(name.strip())
+    content = '\n'.join(lines) + '\n'
+    digest = hashlib.md5(content.encode('utf-8')).hexdigest()[:12]
+    excludes_path = os.path.join(engine_cache_dir(create=True), f'excludes-{digest}.txt')
+    if not os.path.exists(excludes_path):
+        temporary = f'{excludes_path}.{os.getpid()}.tmp'
+        with open(temporary, 'w', encoding='utf-8') as f:
+            f.write(content)
+        os.replace(temporary, excludes_path)
     return excludes_path
 
 
@@ -1182,12 +1235,279 @@ def _target_args() -> list[str]:
     return ['--target', site] if site else []
 
 
-def _install_dry_run(requirements_path: str, constraints_path: str) -> list[str]:
+# ---------------------------------------------------------------------------
+# Shared-namespace package families
+# ---------------------------------------------------------------------------
+
+
+class RestartRequired(RuntimeError):
+    """The environment is correct; this **process** cannot run on it.
+
+    Raised when a family's namespace is already in ``sys.modules`` and the environment
+    provides a different build of it. A loaded extension module cannot be replaced under a
+    live interpreter, and a ``sys.path`` insert does not re-import what is already loaded —
+    so the environment is finished and recorded, and then the *run* is refused. Refusing the
+    build instead would be untrue: there may be nothing to install at all.
+    """
+
+
+_facts_cache: Optional[pkg_families.Facts] = None
+
+
+def _facts() -> pkg_families.Facts:
+    """The environment facts, one instance per process (each fact resolves lazily inside)."""
+    global _facts_cache
+    with _state_lock:
+        if _facts_cache is None:
+            _facts_cache = pkg_families.Facts(exe_dir=_get_executable_dir())
+        return _facts_cache
+
+
+@dataclass
+class _FamilyWork:
+    """One family in play for an install: what it holds the namespace at, and what is left."""
+
+    family: pkg_families.Family
+    version: str
+    members: tuple[pkg_families.Member, ...]
+    passes: tuple[pkg_families.InstallPass, ...]
+
+
+def _read_resolution(constraints_path: str) -> dict[str, str]:
+    """The environment's compiled resolution, or empty when it has not been compiled yet."""
+    try:
+        with open(constraints_path, 'r', encoding='utf-8') as fh:
+            return pkg_families.parse_resolution(fh.read())
+    except OSError:
+        return {}
+
+
+def _family_work(constraints_path: str, target_site: str, trigger: Optional[list[str]] = None) -> list[_FamilyWork]:
+    """The families this install must handle, and the ordered passes each still owes.
+
+    **Two questions, deliberately kept apart.** *When* the step runs is per call and comes
+    from ``trigger`` — the packages this install would actually touch, from its dry-run.
+    *What* it installs is a property of the environment, read from its compiled
+    ``constraints.txt``. Keying the step off the resolution would drag every opencv wheel
+    the installation resolves into the very first ``depends()`` of startup, which asks for
+    nothing from opencv; drawing the set from the call would let a subset arriving later be
+    the only member written and take the namespace from a superset already there.
+
+    ``trigger=None`` means "presence in the resolution is the trigger", which is the overlay
+    path: :func:`_install_target` installs the whole combined file in one go and has no
+    dry-run, so a family present in the resolution is by construction a family being
+    installed. An implementer looking for a dry-run there will not find one.
+    """
+    resolved = _read_resolution(constraints_path)
+    if not resolved:
+        return []
+    installed = pkg_families.installed_versions(target_site)
+    facts = _facts()
+    wanted = None if trigger is None else {pkg_families.normalize(name) for name in trigger}
+
+    work: list[_FamilyWork] = []
+    for family in pkg_families.members_in(resolved):
+        if wanted is not None and not any(pkg_families.normalize(m.dist) in wanted for m in family.members):
+            continue
+        version = pkg_families.align(family, resolved)
+        if not version:
+            continue
+        members = pkg_families.install_set(family, resolved, facts)
+        work.append(
+            _FamilyWork(
+                family=family,
+                version=version,
+                members=members,
+                passes=pkg_families.install_batches(family, version, members, installed),
+            )
+        )
+    return work
+
+
+def _shadowing(work: _FamilyWork) -> Optional[str]:
+    """Why this process cannot run on the environment it just built, or ``None``.
+
+    Two shapes, one answer. The namespace may be **about to be rewritten** under a live
+    interpreter — on Windows that write fails on the locked extension, on Linux it succeeds
+    and the running process keeps serving the old module while the environment reports the
+    new one, which is the worse of the two because it is silent. Or the environment may
+    simply **provide a different version** than the one already loaded: under the default
+    ``auto`` the base and an overlay align over different input sets, so they legitimately
+    differ, and an overlay reaching the process as a ``sys.path`` insert does not re-import
+    what is already there.
+
+    Only the *write* half is load-bearing here, because only here is it known that something
+    is about to be laid down. The version half also lives in :func:`_shadowing_check`, which
+    runs outside the gates — this one would never see the case where there is nothing to do.
+    """
+    loaded = sys.modules.get(work.family.import_name)
+    if loaded is None:
+        return None
+    loaded_version = getattr(loaded, '__version__', None)
+    if work.passes:
+        return (
+            f'{work.family.import_name} is already imported in this process'
+            f' (version {loaded_version or "unknown"}) and the environment installs'
+            f' {work.family.name} at {work.version}'
+        )
+    if loaded_version and loaded_version != work.version:
+        return (
+            f'{work.family.import_name} was imported from another environment at'
+            f' {loaded_version}; this one provides {work.version}'
+        )
+    return None
+
+
+def _shadowing_check(constraints_path: str) -> Optional[RestartRequired]:
+    """Refuse the run when a family's namespace is loaded here at another version.
+
+    **Deliberately outside every gate**, unlike the rest of the family step, and that is a
+    correction rather than a flourish: shadowing is at its most likely exactly when there is
+    *nothing to do*. An overlay whose hash matches is never rebuilt, so its install path never
+    runs; a ``depends()`` call whose requirements are satisfied returns at its gate. Put this
+    check behind either and the common case — parent imported ``cv2`` from base, pipeline then
+    runs on an already-built overlay that holds a different one — is never noticed at all, and
+    the pipeline silently uses the wrong build.
+
+    Costs nothing when it does not apply: a ``sys.modules`` lookup per registered family, and
+    the resolution is read only once one of them is actually loaded.
+    """
+    loaded = [family for family in pkg_families.families() if family.import_name in sys.modules]
+    if not loaded:
+        return None
+    resolved = _read_resolution(constraints_path)
+    if not resolved:
+        return None
+    for family in loaded:
+        if not any(pkg_families.normalize(m.dist) in resolved for m in family.members):
+            continue
+        version = pkg_families.align(family, resolved)
+        module_version = getattr(sys.modules[family.import_name], '__version__', None)
+        if version and module_version and module_version != version:
+            return RestartRequired(
+                f'{family.import_name} was imported from another environment at {module_version};'
+                f' this one provides {version}. A sys.path insert does not re-import a loaded'
+                ' module, so restart the engine to pick it up.'
+            )
+    return None
+
+
+def _run_family_passes(work: _FamilyWork, constraints_path: str, target_site: Optional[str]) -> None:
+    """Install the family's members explicitly, in declared order, widest last.
+
+    Goes through ``build_install_argv`` rather than a hand-rolled argv: that builder exists
+    because while there were two ways to construct an install command, a flag added to one
+    silently diverged from the other. The ``-c`` matters beyond tidiness here — the compile
+    runs with ``--emit-index-url`` so the index URLs reach an install *through* the
+    constraints file, and a pass installing by explicit spec has no other source of them.
+    """
+    if not work.passes:
+        return
+    exe_dir = _get_executable_dir()
+    # The BASE exclusions, never the family's own — measured, because the failure is silent.
+    # uv's `--excludes` excludes from *resolution*, so a pass handed its family's set drops the
+    # very member it was asked to install: every pass reports success, nothing lands, and the
+    # namespace is simply absent afterwards. The base set is still needed here (plain
+    # onnxruntime must stay out of a `-gpu` pass's resolution), and the ordering this pass
+    # exists to impose is enforced by running one spec at a time, not by exclusions.
+    excludes_rel = os.path.relpath(_write_excludes_file(), exe_dir)
+    for step in work.passes:
+        spec = f'{step.dist}=={step.version}'
+        updateProgress(f'Installing {work.family.name}: {spec}')
+        argv = venv_env.build_install_argv(
+            uv_path=_uv_abs_path(),
+            python_exe=sys.executable,
+            specs=[spec],
+            target_site=target_site,
+            excludes_path=excludes_rel,
+            reinstall_packages=(step.dist,) if step.force_reinstall else (),
+        )
+        argv.extend(_constraints_args(constraints_path, exe_dir))
+        debug(f'Family install: {argv}')
+        result = subprocess.run(
+            argv,
+            cwd=exe_dir,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            check=False,
+            stdin=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or '').strip()
+            error(f'Family install failed for {spec}: {detail}')
+            raise RuntimeError(_family_install_message(work, spec, detail))
+
+
+def _family_install_message(work: _FamilyWork, spec: str, detail: str) -> str:
+    """The refusal text when an ordered pass cannot install ``<member>==<version>``.
+
+    A **declared** version that cannot be found is not a conflict between consumers —
+    nobody disagrees, the authored number is wrong (a release can be withdrawn, exactly as
+    onnxruntime 1.20.1 was for the -gpu build). Naming a container there would send an
+    operator to split a pipeline over a number they could change in one line.
+    """
+    if work.family.namespace_version:
+        return (
+            f'{work.family.name}: the declared namespace version {work.version} could not be installed'
+            f' ({spec}). This value is authored in lib/pkg_families/{work.family.name}.py, not derived'
+            f' from any consumer, so no pipeline split can help — change the declaration.\n{detail[:800]}'
+        )
+    return f'{work.family.name}: failed to install {spec} at the derived version.\n{detail[:800]}'
+
+
+def _handle_families(
+    work_list: list[_FamilyWork],
+    constraints_path: str,
+    target_site: Optional[str],
+) -> Optional[RestartRequired]:
+    """Run every family's ordered passes, then report whether this process may use the result.
+
+    With two families in play the steps run per family in registry order and the first
+    failure stops the build — there is no partial-success state to design, because a family
+    that installed correctly before another failed is simply part of an environment that did
+    not finish.
+
+    Returns the refusal rather than raising it, so a caller with bookkeeping to protect can
+    record the environment **first**. Recording after the refusal would make the restart the
+    message asks for repeat the whole build, and the operator would watch the fix appear not
+    to take.
+    """
+    deferred: Optional[RestartRequired] = None
+    for work in work_list:
+        reason = _shadowing(work)
+        _run_family_passes(work, constraints_path, target_site)
+        if reason is not None and deferred is None:
+            deferred = RestartRequired(f'{reason}. Restart the engine to pick it up.')
+    return deferred
+
+
+def _family_exclusions(work_list: list[_FamilyWork]) -> tuple[str, ...]:
+    """Members to keep out of the **main** install, for the families in play.
+
+    Excluding a member does not mean it is not installed — for one in the install set it
+    means "not installed by *that* run", because the main install would let uv pick the
+    order and the order is the whole point. A member outside the set is excluded outright.
+    """
+    return tuple(dist for work in work_list for dist in pkg_families.excluded(work.family))
+
+
+def _install_dry_run(requirements_path: str, constraints_path: str, excludes_path: str) -> list[str]:
     """
     Run uv pip install --dry-run and return list of packages that would be installed.
 
     Returns empty list if all requirements are already satisfied.
     Raises RuntimeError if dependency resolution fails.
+
+    ``excludes_path`` is a parameter rather than a call to :func:`_write_excludes_file`
+    because this answer drives two decisions with opposite needs, and one of them breaks
+    if it is given the family exclusions: the family **trigger** asks "would this install
+    touch a member", and a dry-run resolved without the members answers "no" by
+    construction — the ordered passes would then never run and the namespace would vanish
+    from every environment as an ImportError rather than a build failure. So it is given
+    the **base** set only, and the caller subtracts family members from the list before
+    asking whether there is other work.
     """
     if not _uv_available():
         raise RuntimeError('uv executable not found')
@@ -1211,7 +1531,7 @@ def _install_dry_run(requirements_path: str, constraints_path: str) -> list[str]
     # uv splits --excludes on whitespace, so an absolute path with a space (macOS
     # "Application Support") breaks resolution; pass it relative to the cwd (exe_dir).
     # See #1256.
-    args.extend(['--excludes', os.path.relpath(_write_excludes_file(), exe_dir)])
+    args.extend(['--excludes', os.path.relpath(excludes_path, exe_dir)])
 
     args.extend(_constraints_args(constraints_path, exe_dir))
     args.extend(_override_args(exe_dir))
@@ -1288,63 +1608,88 @@ def _install_requirements_inner(requirements_path: str, constraints_path: str):
     """Inner install logic, runs under the heartbeat thread."""
     import importlib
 
-    # Check what needs to be installed (raises on failure)
-    packages = _install_dry_run(requirements_path, constraints_path)
+    exe_dir = _get_executable_dir()
+
+    # The dry-run gets the BASE exclusions only. Handing it the family set would make its
+    # answer "no member will be installed" by construction, and the trigger below could
+    # never fire. See _install_dry_run.
+    base_excludes = _write_excludes_file()
+    packages = _install_dry_run(requirements_path, constraints_path, base_excludes)
     debug(f'Dry-run found {len(packages)} packages to install: {packages}')
 
-    # If dry-run returned empty list, all packages are satisfied
-    if len(packages) == 0:
+    # What the families owe here. The trigger is this call's dry-run; the install set comes
+    # from the environment's resolution.
+    target_site = _target_site()
+    family_work = _family_work(constraints_path, target_site or active_env().paths.site_packages, packages)
+
+    # A member's presence in the dry-run list is not work the caller owes — it is the
+    # family's business. Without the subtraction a member excluded *by design* (plain
+    # onnxruntime on Linux) reads as permanently missing and every call reinstalls the world.
+    members = pkg_families.all_member_dists()
+    real_work = [name for name in packages if pkg_families.normalize(name) not in members]
+    family_has_work = any(work.passes for work in family_work)
+
+    if not real_work and not family_has_work:
         debug(f'All requirements satisfied: {requirements_path}')
+        # Ahead of the gate on purpose: an environment with nothing to do is precisely where
+        # a namespace loaded from somewhere else goes unnoticed.
+        shadowed = _shadowing_check(constraints_path)
+        if shadowed is not None:
+            raise shadowed
         _save_verdict(requirements_path, constraints_path)
         return
 
-    # Format status message: show up to 5 packages, or 4 + "..." if more than 5
-    if len(packages) <= 5:
-        pkg_list = ', '.join(packages)
-    else:
-        pkg_list = ', '.join(packages[:4]) + ', ...'
-    updateProgress(f'Installing {pkg_list}')
+    if real_work:
+        # Format status message: show up to 5 packages, or 4 + "..." if more than 5
+        if len(real_work) <= 5:
+            pkg_list = ', '.join(real_work)
+        else:
+            pkg_list = ', '.join(real_work[:4]) + ', ...'
+        updateProgress(f'Installing {pkg_list}')
 
-    # Build uv command — same builder as the scoped install, so the two install paths
-    # cannot drift apart on flags. Relative --excludes/-c: uv splits them on whitespace
-    # (#1256).
-    exe_dir = _get_executable_dir()
-    uv_args = venv_env.build_install_argv(
-        uv_path=_uv_abs_path(),
-        python_exe=sys.executable,
-        requirements_path=requirements_path,
-        target_site=_target_site(),
-        excludes_path=os.path.relpath(_write_excludes_file(), exe_dir),
-    )
-    uv_args.extend(_constraints_args(constraints_path, exe_dir))
-    uv_args.extend(_override_args(exe_dir))
+        # Build uv command — same builder as the scoped install, so the two install paths
+        # cannot drift apart on flags. Relative --excludes/-c: uv splits them on whitespace
+        # (#1256).
+        uv_args = venv_env.build_install_argv(
+            uv_path=_uv_abs_path(),
+            python_exe=sys.executable,
+            requirements_path=requirements_path,
+            target_site=target_site,
+            excludes_path=os.path.relpath(_write_excludes_file(_family_exclusions(family_work)), exe_dir),
+        )
+        uv_args.extend(_constraints_args(constraints_path, exe_dir))
+        uv_args.extend(_override_args(exe_dir))
 
-    # Run uv and stream output (heartbeat is already running from the caller)
-    debug(f'Install: {uv_args}')
-    proc = subprocess.Popen(
-        uv_args,
-        cwd=exe_dir,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding='utf-8',
-        errors='replace',
-        bufsize=1,
-    )
-    output_lines = []
-    for line in proc.stdout:
-        line = line.rstrip()
-        output_lines.append(line)
-        updateProgress(line)
-    proc.wait()
+        # Run uv and stream output (heartbeat is already running from the caller)
+        debug(f'Install: {uv_args}')
+        proc = subprocess.Popen(
+            uv_args,
+            cwd=exe_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            bufsize=1,
+        )
+        output_lines = []
+        for line in proc.stdout:
+            line = line.rstrip()
+            output_lines.append(line)
+            updateProgress(line)
+        proc.wait()
 
-    if proc.returncode != 0:
-        output_text = '\n'.join(output_lines)
-        error(f'Installation failed: {output_text}')
-        # Include last few lines of output in the error for debugging
-        last_lines = output_lines[-10:] if len(output_lines) > 10 else output_lines
-        error_detail = '\n'.join(last_lines)
-        raise RuntimeError(f'Failed to install {requirements_path}\n{error_detail}')
+        if proc.returncode != 0:
+            output_text = '\n'.join(output_lines)
+            error(f'Installation failed: {output_text}')
+            # Include last few lines of output in the error for debugging
+            last_lines = output_lines[-10:] if len(output_lines) > 10 else output_lines
+            error_detail = '\n'.join(last_lines)
+            raise RuntimeError(f'Failed to install {requirements_path}\n{error_detail}')
+
+    # The ordered family passes run after the main install and inside the same heartbeat
+    # window the caller opened.
+    deferred = _handle_families(family_work, constraints_path, target_site)
 
     # Invalidate import caches so Python can find newly installed packages
     importlib.invalidate_caches()
@@ -1356,6 +1701,12 @@ def _install_requirements_inner(requirements_path: str, constraints_path: str):
     _save_verdict(requirements_path, constraints_path)
 
     debug(f'Installed: {requirements_path}')
+
+    # The base runtime has no per-install bookkeeping to protect — ensure_constraints wrote
+    # its hash back at compile time and each depends() call is gated by its own dry-run — so
+    # raising directly here is correct. The overlay path defers instead; see _install_target.
+    if deferred is not None:
+        raise deferred
 
 
 # ---------------------------------------------------------------------------
@@ -1488,56 +1839,149 @@ def _apply_overlay_path(site: str) -> None:
 
 
 def _compile_constraints_at(combined_path: str, constraints_path: str) -> None:
-    """Compile ``combined_path`` -> ``constraints_path`` for one environment.
+    """Compile ``combined_path`` -> ``constraints_path``, then align any family present.
 
-    Twin of :func:`_compile_constraints` taking explicit paths, so each env compiles
-    its own scoped set rather than the global one.
+    The single compile path for both the global union and one environment's scoped set.
+    Compile-then-align rather than a single pass: which families the environment contains is
+    only knowable *from* a resolution, so detection reads the compile output and the
+    alignment goes back in as requirements for a second pass.
     """
-    if not _uv_available():
-        raise RuntimeError('uv executable not found')
-    exe_dir = _get_executable_dir()
-    updateProgress('Compiling constraints...')
-    args = [
-        _uv_abs_path(),
-        'pip',
-        'compile',
-        combined_path,
-        '--output-file',
-        constraints_path,
-        '--python',
-        sys.executable,
-        '--index-strategy',
-        'unsafe-best-match',
-        '--no-build-isolation',
-        '--emit-index-url',
-    ]
-    result = subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        check=False,
-        stdin=subprocess.PIPE,
-        encoding='utf-8',
-        errors='replace',
-        cwd=exe_dir,
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or '').strip()
-        error(f'Failed to compile constraints: {detail}')
-        raise RuntimeError(f'Failed to compile constraints: {detail[:800]}')
-    debug(f'Constraints compiled: {constraints_path}')
+    _run_uv_compile(combined_path, constraints_path)
+    _align_families(combined_path, constraints_path)
 
 
-def _install_target(requirements_path: str, constraints_path: str, target_site: str) -> None:
-    """Install ``requirements_path`` into the overlay ``target_site`` (uv ``--target``)."""
+def _align_families(combined_path: str, constraints_path: str) -> None:
+    """Hold every derived family's namespace at one version, and prove it still resolves.
+
+    Appends ``<member>==V`` for the members the environment will hold, under a marked block
+    in the already-generated ``combined.txt``, and compiles again. Those lines must be
+    *requirements* rather than ``-c`` entries: a constraint on a distribution nothing
+    requests is a no-op, so it would never check that V exists for a member no consumer
+    names — and checking exactly that is the point of the second pass.
+
+    **Skipped whenever the block would change nothing**, which is the common case and not a
+    micro-optimisation: the global compile resolves the whole tree at engine startup, so an
+    unconditional second pass would double it on every requirements edit. A family whose
+    version is **declared** never reaches here at all — there is no derivation to check, and
+    a block naming a member nothing resolves would make the second pass permanent.
+    """
+    resolved = _read_resolution(constraints_path)
+    if not resolved:
+        return
+    try:
+        with open(constraints_path, 'r', encoding='utf-8') as fh:
+            annotations = pkg_families.parse_annotations(fh.read())
+    except OSError:
+        annotations = {}
+
+    facts = _facts()
+    blocks: list[str] = []
+    aligned: list[tuple[pkg_families.Family, str, tuple[pkg_families.Member, ...]]] = []
+    for family in pkg_families.members_in(resolved):
+        if family.namespace_version:
+            continue
+        version = pkg_families.align(family, resolved)
+        if not version:
+            continue
+        members = pkg_families.install_set(family, resolved, facts)
+        if pkg_families.redundant(version, members, resolved):
+            debug(f'{family.name}: already at {version}, second compile skipped')
+            continue
+        blocks.append(pkg_families.derived_block(family, version, members))
+        aligned.append((family, version, members))
+
+    if not blocks:
+        return
+
+    with open(combined_path, 'a', encoding='utf-8') as fh:
+        fh.write('\n')
+        for block in blocks:
+            fh.write(block)
+
+    try:
+        _run_uv_compile(combined_path, constraints_path)
+    except CompileFailed as failure:
+        raise _alignment_failure(aligned, resolved, annotations, failure) from None
+
+    _log_alignment_moves(aligned, resolved, annotations)
+
+
+def _alignment_failure(aligned, resolved, annotations, failure: CompileFailed) -> RuntimeError:
+    """Turn a failed second compile into the right error, which is not always a conflict.
+
+    Pass 1 succeeded on the same inputs minus the derived block, so a pass-2-only failure is
+    attributable to the alignment — and uv's own explanation already names the chain
+    (*"because X depends on Y==… and you require Y==…"*), which is better than any range this
+    repository could enumerate: ``surya-ocr``'s ``opencv-python-headless==4.11.0.86`` lives in
+    its wheel metadata, not in any file here.
+
+    But it **checks before claiming**. If uv's failure mentions no family member, this is an
+    ordinary compile failure that happened to surface in pass 2, and it is reported as one.
+    """
+    detail = failure.detail
+    lowered = detail.lower()
+    for family, version, _members in aligned:
+        if not any(pkg_families.normalize(m.dist) in lowered for m in family.members):
+            continue
+        lowest = _who_set_the_version(family, version, resolved, annotations)
+        return RuntimeError(
+            f'{family.name}: this environment cannot hold one version of the "{family.import_name}" '
+            f'namespace. Alignment derived {version}{lowest}, and re-resolving against it failed.\n'
+            f'{detail[:800]}\n'
+            'These consumers cannot share an environment. Put one of them in a Virtual '
+            'Environment container so each gets its own resolution.'
+        )
+    return failure
+
+
+def _who_set_the_version(family, version, resolved, annotations) -> str:
+    """Read off the annotation of the member that produced the minimum: `` from X (via Y)``."""
+    for member in family.members:
+        name = pkg_families.normalize(member.dist)
+        if resolved.get(name) == version:
+            sources = annotations.get(name, ())
+            if sources:
+                return f' from {member.dist} (via {", ".join(sources)})'
+            return f' from {member.dist}'
+    return ''
+
+
+def _log_alignment_moves(aligned, resolved, annotations) -> None:
+    """Say when alignment succeeded but moved someone — not a failure, but not invisible.
+
+    A user whose doctr quietly rides Surya's version should be able to see why and decide to
+    split the pipeline. The attribution comes from the ``# via`` annotation of the member that
+    produced the minimum, which is the consumer rather than any file of ours.
+    """
+    for family, version, members in aligned:
+        imposed = _who_set_the_version(family, version, resolved, annotations)
+        for member in members:
+            was = resolved.get(pkg_families.normalize(member.dist))
+            if was and was != version:
+                monitorStatus(
+                    f'{family.name}: {member.dist} moved {was} -> {version}{imposed}; '
+                    f'the "{family.import_name}" namespace is shared, so one version has to win.'
+                )
+
+
+def _install_target(requirements_path: str, constraints_path: str, target_site: str) -> Optional[RestartRequired]:
+    """Install ``requirements_path`` into the overlay ``target_site`` (uv ``--target``).
+
+    Returns a :class:`RestartRequired` rather than raising it, so the caller can record the
+    environment before refusing the run.
+    """
     with open(requirements_path, 'r', encoding='utf-8') as f:
         has_deps = any(line.strip() and not line.strip().startswith('#') for line in f)
     if not has_deps:
         debug(f'  Empty scoped requirements, nothing to install: {requirements_path}')
-        return
+        return None
 
     exe_dir = _get_executable_dir()
-    excludes_rel = os.path.relpath(_write_excludes_file(), exe_dir)
+    # No dry-run on this path — it installs the environment's whole combined file in one go,
+    # so a family present in the resolution *is* by construction a family being installed.
+    # An implementer looking for the dry-run the base path uses will not find one here.
+    family_work = _family_work(constraints_path, target_site)
+    excludes_rel = os.path.relpath(_write_excludes_file(_family_exclusions(family_work)), exe_dir)
     argv = venv_env.build_install_argv(
         uv_path=_uv_abs_path(),
         python_exe=sys.executable,
@@ -1570,6 +2014,10 @@ def _install_target(requirements_path: str, constraints_path: str, target_site: 
             tail = '\n'.join(lines[-10:])
             error(f'Scoped install failed: {tail}')
             raise RuntimeError(f'Failed scoped install into {target_site}\n{tail}')
+        # Inside the heartbeat window on purpose: this half can be several hundred megabytes,
+        # and appending it after the `finally` would put it outside the keep-alive and turn a
+        # working install into a task-startup timeout.
+        deferred = _handle_families(family_work, constraints_path, target_site)
     finally:
         _stop_heartbeat()
 
@@ -1578,6 +2026,7 @@ def _install_target(requirements_path: str, constraints_path: str, target_site: 
     importlib.invalidate_caches()
     sys.path_importer_cache.pop(target_site, None)
     debug(f'Scoped install complete: {target_site}')
+    return deferred
 
 
 def ensure_env_scoped(
@@ -1614,10 +2063,13 @@ def ensure_env_scoped(
         return ast_deps.discover_for_providers(provs, exe_dir, exe_dir, local_root).requirement_files
 
     def _compile_and_install(plan):
+        # Returns the restart-required condition instead of raising it: mark_installed lives
+        # on run_scoped_install's side, and recording has to happen before the refusal or the
+        # restart repeats the whole build.
         with FileLock(plan.paths.lock_file):  # one lock per overlay, not the global one
             bootstrap()
             _compile_constraints_at(plan.paths.combined, plan.paths.constraints)
-            _install_target(plan.paths.combined, plan.paths.constraints, plan.paths.site_packages)
+            return _install_target(plan.paths.combined, plan.paths.constraints, plan.paths.site_packages)
 
     def _overlay(paths):
         # The one door that does both halves of a switch: where installs go, and where
@@ -1634,7 +2086,7 @@ def ensure_env_scoped(
     # the signature honest for a future non-C++ caller rather than guarding a real second source.
     has_isolated_group = has_isolated_group or venv_env.isolated_from_env()
 
-    return venv_env.run_scoped_install(
+    site = venv_env.run_scoped_install(
         exe_dir,
         project_id,
         env_id,
@@ -1644,6 +2096,15 @@ def ensure_env_scoped(
         has_isolated_group=has_isolated_group,
         on_overlay=_overlay,
     )
+
+    # Outside the drift gate, which is the point: an overlay whose hash matched was never
+    # rebuilt, so nothing on the install path ran to notice that this process already holds
+    # the namespace at another version. That is the *common* shape of shadowing, not a corner.
+    if site is not None:
+        shadowed = _shadowing_check(active_env().paths.constraints)
+        if shadowed is not None:
+            raise shadowed
+    return site
 
 
 # ---------------------------------------------------------------------------
