@@ -278,23 +278,35 @@ async def test_a_chatty_child_is_waited_past_the_silence_ceiling():
     """
     server, port = await _listener()
     child = _child()
-    # Generous on purpose: under gate concurrency a stall once read 0.1 s as silence.
     ceiling = 0.4
+
+    # Simulated time, advanced only by the chatter. Widening a real-clock ceiling was tried
+    # (commit 83aa7cda took it from 0.1 s to 0.4 s) and did not hold: the test was racing the
+    # scheduler, so a loaded machine could always manufacture a gap wider than whatever number
+    # was chosen, and a healthy child came back degraded. With the clock in the test's hands a
+    # stall delays the chatter and the waiter together and cannot invent silence.
+    now = [0.0]
+
+    def clock() -> float:
+        return now[0]
+
+    child.last_event_at = clock()
 
     async def chatter():
         for _ in range(15):
-            await asyncio.sleep(ceiling / 8)
-            child.last_event_at = time.monotonic()
+            await asyncio.sleep(0.005)  # let the waiter poll between ticks; real duration is irrelevant
+            now[0] += ceiling / 8  # ...because only this advances the clock the waiter reads
+            child.last_event_at = clock()
         child.ready.set()
 
     task = asyncio.create_task(chatter())
-    started = time.monotonic()
+    started = clock()
     try:
         outcome = await await_child_ready(
-            child, '127.0.0.1', port, child.process, silence_ceiling=ceiling, interval=0.01
+            child, '127.0.0.1', port, child.process, silence_ceiling=ceiling, interval=0.01, clock=clock
         )
         assert outcome == READY_CONFIRMED
-        assert time.monotonic() - started > ceiling, 'the old fixed deadline would have killed it here'
+        assert clock() - started > ceiling, 'the old fixed deadline would have killed it here'
     finally:
         await task
         server.close()
