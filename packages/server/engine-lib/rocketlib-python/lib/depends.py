@@ -1457,6 +1457,194 @@ def _family_install_message(work: _FamilyWork, spec: str, detail: str) -> str:
     return f'{work.family.name}: failed to install {spec} at the derived version.\n{detail[:800]}'
 
 
+# ---------------------------------------------------------------------------
+# Probes — proving the environment that was just built
+# ---------------------------------------------------------------------------
+
+# The one lever this item ships. Global rather than per family on purpose: an operator
+# reaching for it at 2am wants the pipeline up, not a taxonomy, and the log already names
+# which probe was downgraded. It is deliberately NOT a switch on the registry — emptying
+# that would hand the namespace back to uv's ordering and break `cv2` silently — and not a
+# downgrade of the *conflict* refusal, which is about two consumers and has a real remedy.
+PROBE_STRICT_ENV = 'ROCKETRIDE_PKG_PROBE_STRICT'
+
+# Generous rather than tight. The work is one import of a large extension module on a
+# machine that may still be busy installing; the timeout exists to bound a hang, not to
+# police performance, and tripping it is *inconclusive* rather than a failure.
+PROBE_TIMEOUT_SECONDS = 180
+
+# (env_dir, family) pairs already re-probed in this process. The marker makes a failure
+# survive the gates, and without this it would also make every later `depends()` call in the
+# same start spawn another subprocess.
+_reprobed: set[tuple[str, str]] = set()
+
+
+def _probe_strict() -> bool:
+    """Whether a failed probe stops the build. ``ROCKETRIDE_PKG_PROBE_STRICT=0`` says no."""
+    return (os.environ.get(PROBE_STRICT_ENV) or '').strip() != '0'
+
+
+def _run_probe(work: _FamilyWork, site: str) -> tuple[str, str]:
+    """Run the family's probe against ``site`` in a subprocess; return ``(verdict, detail)``.
+
+    **Never in the resident engine**, which may already hold a different member of this
+    namespace in ``sys.modules`` and would answer about the wrong one.
+
+    The script is written to the engine cache and run as ``sys.executable <script>`` — the
+    engine's own documented invocation shape. A ``-c`` flag would be shorter and there is no
+    evidence the binary has one: nothing in `engine-core` parses it, and every invocation in
+    the tree passes a script path.
+    """
+    probe = work.family.probe
+    facts = _facts()
+    met = pkg_families.probes.needs_met(probe.needs, facts)
+    if met is not True:
+        # Unknown facts skip too, and say so. "GPU box, probe skipped" is the one shape that
+        # looks like success while checking nothing, so it is never silent.
+        reason = 'a required fact is unknown' if met is None else 'its facts do not apply here'
+        return pkg_families.probes.SKIPPED, f'{reason} ({facts.describe()})'
+
+    script = pkg_families.probes.probe_script(
+        work.family.name,
+        probe.code,
+        site,
+        tuple(m.dist for m in work.members),
+        work.version,
+    )
+    digest = hashlib.md5(script.encode('utf-8')).hexdigest()[:12]
+    path = os.path.join(engine_cache_dir(create=True), f'probe-{work.family.name}-{digest}.py')
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write(script)
+
+    updateProgress(f'Proving {work.family.name} at {work.version}')
+    try:
+        result = subprocess.run(
+            [sys.executable, path],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            check=False,
+            stdin=subprocess.PIPE,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return pkg_families.probes.INCONCLUSIVE, f'the probe did not finish within {PROBE_TIMEOUT_SECONDS}s'
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    output = (result.stdout or '') + (result.stderr or '')
+    answer = pkg_families.probes.parse_verdict(output)
+    if answer is None:
+        tail = ' '.join(output.split())[-400:]
+        return (
+            pkg_families.probes.INCONCLUSIVE,
+            f'the probe exited with code {result.returncode} and reported no verdict: {tail}',
+        )
+    return answer
+
+
+def _probe_failure_message(work: _FamilyWork, verdict: str, detail: str) -> str:
+    """What the operator is told, including the lever that family has — or the cause.
+
+    `cv2` has **no** version lever: its failures are a missing system library or a lost
+    namespace race, and naming a knob that repairs neither would send someone to change a
+    number. onnxruntime has one, and it is the declared `namespace_version`.
+    """
+    if verdict == pkg_families.probes.INCONCLUSIVE:
+        remedy = 'This is a statement about the probe, not about the package — fix the machine or the probe.'
+    elif work.family.namespace_version:
+        remedy = (
+            f'Adjust `namespace_version` in lib/pkg_families/{work.family.name}.py '
+            '(it is in the drift hash, so an edit rebuilds the environments that hold this family).'
+        )
+    else:
+        remedy = 'No version change repairs this — fix the cause named above.'
+    return (
+        f'{work.family.name}: the environment built at {work.version} did not prove out '
+        f'[{verdict}]. {detail}\n{_facts().describe()}\n{remedy}'
+    )
+
+
+def _apply_probe(work: _FamilyWork, env_dir: str, site: str) -> None:
+    """Run the probe and act on its answer: clear, record, or stop the build.
+
+    Four bookkeeping behaviours meet here and making any of them uniform is a bug. **Only a
+    pass clears the marker** — a skip proves nothing, so a previous failure survives it. A
+    hard failure **raises**, which in an overlay also withholds `mark_installed` and so
+    rebuilds as well as re-probes. A **downgraded** failure records the build (the hash is
+    written and the next start does not rebuild) but still writes the marker, so the
+    exemption ends when the operator ends it rather than lasting until an unrelated drift.
+    """
+    if work.family.probe is None:
+        return
+    verdict, detail = _run_probe(work, site)
+
+    if verdict == pkg_families.probes.PASS:
+        pkg_families.probes.update_marker(env_dir, work.family.name, None)
+        debug(f'{work.family.name}: probe passed ({detail})')
+        return
+
+    if verdict == pkg_families.probes.SKIPPED:
+        # Logged where an operator sees it, not folded into debug: a skip must never read
+        # like a pass.
+        monitorStatus(f'{work.family.name}: probe skipped — {detail}')
+        return
+
+    message = _probe_failure_message(work, verdict, detail)
+    if _probe_strict():
+        pkg_families.probes.update_marker(env_dir, work.family.name, pkg_families.probes.UNPROVED_FAILED)
+        error(message)
+        raise RuntimeError(message)
+
+    pkg_families.probes.update_marker(env_dir, work.family.name, pkg_families.probes.UNPROVED_DOWNGRADED)
+    monitorStatus(f'{PROBE_STRICT_ENV}=0: {work.family.name} is running UNPROVED. {message}')
+
+
+def _reprove_unproved(constraints_path: str, env_dir: str, target_site: Optional[str]) -> None:
+    """Re-run the probe of any family a previous build left unproved, and nothing else.
+
+    This is the one thing that reaches past both gates. A measured-broken environment has a
+    matching `requirements.hash` and every member already at `V`, so the ordered passes are
+    skipped and the probe would never run again — the environment would go silently into
+    service on the second attempt. One subprocess, no rebuild.
+    """
+    unproved = pkg_families.probes.read_marker(env_dir)
+    if not unproved:
+        return
+    site = target_site or active_env().paths.site_packages
+    resolved = _read_resolution(constraints_path)
+    if not resolved:
+        return
+    facts = _facts()
+    for family in pkg_families.members_in(resolved):
+        if family.name not in unproved:
+            continue
+        key = (os.path.normcase(env_dir), family.name)
+        with _state_lock:
+            if key in _reprobed:
+                continue
+        version = pkg_families.align(family, resolved)
+        if not version:
+            continue
+        work = _FamilyWork(
+            family=family,
+            version=version,
+            members=pkg_families.install_set(family, resolved, facts),
+            passes=(),
+        )
+        debug(f'{family.name}: marked unproved, re-running the probe alone')
+        _apply_probe(work, env_dir, site)
+        # Recorded on the way out, never on the way in: the guard is a cost rule, not an
+        # exemption. A hard failure raises, and every later call in this process must raise
+        # with it rather than sail past an environment the marker says was measured broken.
+        with _state_lock:
+            _reprobed.add(key)
+
+
 def _handle_families(
     work_list: list[_FamilyWork],
     constraints_path: str,
@@ -1474,10 +1662,22 @@ def _handle_families(
     message asks for repeat the whole build, and the operator would watch the fix appear not
     to take.
     """
+    # Derived from the target rather than from `active_env()`: on the overlay path this runs
+    # inside `_compile_and_install`, which is *before* the environment is activated, so the
+    # active context is still base and would name the wrong marker file.
+    env_dir = os.path.dirname(target_site) if target_site else active_env().paths.env_dir
+    site = target_site or active_env().paths.site_packages
     deferred: Optional[RestartRequired] = None
     for work in work_list:
         reason = _shadowing(work)
         _run_family_passes(work, constraints_path, target_site)
+        if work.passes:
+            # Nothing installed means nothing new to prove; the probe follows the same gate
+            # as the passes. What crosses that gate is the unproved marker, elsewhere.
+            # Ordered before the restart refusal on purpose: if the probe says the
+            # environment is wrong, that is the answer, and "restart and try again" would be
+            # advice about a different problem.
+            _apply_probe(work, env_dir, site)
         if reason is not None and deferred is None:
             deferred = RestartRequired(f'{reason}. Restart the engine to pick it up.')
     return deferred
@@ -1631,8 +1831,11 @@ def _install_requirements_inner(requirements_path: str, constraints_path: str):
 
     if not real_work and not family_has_work:
         debug(f'All requirements satisfied: {requirements_path}')
-        # Ahead of the gate on purpose: an environment with nothing to do is precisely where
-        # a namespace loaded from somewhere else goes unnoticed.
+        # Both of these run ahead of the gate on purpose, and for the same reason: an
+        # environment with nothing to do is precisely where a measured-broken build and a
+        # namespace loaded from somewhere else go unnoticed. The probe goes first — if it
+        # says the environment is wrong, a restart is advice about a different problem.
+        _reprove_unproved(constraints_path, active_env().paths.env_dir, target_site)
         shadowed = _shadowing_check(constraints_path)
         if shadowed is not None:
             raise shadowed
@@ -2098,10 +2301,13 @@ def ensure_env_scoped(
     )
 
     # Outside the drift gate, which is the point: an overlay whose hash matched was never
-    # rebuilt, so nothing on the install path ran to notice that this process already holds
-    # the namespace at another version. That is the *common* shape of shadowing, not a corner.
+    # rebuilt, so nothing on the install path ran either to re-prove a build a previous run
+    # measured as broken, or to notice that this process already holds the namespace at
+    # another version. Both are the *common* shape, not a corner.
     if site is not None:
-        shadowed = _shadowing_check(active_env().paths.constraints)
+        paths = active_env().paths
+        _reprove_unproved(paths.constraints, paths.env_dir, site)
+        shadowed = _shadowing_check(paths.constraints)
         if shadowed is not None:
             raise shadowed
     return site

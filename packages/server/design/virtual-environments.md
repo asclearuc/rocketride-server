@@ -1551,6 +1551,10 @@ code nor anything a node spawns can observe or change them. `ROCKETRIDE_VENV_TOK
 by neither: node code is its legitimate reader at connect time, so popping it would take the
 bridge down in every scoped run. Three variables, three treatments, one principle — inputs are
 read once, and only the ones nothing legitimately reads later are removed.
+**A fourth variable exists and does *not* follow this rule:** §4.16's `ROCKETRIDE_PKG_PROBE_STRICT`
+is read fresh on every check rather than frozen at first read. It is named here because this is
+where a reader audits the feature's variables, and a lever that is absent from the list reads as a
+lever that obeys it; the argument for and against freezing it is with the lever itself.
 
 **Known gap.** `<exe>/.env` is loaded by `ai/web/server.py` inside `WebServer.__init__`, but
 `ai/__init__.py` calls `depends()` at import — so a value placed in `.env` is read **after** the
@@ -1657,9 +1661,112 @@ change; until then the static exclusion keeps doing its job alone.
 `constraints.txt` (never from declarations — both real cases arrive transitively); *align* on one
 version `V`; *couple and verify* by appending `<member>==V` to the already-generated `combined.txt`
 under a `# derived by pkg_families` block and compiling again; then *install in order* by explicit
-uv runs, widest last. A fifth act — **proving the built environment by running code inside it** —
-belongs to the same mechanism and lands with the probes; the `Probe` declaration exists here, and
-nothing runs it yet.
+uv runs, widest last; then **prove** the result by running the family's declared code inside the
+environment that was just built.
+
+#### Probes — where "version X works" stops being an assumption
+
+A resolution that installs cleanly is not a resolution that works, and no resolver can close that
+gap: PyPI metadata does not say which CUDA an `onnxruntime-gpu` wheel was built against, and nothing
+in a resolution says which member ended up owning a shared namespace. Only running code in the
+finished environment answers either, so after the ordered passes the family's probe runs **in a
+subprocess against that environment** — never in the resident engine, which may already hold a
+different member in `sys.modules` and would answer about the wrong one.
+
+- **The overlay reaches the subprocess as a `sys.path` insert written into a generated script**,
+  never via `PYTHONPATH`, which §4.11 records as inert under the engine's isolated `PyConfig`. A
+  probe relying on it would measure base while believing it tested the overlay — a pass for an
+  environment nobody checked. The insert is **unconditional, base included**, where it is very
+  nearly a no-op: making it conditional on "is this an overlay" would leave the base probe measuring
+  whatever a bare interpreter happens to have on its path, which is the one thing this line exists
+  to stop being a question. The script is run as `sys.executable <script>`, the engine's own
+  documented invocation shape — every invocation in the tree passes a script path, and no `-c` flag
+  is in evidence. **Measured before anything leaned on it**, since a binary that started a server
+  instead of exiting would have sunk the whole approach: the engine runs a throwaway script, prints
+  its verdict and exits 0 in ~1.5 s. That is its embedded-Python init and nothing else — no server,
+  no node loading, and **no `ai` bootstrap**, which would have run `uv` and shown for far longer than
+  that. It is not free, and a probe per environment build is the reason that is affordable. The same
+  run confirmed the insert points where it claims — a probe aimed at an overlay reported the
+  overlay's `cv2`, not base's.
+- **The preamble carries `INSTALL_SET` and `VERSION`**, so a declaration stays a static string and
+  still branches on what *this* environment installed. `cv2` asserts `cv2.ximgproc` only where a
+  contrib member landed — not a hedge but the stronger statement: *the widest variant this
+  environment asked for is the one that wrote the namespace*. A fixed assertion would fail correct
+  environments once most of them request only headless.
+- **Three verdicts, and a fourth answer that is not one.** *pass*; *fail-version* (this version does
+  not work here and another might); *fail-environment* (a missing system library, a lost namespace
+  race — nothing a version changes). Anything else — non-zero with no verdict, no output, a timeout
+  — is **inconclusive**, a statement about the *probe*. Treating it as a negative verdict sends an
+  operator to change a version number over a machine that could not run the check. **Every failure
+  shape stops the build, in either family — none narrows**; the distinction buys the message, and it
+  is what the deferred search will key on. Only `cv2`'s probe actually *runs* yet, since onnxruntime
+  is declared and not registered (above): its first live run is the commit that registers it.
+  `cv2` is `fail-environment` in both of its modes, which is also why its failure
+  message names the **cause** rather than a lever: no number repairs a missing `libGL`.
+  `onnxruntime` separates them — the CUDA provider absent means the runtime is missing (an
+  environment may legitimately hold `-gpu` without torch, since `faster-whisper` does not require
+  it), while a provider that refuses on session creation is a version fact.
+- **`needs` are tri-state.** onnxruntime's probe demands `CUDAExecutionProvider`, correct only where
+  a GPU exists, so it is **skipped** on a CPU-only host rather than failed. But *unknown* is not
+  *absent*: a GPU box whose probe was skipped looks exactly like success while checking nothing, so
+  a skip is logged where an operator sees it and never clears an earlier failure.
+- **Timeout is generous, and tripping it is inconclusive.** One import of a large extension module on
+  a machine that may still be installing; the bound exists to stop a hang from being indistinguishable
+  from work, not to police performance.
+
+**The unproved marker is one of exactly two things that cross both gates** — the shadowing check
+below is the other, and for the same reason: an environment with *nothing to do* is precisely where a
+measured-broken build and a namespace loaded from somewhere else go unnoticed. **The probe goes
+first** where both apply: if it says the environment is wrong, "restart and try again" is advice
+about a different problem. `plan_install` skips compile and
+install on a matching hash, and the `*.dist-info` check skips the ordered passes when every member is
+already at `V` — so a probe that ran once and said no would never run again, and an environment
+measured and found broken would go silently into service on the second attempt. A probe that does not
+pass therefore writes a small file beside the environment naming the family and the flavour; it is
+consulted **outside** both gates and re-runs the probe **alone** — one subprocess, no rebuild, and
+once per process rather than once per `depends()` call. *Outside, not ahead of* — the distinction is
+worth the words, because "before the gates" reads as an instruction to short-circuit them. On the
+per-file path it runs just ahead of the satisfied-early-return; in `ensure_env_scoped` it runs
+**after** the drift-gated install has returned, so the environment is still built and recorded by the
+ordinary rules and only then re-proved. **Once per process is a cost rule and not an exemption**,
+which is a distinction the obvious implementation loses: record the re-probe on the way *in* and a
+hard failure stops only the first call, while every later one in the same start sails past into
+exactly the environment the marker says was measured broken. It is recorded on the way out, so a
+build that must stop stops every time. The marker stays out of the drift hash deliberately: it is an
+output of a build, and hashing it would rebuild the environment where re-proving it is what is wanted.
+
+**Four bookkeeping behaviours, and making any of them uniform is a bug.** Only a *pass* clears the
+marker — a skip proves nothing. A hard failure **raises**, which in an overlay also withholds
+`mark_installed`, so that environment rebuilds as well as re-probes; the base has no hash to withhold,
+which is why the marker exists in both paths rather than only one. Restart-required is the reverse
+case for the reverse reason: the environment is *correct*, so it is recorded before the refusal. And a
+failure **downgraded by the strictness lever** records too, because the build completed.
+
+**The lever: `ROCKETRIDE_PKG_PROBE_STRICT=0` downgrades a probe failure to a log line.** Global rather
+than per family — an operator reaching for it at 2am wants the pipeline up, not a taxonomy, and the
+log already names which probe was downgraded. Deliberately **not** a switch on the registry, which
+would hand the namespace back to uv's ordering and break `cv2` silently, and **not** a downgrade of
+the *conflict* refusal, which is about two consumers and has a real remedy. It exists for the one case
+an operator cannot fix at 2am: a probe misfiring on a host we did not anticipate. A downgraded build is
+recorded so the next start does not repeat it, **and** still writes the marker flavoured *downgraded*,
+so the exemption ends when the operator ends it rather than lasting until an unrelated drift.
+
+*One thing about this variable is **not** settled by §4.15's rule, and it is stated rather than left
+to be discovered.* Unlike the venv variables it is read **fresh on every check**, not frozen at first
+read. Nothing legitimately changes it mid-process, so freezing would cost nothing — while 8.7S closed
+this exact channel for the switch, on the ground that a node setting a variable before another node's
+`depends()` gains **persistence beyond its own run**. Here that persistence is real: a recorded
+environment plus a *downgraded* marker outlive the run. The counter-argument is that a node running
+Python inside the engine is already fully privileged, which is why this is recorded as an open
+decision rather than changed in passing.
+
+**Environments that already exist are not retro-validated, and this should not imply they are.** The
+drift gate is what makes probes cheap and it is also what excludes them: an overlay built before this
+landed has an unchanged `requirements.hash`, so nothing recompiles, nothing reinstalls and no probe
+runs. Those environments keep whatever ordering they were built with and get proved on their next
+rebuild. "Every environment is proved" is true going forward, not retroactively.
+
+#### Environment facts, and why the package is stdlib-only
 
 `pkg_families` is **stdlib-only**, by the precedent `venv_env` already sets: `depends` reads the
 registry and `depends` needs `engLib`, so the rules stay unit-testable under bare `pytest` — and the
@@ -1714,6 +1821,12 @@ person will not re-derive them.
   one was actually installed. Order alone does not make the widest member win — the *write* does, and
   uv skips the write for a distribution it already considers satisfied. Decided from the
   `*.dist-info` listing before any pass starts, not by reading uv's output afterwards.
+- **The ordered passes and the probe run *inside* `_install_target`'s heartbeat window**, never after
+  its `finally`. That function starts and stops its own keep-alive around the single `uv` run, so the
+  obvious way to add family work — appending it at the end — puts several hundred megabytes of
+  installs plus a subprocess *outside* the keep-alive and turns a working install into a task-startup
+  timeout. The per-file path needs no such care: its caller already wraps the whole of
+  `_install_requirements_inner`. Deferred narrowing, when it lands, inherits the same window.
 - **`_target_site()`, never the env var**, decides base-versus-overlay behaviour. The switch has
   three states and the default is `auto`, where both kinds of environment exist in one installation.
 - **A declared `namespace_version` skips derivation entirely** — no minimum, no derived block, no
@@ -1922,10 +2035,14 @@ live interpreter and then reports success for a version it is not running.
 **2A-4 — shared-namespace package families, environment facts and probes (IN PROGRESS).** Not "OCR
 opencv de-conflict" any more: the OCR split is the framework's *first consumer*, not its subject.
 The mechanism is §4.16; the investigation that produced it, its verified fact base and its
-verification plan live in `packages/server/design/INVESTIGATE-opencv-ocr-venv.md` (bilingual).
+verification plan live in `packages/server/design/INVESTIGATE-opencv-ocr-venv.md` (bilingual, and
+**untracked** like every `NEXT-STEP-*` sibling — this document is currently the only tracked file in
+`design/`, so a reader who cannot find that one is not looking at a deletion). Its corrections are
+scheduled with the increments that make them true, so they land outside the repository unless it is
+added first.
 2B is closed, so the old "DEFERRED, sequenced after 2B" and "Do 2B first" no longer apply.
 
-Scope, in the order it lands. **Done: 1. Remaining: 2–6** — keep this line current, because a phase
+Scope, in the order it lands. **Done: 1, 2. Remaining: 3–6** — keep this line current, because a phase
 entry that says "next" long after the thing shipped is how §7 went stale before.
 
 1. **`lib/pkg_families/`** *(landed)* — the registry, environment facts, alignment and the ordered install,
@@ -1934,8 +2051,10 @@ entry that says "next" long after the thing shipped is how §7 went stale before
    before anything depends on it. onnxruntime is declared here but deliberately *not* registered —
    registering a family changes what its environments install, and for that one the change is not
    neutral until its version is declared.
-2. **Probes** — subprocess proof of the environment just built, three verdicts, and one
-   probe-strictness lever.
+2. **Probes** *(landed)* — subprocess proof of the environment just built against a generated
+   script, three verdicts plus *inconclusive*, an unproved marker that crosses the drift and
+   `*.dist-info` gates, and one global probe-strictness lever. Both families declare a probe;
+   onnxruntime's runs only once its family registers at item 5.
 3. **TrOCR and `craft-text-detector` leave the tree**, which has to precede the opencv move:
    craft's `opencv-python < 4.5.4.62` and Surya 0.17's `opencv-python-headless == 4.11.0.86` cannot
    share one namespace once the shim stops overriding both, and uv reports no conflict between them
@@ -2629,6 +2748,19 @@ Three layers; each test is tagged with the phase that first makes it runnable (*
   `run_scoped_install` lives: a returned refusal is re-raised only *after* `mark_installed`, and the
   restart that follows finds a matching hash and rebuilds nothing. Both assertions are needed — the
   first alone passes if the environment is recorded and the second start rebuilds anyway.
+  **Probes split the same way.** Pure, in `test_pkg_families.py`: the generated script carries the
+  `sys.path` insert and never `PYTHONPATH`; the preamble carries what a declaration branches on; a
+  raising probe becomes *fail-environment* and a silent one is a failure *of the probe*; only the
+  three verdicts parse, and no verdict line is **inconclusive** rather than negative; `needs` answer
+  tri-state so unknown never reads as absent; the marker is per family, so a pass cannot clear the
+  sibling that failed. Injected, in `test_depends_families.py`: the runner is a parameter, because
+  every rule there is about what is *done* with an answer — a pass clears, a hard failure marks and
+  raises, an inconclusive says so in those words, the two failure verdicts carry different messages,
+  a skip is logged and clears nothing, a downgrade records **and** marks, and a marker re-probes
+  alone, installing nothing — once per process on the paths that let the build continue, but on
+  **every** call while a hard failure stands, since a build that must stop cannot stop only the
+  first time. The subprocess itself is not unit-tested: it is a
+  live check, and pretending otherwise would be the mocked test standing in for the thing it mocks.
 - **`depends.py` per-env parameterization** — env-keyed paths / lock / `_processed` / progress;
   `requirements.hash` drift → reinstall; default-env fallback when no `project_id`; base =
   engine-runtime-only. [2A] **Implemented cases (`test_depends_scoping.py`, engine interpreter;
@@ -2876,8 +3008,8 @@ measured).
   the CLI `start` command is unsuitable for an unbound run (its wrapper needs a token for the event
   subscription — use the SDK), and the editor does not write a top-level `source` field the engine
   requires. [2B]
-- **Embedding invariant — VERIFIED.** `server:run-engtest` passes (23 cases, 490 assertions,
-  including `python::config`): the no-move-binary overlay preserves
+- **Embedding invariant — VERIFIED.** `server:run-engtest` passes, `python::config` included: the
+  no-move-binary overlay preserves
   `sys.prefix == exe dir == rootDir`. Under `=1` the same run creates **no `venvs/default`**, which
   is correct and now explained rather than open — its fixture carries no pipeline components, so the
   hook fires with an empty provider set and scoping no-ops (§4.14).
@@ -2933,7 +3065,9 @@ measured).
 - `packages/server/engine-lib/rocketlib-python/lib/pkg_families/` — the shared-namespace family
   registry (§4.16): `__init__.py` (rules, resolution parsing, drift-hash contribution), `facts.py`
   (python/platform/CUDA/GPU), `markers.py` (a small PEP 508 evaluator, because this package is read
-  during bootstrap and cannot depend on a wheel), and one module per family. **Stdlib-only** — it is
+  during bootstrap and cannot depend on a wheel), `probes.py` (script generation, verdict parsing
+  and the unproved marker — it *generates* the probe, `depends.py` runs it, which is what keeps
+  every probe rule testable without a subprocess), and one module per family. **Stdlib-only** — it is
   read by `depends.py`, so importing anything from the engine side would make the rules untestable
   under bare `pytest`; the same reason `venv_env.py` mirrors helpers instead of importing `depends`.
 - UI: `packages/shared-ui/src/components/canvas/util/graph.ts` (`getProjectComponents`),

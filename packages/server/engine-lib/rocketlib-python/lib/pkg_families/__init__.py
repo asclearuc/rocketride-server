@@ -44,6 +44,7 @@ from typing import Optional
 
 from .facts import Facts
 from . import markers
+from . import probes
 
 __all__ = [
     'Facts',
@@ -51,6 +52,7 @@ __all__ = [
     'InstallPass',
     'Member',
     'Probe',
+    'probes',
     'align',
     'all_member_dists',
     'applicable',
