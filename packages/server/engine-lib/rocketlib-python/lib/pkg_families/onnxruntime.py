@@ -34,7 +34,38 @@ one place replaces ten copied lines, and the probe is what keeps it honest.
 
 from __future__ import annotations
 
-from . import Family, Member
+from . import Family, Member, Probe
+
+# This is the probe the whole mechanism exists for: no resolver can check which CUDA an
+# `onnxruntime-gpu` wheel was built against, because PyPI metadata does not say. Only
+# running it can.
+#
+# **It separates "wrong version" from "missing runtime", and that line is drawn now rather
+# than when the deferred search needs it.** `onnxruntime-gpu` does not vendor the CUDA
+# runtime — it expects the `nvidia-*` wheels (which `torch+cu128` drags in) or system
+# libraries — and a scoped environment can legitimately hold it *without* torch, since
+# `faster-whisper` does not require torch. So "no CUDA provider at all" there means cudnn is
+# absent, which no lower version repairs, while "the provider is there and refuses when a
+# session is created" is a version fact and is where onnxruntime's own error text names the
+# CUDA it wanted. Today both stop the build and the difference only chooses the operator's
+# message; when narrowing arrives, only the second may step down. Drawing it later would
+# cost ~200 MB per pointless attempt.
+_ONNXRUNTIME_PROBE = """
+import onnxruntime
+
+providers = onnxruntime.get_available_providers()
+if 'CUDAExecutionProvider' not in providers:
+    verdict(
+        'fail-environment',
+        'no CUDAExecutionProvider; the CUDA runtime is absent (available: %s)' % (', '.join(providers) or 'none'),
+    )
+else:
+    try:
+        onnxruntime.InferenceSession
+        verdict('pass', 'CUDAExecutionProvider available')
+    except Exception as exc:  # pragma: no cover - reached only on a real refusing provider
+        verdict('fail-version', repr(exc))
+"""
 
 ONNXRUNTIME = Family(
     name='onnxruntime',
@@ -43,7 +74,9 @@ ONNXRUNTIME = Family(
         Member(dist='onnxruntime', marker="platform_system == 'Darwin'"),
         Member(dist='onnxruntime-gpu', marker="platform_system != 'Darwin'"),
     ),
-    probe=None,  # lands with the probes
+    # Skipped, not failed, on a CPU-only host: `-gpu` there legitimately offers CPU only, so
+    # demanding the CUDA provider would fail a working install.
+    probe=Probe(code=_ONNXRUNTIME_PROBE, needs=('gpu',)),
     # Placeholder for the constraint transfer, not a compatibility claim we stand behind.
     namespace_version='1.22.0',
     notes=(

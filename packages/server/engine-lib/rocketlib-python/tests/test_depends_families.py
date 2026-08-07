@@ -401,3 +401,171 @@ def test_nothing_is_logged_when_alignment_moved_nobody(monkeypatch):
     resolved = {'opencv-python-headless': '4.13.0.92'}
     D._log_alignment_moves([(family, '4.13.0.92', family.members[:1])], resolved, {})
     assert said == []
+
+
+# ---------------------------------------------------------------------------
+# probes: verdicts, the marker, and the one lever
+# ---------------------------------------------------------------------------
+
+P = pkg_families.probes
+
+
+def _probe_work(version='4.13.0.92', passes=(pkg_families.InstallPass(dist='opencv-python-headless', version='x'),)):
+    family = pkg_families.family_by_name('cv2')
+    return D._FamilyWork(family=family, version=version, members=family.members[:1], passes=passes)
+
+
+def _answer(monkeypatch, verdict, detail=''):
+    """Inject the runner. Every rule below is about what is *done* with an answer, not about
+    producing one — the subprocess itself is covered by the live check, not by a unit test.
+    """
+    monkeypatch.setattr(D, '_run_probe', lambda work, site: (verdict, detail))
+
+
+def test_a_passing_probe_clears_the_marker(monkeypatch, tmp_path):
+    P.update_marker(str(tmp_path), 'cv2', P.UNPROVED_FAILED)
+    _answer(monkeypatch, P.PASS, '4.13.0.92')
+    D._apply_probe(_probe_work(), str(tmp_path), str(tmp_path))
+    assert P.read_marker(str(tmp_path)) == {}
+
+
+def test_a_failing_probe_writes_the_marker_and_stops_the_build(monkeypatch, tmp_path):
+    """Without the marker the next start finds a matching hash and every member already at V,
+    skips the ordered passes and never re-probes — an environment measured and found broken
+    goes silently into service on the second attempt.
+    """
+    _answer(monkeypatch, P.FAIL_ENVIRONMENT, 'no libGL')
+    monkeypatch.setenv(D.PROBE_STRICT_ENV, '1')
+    with pytest.raises(RuntimeError, match='did not prove out'):
+        D._apply_probe(_probe_work(), str(tmp_path), str(tmp_path))
+    assert P.read_marker(str(tmp_path)) == {'cv2': P.UNPROVED_FAILED}
+
+
+def test_an_inconclusive_probe_fails_hard_and_says_it_is_about_the_probe(monkeypatch, tmp_path):
+    """A non-zero exit is not evidence about a version. Reported as one, it sends an operator
+    to change a number over a machine that could not run the check at all.
+    """
+    _answer(monkeypatch, P.INCONCLUSIVE, 'exited with code 1 and reported no verdict')
+    with pytest.raises(RuntimeError) as raised:
+        D._apply_probe(_probe_work(), str(tmp_path), str(tmp_path))
+    assert 'inconclusive' in str(raised.value)
+    assert 'statement about the probe' in str(raised.value)
+
+
+def test_the_two_failure_verdicts_carry_different_messages():
+    """Today both stop the build; the distinction buys the operator's message, and it is what
+    the deferred search will key on later.
+    """
+    work = _probe_work()
+    version_msg = D._probe_failure_message(work, P.FAIL_VERSION, 'built for another CUDA')
+    environment_msg = D._probe_failure_message(work, P.FAIL_ENVIRONMENT, 'no libGL')
+    assert 'fail-version' in version_msg and 'built for another CUDA' in version_msg
+    assert 'fail-environment' in environment_msg and 'no libGL' in environment_msg
+    assert version_msg != environment_msg
+
+
+def test_the_message_names_a_lever_only_where_one_exists():
+    """cv2's failures are a missing system library or a lost namespace race — no version knob
+    repairs either, so offering one would point the operator at the wrong thing.
+    """
+    from pkg_families.onnxruntime import ONNXRUNTIME
+
+    cv2_msg = D._probe_failure_message(_probe_work(), P.FAIL_ENVIRONMENT, 'no libGL')
+    assert 'namespace_version' not in cv2_msg
+    assert 'No version change repairs this' in cv2_msg
+
+    declared = D._FamilyWork(family=ONNXRUNTIME, version='1.22.0', members=ONNXRUNTIME.members, passes=())
+    assert 'namespace_version' in D._probe_failure_message(declared, P.FAIL_VERSION, 'wrong CUDA')
+
+
+def test_a_skipped_probe_is_distinguishable_from_a_pass_and_clears_nothing(monkeypatch, tmp_path):
+    """A skip proves nothing, so a previous failure survives it — and it is logged where an
+    operator sees it, because a silent skip reads exactly like success.
+    """
+    said = []
+    monkeypatch.setattr(D, 'monitorStatus', said.append)
+    P.update_marker(str(tmp_path), 'cv2', P.UNPROVED_FAILED)
+    _answer(monkeypatch, P.SKIPPED, 'a required fact is unknown')
+    D._apply_probe(_probe_work(), str(tmp_path), str(tmp_path))
+    assert P.read_marker(str(tmp_path)) == {'cv2': P.UNPROVED_FAILED}
+    assert any('skipped' in line for line in said)
+
+
+def test_a_downgraded_failure_is_recorded_but_still_marked(monkeypatch, tmp_path):
+    """Two rules that look contradictory and are not. Recording the build stops the 2am lever
+    from making every start repeat it; the marker stops the exemption from outliving the
+    lever, so the fix takes effect when the operator makes it rather than at the next
+    unrelated drift. The downgrade itself is visible, so an environment running unproved never
+    reads like one that passed.
+    """
+    said = []
+    monkeypatch.setattr(D, 'monitorStatus', said.append)
+    monkeypatch.setenv(D.PROBE_STRICT_ENV, '0')
+    _answer(monkeypatch, P.FAIL_VERSION, 'wrong CUDA')
+    D._apply_probe(_probe_work(), str(tmp_path), str(tmp_path))
+    assert P.read_marker(str(tmp_path)) == {'cv2': P.UNPROVED_DOWNGRADED}
+    assert any('UNPROVED' in line for line in said)
+
+
+def test_a_marker_re_runs_the_probe_alone_past_both_gates(monkeypatch, tmp_path):
+    """The one thing that crosses the drift gate and the dist-info gate. It re-probes; it does
+    not rebuild and it does not install.
+    """
+    D._reprobed.clear()
+    P.update_marker(str(tmp_path), 'cv2', P.UNPROVED_FAILED)
+    ran = []
+    monkeypatch.setattr(D, '_run_probe', lambda work, site: (ran.append(work.family.name), (P.PASS, ''))[1])
+    monkeypatch.setattr(D.subprocess, 'run', lambda *a, **k: pytest.fail('re-proving must not install'))
+
+    constraints = _constraints(tmp_path, 'opencv-python-headless==4.13.0.92\n')
+    D._reprove_unproved(constraints, str(tmp_path), str(tmp_path))
+    assert ran == ['cv2']
+    assert P.read_marker(str(tmp_path)) == {}, 'a pass clears it'
+
+
+def test_re_proving_happens_once_per_process_not_once_per_depends_call(monkeypatch, tmp_path):
+    """The marker survives the gates by design; without this it would also make every later
+    `depends()` call in the same start spawn another subprocess.
+    """
+    D._reprobed.clear()
+    P.update_marker(str(tmp_path), 'cv2', P.UNPROVED_FAILED)
+    ran = []
+    monkeypatch.setattr(D, '_run_probe', lambda work, site: (ran.append(1), (P.FAIL_ENVIRONMENT, 'x'))[1])
+    monkeypatch.setenv(D.PROBE_STRICT_ENV, '0')
+    monkeypatch.setattr(D, 'monitorStatus', lambda *_: None)
+    constraints = _constraints(tmp_path, 'opencv-python-headless==4.13.0.92\n')
+    D._reprove_unproved(constraints, str(tmp_path), str(tmp_path))
+    D._reprove_unproved(constraints, str(tmp_path), str(tmp_path))
+    assert ran == [1]
+
+
+def test_a_hard_re_probe_failure_keeps_failing_in_the_same_process(monkeypatch, tmp_path):
+    """The once-per-process guard is a cost rule, not an exemption. Recorded before the probe
+    ran rather than after it, it would let the first `depends()` call raise and every later one
+    in the same start proceed — the second node running against precisely the environment the
+    marker says was measured and found broken.
+    """
+    D._reprobed.clear()
+    P.update_marker(str(tmp_path), 'cv2', P.UNPROVED_FAILED)
+    ran = []
+    monkeypatch.setattr(D, '_run_probe', lambda work, site: (ran.append(1), (P.FAIL_ENVIRONMENT, 'no libGL'))[1])
+    monkeypatch.setenv(D.PROBE_STRICT_ENV, '1')
+    constraints = _constraints(tmp_path, 'opencv-python-headless==4.13.0.92\n')
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match='did not prove out'):
+            D._reprove_unproved(constraints, str(tmp_path), str(tmp_path))
+    assert ran == [1, 1], 'the second call must re-probe, not be waved through by the guard'
+
+
+def test_no_marker_means_no_subprocess_at_all(monkeypatch, tmp_path):
+    monkeypatch.setattr(D, '_run_probe', lambda *a: pytest.fail('there is nothing to re-prove'))
+    D._reprove_unproved(_constraints(tmp_path, 'opencv-python-headless==4.13.0.92\n'), str(tmp_path), None)
+
+
+def test_nothing_installed_means_nothing_new_to_prove(monkeypatch, tmp_path):
+    """The probe follows the same gate as the ordered passes — otherwise a suite calling
+    `depends()` a hundred times pays a subprocess on each.
+    """
+    monkeypatch.setattr(D, '_run_probe', lambda *a: pytest.fail('the gate should have held'))
+    monkeypatch.setattr(D, '_run_family_passes', lambda *a: None)
+    D._handle_families([_probe_work(passes=())], _constraints(tmp_path, 'x==1\n'), str(tmp_path))

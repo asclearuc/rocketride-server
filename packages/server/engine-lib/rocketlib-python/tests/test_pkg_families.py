@@ -443,3 +443,116 @@ def test_an_unreadable_marker_raises_rather_than_reading_as_false():
         markers.evaluate("python_version >= '3.9'", LINUX)
     with pytest.raises(markers.UnsupportedMarker):
         markers.evaluate("extra == 'gpu'", LINUX)
+
+
+# ---------------------------------------------------------------------------
+# probes: the script, the verdicts, the marker
+# ---------------------------------------------------------------------------
+
+
+def test_the_overlay_reaches_the_probe_as_a_path_insert_not_an_env_var():
+    """§4.11 records that the engine's isolated ``PyConfig`` ignores ``PYTHONPATH``. A probe
+    relying on it would measure base while believing it tested the overlay — a pass for an
+    environment nobody checked, which is the most damaging answer available.
+    """
+    script = pkg_families.probes.probe_script('cv2', 'verdict("pass")', '/over/lay', ('a',), '1.0')
+    assert "sys.path.insert(0, '/over/lay')" in script
+    assert 'PYTHONPATH' not in script
+
+
+def test_the_preamble_carries_what_a_declaration_must_branch_on():
+    """So a family's code stays a static string and still asks what *this* environment
+    installed — cv2 asserts ximgproc only where a contrib member landed.
+    """
+    script = pkg_families.probes.probe_script('cv2', 'verdict("pass")', '/s', ('opencv-contrib-python',), '4.13.0.92')
+    assert "INSTALL_SET = ('opencv-contrib-python',)" in script
+    assert "VERSION = '4.13.0.92'" in script
+
+
+def test_a_raising_probe_becomes_fail_environment_rather_than_a_crash():
+    """The harness owns the default verdict, so a declaration only has to name the cases it
+    can tell apart. For cv2 that default *is* the right answer for both of its failures.
+    """
+    script = pkg_families.probes.probe_script('cv2', 'raise RuntimeError("no libGL")', '/s', (), '1.0')
+    assert 'fail-environment' in script
+    assert '_probe()' in script
+
+
+def test_a_probe_that_answers_nothing_is_a_failure_of_the_probe():
+    script = pkg_families.probes.probe_script('cv2', 'pass', '/s', (), '1.0')
+    assert 'the probe finished without reporting a verdict' in script
+
+
+def test_parse_verdict_reads_the_three_verdicts_and_nothing_else():
+    P = pkg_families.probes
+    assert P.parse_verdict(f'{P.VERDICT_PREFIX} pass 4.13.0.92') == (P.PASS, '4.13.0.92')
+    assert P.parse_verdict(f'{P.VERDICT_PREFIX} fail-version wrong cuda') == (P.FAIL_VERSION, 'wrong cuda')
+    assert P.parse_verdict(f'{P.VERDICT_PREFIX} fail-environment no libGL') == (P.FAIL_ENVIRONMENT, 'no libGL')
+    assert P.parse_verdict(f'{P.VERDICT_PREFIX} something-else oops') is None
+
+
+def test_no_verdict_line_is_inconclusive_not_a_negative_verdict():
+    """A non-zero exit is not evidence about a version: the binary might fail to start, a DLL
+    might be missing. Treated as a verdict, it sends an operator to change a version number
+    over a machine that could not run the check at all.
+    """
+    assert pkg_families.probes.parse_verdict('Traceback...\nImportError: DLL load failed\n') is None
+    assert pkg_families.probes.parse_verdict('') is None
+
+
+def test_needs_are_tri_state_so_unknown_never_reads_as_absent():
+    """A GPU box whose probe was skipped is the one shape that looks like success while
+    checking nothing, so it has to stay distinguishable from "no GPU here, correctly skipped".
+    """
+    met = pkg_families.probes.needs_met
+    assert met((), facts(gpu=None)) is True, 'no needs is always met'
+    assert met(('gpu',), facts(gpu=True)) is True
+    assert met(('gpu',), facts(gpu=False)) is False
+    assert met(('gpu',), facts(gpu=None)) is None
+
+
+def test_the_marker_survives_per_family_so_a_pass_cannot_clear_a_sibling(tmp_path):
+    """Two families can be present, and a passing probe must not erase the record of the one
+    that failed beside it.
+    """
+    P = pkg_families.probes
+    env = str(tmp_path)
+    assert P.read_marker(env) == {}
+    P.update_marker(env, 'cv2', P.UNPROVED_FAILED)
+    P.update_marker(env, 'onnxruntime', P.UNPROVED_DOWNGRADED)
+    assert P.read_marker(env) == {'cv2': P.UNPROVED_FAILED, 'onnxruntime': P.UNPROVED_DOWNGRADED}
+    P.update_marker(env, 'cv2', None)
+    assert P.read_marker(env) == {'onnxruntime': P.UNPROVED_DOWNGRADED}
+    P.update_marker(env, 'onnxruntime', None)
+    assert P.read_marker(env) == {}
+    assert not os.path.exists(P.marker_path(env)), 'the last entry removes the file'
+
+
+def test_a_missing_marker_is_empty_rather_than_an_error(tmp_path):
+    assert pkg_families.probes.read_marker(str(tmp_path / 'nope')) == {}
+
+
+def test_both_shipped_families_declare_a_probe_and_only_one_needs_a_gpu():
+    """cv2's demand is always correct, so it carries no `needs`; onnxruntime's is correct only
+    where a GPU exists, so on a CPU-only host it must skip rather than fail a working install.
+    """
+    assert CV2.probe is not None and CV2.probe.needs == ()
+    assert ONNXRUNTIME.probe is not None and ONNXRUNTIME.probe.needs == ('gpu',)
+
+
+def test_the_cv2_probe_asserts_ximgproc_only_where_a_contrib_member_landed():
+    """A fixed assertion would fail correct environments once most of them request only
+    headless; keyed on the install set it states what the ordering owes.
+    """
+    assert 'ximgproc' in CV2.probe.code
+    assert "'contrib' in dist" in CV2.probe.code
+
+
+def test_the_onnxruntime_probe_separates_a_missing_runtime_from_a_wrong_version():
+    """-gpu does not vendor the CUDA runtime, and an environment may legitimately hold it
+    without torch — so "no provider" means cudnn is absent, which no lower version repairs.
+    """
+    code = ONNXRUNTIME.probe.code
+    assert "'CUDAExecutionProvider' not in providers" in code
+    assert 'fail-environment' in code
+    assert 'fail-version' in code

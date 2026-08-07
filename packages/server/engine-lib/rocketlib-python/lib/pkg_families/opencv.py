@@ -30,7 +30,28 @@ the base aligns exactly as an overlay does.
 
 from __future__ import annotations
 
-from . import Family, Member
+from . import Family, Member, Probe
+
+# Both of this family's failure modes are **fail-environment**, and that is a statement
+# about causes rather than a default. `import cv2` fails because the host lacks `libGL`
+# (a system package) and `cv2.ximgproc` fails because a subset won the namespace (a bug in
+# the ordering). Neither is repaired by a different version number, which is also why this
+# family gets no version lever in its failure message — it would be a knob over the wrong
+# thing.
+#
+# The `ximgproc` assertion is conditional and that is the strongest form available, not a
+# hedge: after the ownership move most environments request only `opencv-python-headless`
+# and never install a contrib build, so a fixed assertion would fail correct environments.
+# Keyed on the install set, the probe states exactly what the ordering owes — *the widest
+# variant this environment asked for is the one that wrote the namespace*.
+_CV2_PROBE = """
+import cv2
+
+if any('contrib' in dist for dist in INSTALL_SET):
+    import cv2.ximgproc  # noqa: F401  the contrib member must be the last writer
+
+verdict('pass', getattr(cv2, '__version__', 'unknown'))
+"""
 
 CV2 = Family(
     name='cv2',
@@ -41,7 +62,7 @@ CV2 = Family(
         Member(dist='opencv-contrib-python-headless'),
         Member(dist='opencv-contrib-python'),
     ),
-    probe=None,  # lands with the probes
+    probe=Probe(code=_CV2_PROBE),  # no `needs`: this one is always a correct demand
     namespace_version=None,
     notes=(
         'Lockstep-released: 4.10.0.84, 4.11.0.86, 4.12.0.88, 4.13.0.90, 4.13.0.92 and '
