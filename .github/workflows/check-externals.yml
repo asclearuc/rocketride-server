@@ -112,8 +112,8 @@ jobs:
 
       - name: Run check-externals (markers respected)
         # The builder task's own steps build the engine + the four trees, then
-        # invoke the CLI. No --install-all: the 7 skip-install bundles and the
-        # 2 disable files stay uninstalled (fast). Tee the output so the
+        # invoke the CLI. No --install-all: the 12 skip-install bundles and the
+        # 1 disable file stay uninstalled (fast). Tee the output so the
         # annotate step can scan it.
         #
         # --autoinstall: let the builder install its own Node deps + missing
@@ -192,8 +192,8 @@ jobs:
       - name: Run check-externals
         # --rebuild-cache: full uv pip compile from scratch (catches upstream
         #                  releases since the last constraint resolution).
-        # --install-all:   install the 7 skip-install bundles and verify them.
-        #                  The 2 disable files (surya/trocr) stay skipped —
+        # --install-all:   install the 12 skip-install bundles and verify them.
+        #                  The 1 disable file (surya) stays skipped —
         #                  disable beats install-all.
         # workflow_dispatch can opt out of --install-all via the input.
         shell: bash

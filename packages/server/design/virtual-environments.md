@@ -8,7 +8,7 @@ lives — §4.9's base shrink, §4.10's second-run-collision question, the clien
 implementation yet)" through the whole of 2A and 2B; a status nobody updates is worse than none,
 which is why it now points at the sections that carry the truth instead of restating it.*
 **Scope:** Engine (C++ + embedded Python), `depends.py`, the `remote` sub-pipeline mechanism,
-the pipeline canvas (shared-ui / VS Code), and the test/CLI harnesses.
+the pipeline canvas (`apps/shared` / VS Code), and the test/CLI harnesses.
 **Audience:** Engine + tooling engineers. This is an *internal* design document, not user-facing
 documentation — it deliberately lives in `packages/server/design/`, **not** `packages/server/docs/`
 (which `docs:gather` publishes to the public site under *Protocols › WebSocket*).
@@ -52,7 +52,9 @@ longer collide. Nodes in different environments exchange lane data over secured 
 ## 2. Background (verified)
 
 ### 2.1 Canvas groups are inert in the engine
-The canvas (`packages/shared-ui/src/components/canvas`, ReactFlow/xyflow) already has a **group node**
+The canvas (`apps/shared/src/components/canvas`, ReactFlow/xyflow — it lived under
+`packages/shared-ui/` until `develop` split the UI into a consumer app and the curated `shell`
+barrel) already has a **group node**
 (`INodeType.Group`). Nodes dropped into a group get `parentId`; on save,
 `graph.ts:getProjectComponents()` **nests the group's children into `config.pipeline.components`**.
 
@@ -430,7 +432,7 @@ a parallel stack:
 - **Extract the common bridge base** (lane dispatch/serialization in `callLocal` + the transform) into
   shared code.
 - Add a **new `venv` / `venv_server`** node pair inheriting it, alongside `remote` / `remote_server`.
-- The `venv` node implements **all data lanes** — the 15 `Binder::MethodNames` minus the
+- The `venv` node implements **all data lanes** — the 16 `Binder::MethodNames` minus the
   `open`/`closing`/`close` framing: `tags, text, table, words, audio, video, questions, answers,
   image, classifications, classificationContext, documents` (today's `callLocal` covers only 3 data
   lanes — text/tags/documents), critically `image`/`video`/`audio` (vision is image-heavy). Derive lane
@@ -474,7 +476,8 @@ the rejected `venvEgress`/`venvIngress` reinvention; it is a sibling of `remote`
   `INTERNAL` (`PROTOCOL_CAPS` BIT 6, `Url.hpp`) means *not returned in `services.json` at all* — the
   UI never sees the node, so it can't be shown, placed, or referenced. `nosaas` (BIT 13) is weaker: the
   node **is** in `services.json` but the UI Add-Node inventory/quick-add filter it out
-  (`shared-ui/.../helpers.tsx`, `QuickAddPopup.tsx`) — and nothing in the C++ engine or the Python
+  (`apps/shared/src/components/canvas/util/helpers.tsx`, `.../panels/quick-add/QuickAddPopup.tsx`) —
+  and nothing in the C++ engine or the Python
   server gates *execution* on `nosaas` (it is only parsed into `def.capabilities` at
   `services.cpp:1779`; there is no engine "saas mode"). That is why `remote_server` carries
   `["internal", "nosaas"]` while the user-placeable `remote` client carries only `["nosaas"]`. Both
@@ -647,6 +650,16 @@ the byte router never solved.
 Today `_find_requirement_files()` globs **all** `nodes/**` + `ai/**` requirements (pipeline-blind);
 the unified `uv pip compile` fails the moment two nodes conflict. Instead:
 
+**Where that glob reads from, because it decides when a deleted requirement file stops counting.**
+Its root is `_get_executable_dir()` — `dist/server/`, the *staged* tree, never source. `ai:sync`
+mirrors, so a `requirement*.txt` removed from `packages/ai/src/ai` leaves the compile on the next
+build; `nodes:sync` does not, because it projects two source trees into one destination and computes
+its delete set per source, so a file removed from `nodes/src` stays staged until `builder
+nodes:clean`. Such an orphan is silent rather than merely stale: `_compute_hash` hashes only the
+files it *found*, so a leftover nobody touched keeps the cached hash stable and does not even
+invalidate the compile — which is how a change that deletes a requirement file can be measured
+against a `constraints.txt` that never saw the deletion.
+
 **Uniform per-environment scoping (main included; one code path).** Each environment compiles +
 installs **only the nodes it uses**, into its own node-set-keyed overlay. The partitioner already knows
 each env's node set, so:
@@ -810,7 +823,10 @@ variant — so the backstop is a narrow safety net, not the primary mechanism.
   one under `nodes/src`. (A grep finds 17: the seventeenth is `base.py`'s
   `_REQUIREMENTS_FILE: Optional[...] = None`, an `ast.AnnAssign` the walker's `ast.Assign` branch
   does not see — and which the resolved-path clause below would neutralise anyway, since `None`
-  names no file.) Two implementation facts are load-bearing. The value is never a plain
+  names no file.) *Increment 2.5 deleted `trocr.py`, one of the declarers, so the tree now reads 15
+  and 16. What carries the argument is the shape — every declarer under one directory, plus one
+  annotation the walker cannot see — not the tally.*
+  Two implementation facts are load-bearing. The value is never a plain
   string (`os.path.join(dirname(__file__), 'x.txt')`, a list of those, or `dirname + '/x.txt'`), so
   `_requirement_basenames` looks through Call arguments and BinOp operands; and it hangs off a
   **new branch keyed on the exact name**, never the pre-existing `'REQUIREMENT' in id.upper()`
@@ -832,16 +848,23 @@ variant — so the backstop is a narrow safety net, not the primary mechanism.
   to the other three. A walk seeded at `surya.py` reaches `ai.common.opencv`, `ai.common.torch` and
   `ai.web.metrics` but **not** `ai.common.image`, so nothing else would have.
 
-  **`ocr` is unchanged at 13 files, by design.** `nodes/ocr/ocr.py` imports all four engines
-  unconditionally — the engine is a *runtime* config choice, so all four are genuinely statically
-  reachable and the walk is right to keep them. The payoff is conditional and measured: a walk
+  **`ocr` was unchanged at 13 files, by design — and reads 12 since increment 2.5.**
+  `nodes/ocr/ocr.py` imports every engine unconditionally — the engine is a *runtime* config choice,
+  so each is genuinely statically reachable and the walk is right to keep them. The table above is
+  the measurement of *this* item and stays at 13; the count moved only because 2.5 deleted TrOCR and
+  with it `requirements_trocr.txt` (re-measured against the tree: `ocr` 12, with `detect`,
+  `audio_transcribe` and `embedding_image` unmoved at 9, 8 and 9 — the same method, so the shift is
+  the deletion and nothing else). The payoff is conditional and measured: a walk
   seeded at `ai/common/models/ocr/surya.py`, which is what a 2A-4 `nodes.ocr.surya` component would
-  look like, goes from all four engine files to `requirements_surya.txt` alone. That is the
+  look like, goes from all three engine files to `requirements_surya.txt` alone. That is the
   precondition 2A-4 rests on, pinned by `test_an_ocr_engine_module_scopes_to_its_own_requirements`.
   It removes one of Surya's two blockers: the same walk still keeps
   `ai/common/opencv/requirements_{1,2}.txt` at `4.13.0.92`, and removing that shim — **deleted
   outright, not demoted to a re-export**, since nothing imports it afterwards — is 2A-4's business
-  (§7, scope item 4), not this item's.
+  (§7, scope item 4), not this item's. *Do not read that as "and then Surya is unblocked":* measured
+  on a craft-free tree with the shim removed, the base still resolves `4.13.0.92` and `surya-ocr`
+  still backtracks to `0.16.1` (§4.16), so the second blocker survives the pin's removal and is a
+  separate question.
 
   **The barrels stay; the invariant moved to the nodes.** A family barrel is a public surface with
   an explicit `__all__`, and PEP 562 would not help the walk anyway (see the Option B note above).
@@ -1616,8 +1639,10 @@ per-run flag can lift that. So `auto` still keeps the legacy node-glob union and
 keeps the conflicting-nodes failure, and **only `=1` delivers conflict isolation** — the same
 conclusion, now for the right reason. Removing the limit means taking node dependencies out of the
 startup path entirely (resolving them per-env on first use) — the same work as the base-runtime-only
-residual in §4.9. The fixtures' side of the same fact is in §8.3: the conflict acceptance is
-structurally `=1`-only until they live where the startup glob does not reach.
+residual in §4.9. *The fixtures' side of this used to be the same fact and is no longer:* the
+conflict acceptance was structurally `=1`-only while the `vtest_*` pins sat where the startup glob
+reached them, and 2A-R moved them to `local_nodes` under `--node_path=`, so it now runs under `auto`
+(§8.2, §8.3). The limit above is about *shipped* nodes, which are still all in the union.
 
 A second consequence of `=1`: nodes whose imports the AST walk cannot resolve statically (flagged
 `dynamic_imports`) no longer get their dependencies from the startup glob and fall back to the runtime
@@ -1862,6 +1887,16 @@ person will not re-derive them.
   first is what stops the restart from repeating the whole build, so the condition travels out of
   `_compile_and_install` as a returned exception that `run_scoped_install` re-raises *after*
   `mark_installed`. The base path has no such bookkeeping and raises directly.
+- **Both sides of that comparison must be *distribution* versions.** The resolution speaks
+  distribution versions — `4.13.0.92` — and a module's `__version__` does not: every `opencv-*`
+  wheel in the `4.13.0.9x` line reports `4.13.0`, dropping the build component. Compare the loaded
+  module's `__version__` against the resolution and a correctly installed environment is unequal to
+  itself, forever. **Measured the expensive way**: it failed 64 collections in one nodes lane and
+  nowhere else, because the check runs on the *nothing to do* path and a freshly cleaned tree never
+  reaches that path with `cv2` loaded — the mandatory clean is what hid it. The version behind a
+  loaded namespace therefore comes from the `*.dist-info` names in the site the module was **loaded
+  from** (`_loaded_family_version`), last member present winning, as everywhere else here; and where
+  that origin cannot be read there is no refusal, because a check that cannot tell must not.
 - **And that check runs outside every gate.** Base and an overlay align over different input sets —
   the base over the union of every requirement file, an overlay over its own consumers — so they
   legitimately hold different versions, and a `sys.path` insert does not re-import what is already
@@ -1875,14 +1910,71 @@ person will not re-derive them.
 A drift-rebuild is refused while the environment is in use, with a named error rather than uv's
 access-denied; main-environment drift on a resident engine therefore requires a restart. This
 relates to 8.6's active-run gate and inherits its check-then-act residual. **Recorded here as the
-decision; building it is a named follow-up** — INVESTIGATE §8 asks for the decision, and the
-lifecycle surface in §4.10 is where the implementation belongs.
+decision; building it is a named follow-up** — the lifecycle surface in §4.10 is where the
+implementation belongs.
 
 The forced re-lay of the widest member makes the hazard **more reachable** rather than new: a rebuild
 might once have left `cv2/` untouched because uv found it satisfied; now, when the family changes, it
 is written on purpose. The base-environment sibling is *not* deferred — the already-imported check
 above ships with the family step, because without it a Linux base runtime writes a new member under a
 live interpreter and then reports success for a version it is not running.
+
+#### A package that can never be installed must not be declared
+
+The family mechanism aligns members that *can* co-install. It has nothing to offer a member whose
+range no resolution can satisfy, and leaving such a package declared is not neutral: **the
+declaration is what the compile sees**, so it constrains every environment the file reaches whether
+or not anything could ever install it. The remedy is to remove the declaration, not to widen the
+alignment.
+
+The worked example is what increment 2.5 acted on, and it is recorded here because it is the fact
+base the shim deletion (§7, scope item 4) opens against — it lived outside git until this increment
+folded it in:
+
+- `craft-text-detector` 0.4.3, reached transitively from TrOCR, requires
+  `opencv-python <4.5.4.62, >=3.4.8.29`; `surya-ocr` 0.17.1 requires
+  `opencv-python-headless==4.11.0.86`.
+- **uv reports no conflict between them** — they are different distributions, which is precisely the
+  condition this section exists for. The `ai.common.opencv` shim's `==4.13.0.92` overrides both, so
+  today the collision is invisible rather than absent.
+- Had craft still been declared when the shim went, a resolution holding `opencv-python` at 4.5.x
+  beside headless at 4.11.0.86 would have become available; alignment takes the minimum and the
+  second pass pins headless where surya forbids it. **Three endings were possible and two break the
+  base environment.** (Counterfactual, and it is why craft went first — for what the shim's removal
+  actually does on the tree as it now stands, see the measurement below.)
+- A *proxied* TrOCR component does not escape it. Requirement files are model-server-blind — nothing
+  in a `requirement*.txt` says which process will load the model — and the saas model server is a
+  base process of this same engine on the same Python 3.12, where craft's opencv range has no wheel
+  at all.
+
+So the uncertainty was **removed rather than resolved**: craft goes because it can never be
+installed, and TrOCR goes with it because craft is its detector. That is what makes the unpinned
+namespace a question worth measuring instead of a question with two wrong answers already in it.
+
+**Then it was measured, and the answer refutes what §7 scope item 4 predicts.** With craft out of
+the tree, both shim requirement files were removed temporarily and the base recompiled — *compile
+only*, deliberately: `depends()` returns silently on a missing file, so running the suite in that
+state would import the 4.13 wheels already on disk and come back green having measured nothing.
+Expected `4.11.0.86`. Measured: the base **stays at `4.13.0.92`** and `surya-ocr` **stays backtracked
+at `0.16.1`**. Once the shim is gone nothing in the tree pins opencv at all, so the resolution is
+purely transitive and every consumer is unpinned:
+
+| distribution | version without the shim | requested by |
+| --- | --- | --- |
+| `opencv-contrib-python` | 4.13.0.92 | `img2table`, `mediapipe`, `rtmlib` |
+| `opencv-python` | 4.13.0.92 | `python-doctr`, `rtmlib`, `albucore` |
+| `opencv-python-headless` | 4.13.0.92 | `albucore`, `albumentations`, `easyocr`, `surya-ocr` |
+| `opencv-contrib-python-headless` | **absent** | the shim alone asked for it |
+
+Deleting the shim therefore changes the family's **composition**, not its version: the fourth member
+stops being installed because nobody else ever wanted it. The `4.11.0.86` prediction rested on
+`surya-ocr` resolving to 0.17, and it does not — **why it does not is unmeasured.** A hand-built
+`uv pip compile` probe does not reproduce the build's index configuration (it died on an unrelated
+`certifi` against `download.pytorch.org`) and would have measured the probe rather than the tree; the
+way to ask is to put `surya-ocr>=0.17` into `requirements_surya.txt` and read the engine's own
+compile. That is scope item 4's opening question, not a blocker for the increment that removed craft
+— 2.5 is correct whichever ending the unpinned namespace has, since removing craft is what makes the
+question answerable at all.
 
 ---
 
@@ -1900,10 +1992,11 @@ live interpreter and then reports success for a version it is not running.
    the `depends()` backstop **doesn't fire** for them. Resolution: the walk must be **transitive through
    `ai`** and **include all reachable config-branch backends' `requirements*.txt`** (§4.8). **A
    throwaway prototype has now PROVEN this** on `detect`/`audio_transcribe`/`anonymize`: zero
-   under-includes, zero dynamic imports (§4.8 Prototype result). The remaining 2A prerequisite is
-   **precision** — the `ai.common.models` barrel `__init__` re-exports every submodule, so barrel-
-   importing nodes over-include the whole ML stack until the barrel goes lazy or nodes import submodules
-   by full path. Second axis: the walk (or a model-server-aware pruning of it) must account for
+   under-includes, zero dynamic imports (§4.8 Prototype result). The precision prerequisite — the
+   `ai.common.models` barrel `__init__` re-exporting every submodule, so barrel-importing nodes
+   over-included the whole ML stack — is **DONE**: Option A moved the four barrel importers to
+   full-path imports, and 2A-R's self-describing-directory rule closed the within-family half
+   (§4.8, §6). Second axis, still open: the walk (or a model-server-aware pruning of it) must account for
    `--modelserver` mode, where the heavy `ai/**` deps aren't imported at all (§4.8 Model-server
    dimension).
 3. **Non-isolated grouped pipelines — RESOLVED: they do NOT run today (verified).** `getProjectComponents`
@@ -2034,15 +2127,15 @@ live interpreter and then reports success for a version it is not running.
    users.
 **2A-4 — shared-namespace package families, environment facts and probes (IN PROGRESS).** Not "OCR
 opencv de-conflict" any more: the OCR split is the framework's *first consumer*, not its subject.
-The mechanism is §4.16; the investigation that produced it, its verified fact base and its
-verification plan live in `packages/server/design/INVESTIGATE-opencv-ocr-venv.md` (bilingual, and
-**untracked** like every `NEXT-STEP-*` sibling — this document is currently the only tracked file in
-`design/`, so a reader who cannot find that one is not looking at a deletion). Its corrections are
-scheduled with the increments that make them true, so they land outside the repository unless it is
-added first.
+The mechanism is §4.16, and so is the fact base the investigation produced — the craft/Surya
+collision, why uv reports no conflict between two distributions sharing `cv2`, the three endings
+that were possible had craft stayed, and **the measurement of what removing the shim actually does
+now that it has gone** — all under *a package that can never be installed must not be declared*.
+That fold happened in increment 2.5 on purpose: the working notes were untracked, so every fact
+still load-bearing had to reach a tracked file before the increment that needs it.
 2B is closed, so the old "DEFERRED, sequenced after 2B" and "Do 2B first" no longer apply.
 
-Scope, in the order it lands. **Done: 1, 2. Remaining: 3–6** — keep this line current, because a phase
+Scope, in the order it lands. **Done: 1, 2, 3. Remaining: 4–6** — keep this line current, because a phase
 entry that says "next" long after the thing shipped is how §7 went stale before.
 
 1. **`lib/pkg_families/`** *(landed)* — the registry, environment facts, alignment and the ordered install,
@@ -2055,30 +2148,60 @@ entry that says "next" long after the thing shipped is how §7 went stale before
    script, three verdicts plus *inconclusive*, an unproved marker that crosses the drift and
    `*.dist-info` gates, and one global probe-strictness lever. Both families declare a probe;
    onnxruntime's runs only once its family registers at item 5.
-3. **TrOCR and `craft-text-detector` leave the tree**, which has to precede the opencv move:
-   craft's `opencv-python < 4.5.4.62` and Surya 0.17's `opencv-python-headless == 4.11.0.86` cannot
-   share one namespace once the shim stops overriding both, and uv reports no conflict between them
-   because they are different distributions. Half of it is out of this repository — see the saas
-   step below.
+3. **TrOCR and `craft-text-detector` leave the tree** *(landed)*, which had to precede the opencv
+   move: craft's `opencv-python < 4.5.4.62` and Surya 0.17's `opencv-python-headless == 4.11.0.86`
+   cannot share one namespace once the shim stops overriding both, and uv reports no conflict
+   between them because they are different distributions. `trocr.py` and `requirements_trocr.txt`
+   are gone with their `contract-check` markers, both barrels and the `ocr` node lost the engine,
+   and the `ocr` walk reads 12 requirement files instead of 13 (§4.8). `services.json` and the node
+   README keep their `trocr` entries until item 6, because the README's PARAMS block is generated
+   from the schema and the two cannot be corrected apart; a stale `engine: trocr` is safe, since
+   `OCR_ENGINES.get` returns `None` and the node falls back to EasyOCR. Half of it was out of this
+   repository — see the saas step below.
 4. **The opencv ownership move** — the `ai.common.opencv` shim is deleted outright rather than
    demoted to a re-export (nothing imports it afterwards, in this repo or in saas), its two
    requirement files go with it, and the two nodes that were riding its pins declare
    `opencv-python-headless<5` of their own. **No base-environment override**: the base aligns
-   exactly as an overlay does and moves from `4.13.0.92` to `4.11.0.86` in every installation.
+   exactly as an overlay does.
+   *The version it lands on is now measured, and it is not the one this item used to name.* This
+   read "moves from `4.13.0.92` to `4.11.0.86` in every installation"; a dry run on a craft-free
+   tree with both shim files removed says the base **stays at `4.13.0.92`** while
+   `opencv-contrib-python-headless` leaves the resolution entirely, because `surya-ocr` still
+   backtracks to `0.16.1` (§4.16 carries the table and the open question of *why*). Start from that
+   measurement, not from the old sentence.
 5. **onnxruntime as the second family** — the ten copied `onnxruntime-gpu==1.22.0` /
    `onnxruntime==1.22.0` lines across five requirement files become one `namespace_version`, and
    the hard-coded exclusion in `_write_excludes_file` becomes data.
 6. **The OCR node split** (Layout S, granularity M) and the honest `surya-ocr>=0.17,<0.18` range.
 
 **A new numbered step, because half of it is out of this repository:** *remove TrOCR from the saas
-side, first.* This repo deletes the loader, its requirements and the barrel exports;
-`rocketride-saas` drops `ModelType.TROCR`, `TrOCRLoader` from the shared
-`from ai.common.models import (...)` in `model_manager.py` and its mapping row, plus two comment
-lists in `warmup_models.py`. Ordering is the point: that import serves **every** model type, so the
+side, first* — **done, ahead of the deletion here, so no stub was needed.** `rocketride-saas`
+dropped `ModelType.TROCR`, `TrOCRLoader` from the shared `from ai.common.models import (...)` in
+`model_manager.py` and its mapping row, plus two comment lists in `warmup_models.py`: five sites,
+three of them live code. Ordering was the point: that import serves **every** model type, so the
 export deleted here and still named there is not "TrOCR breaks", it is model loading breaking for
 everything — lazily, at first load in a running deployment, where this repository's CI cannot see
-it. If the saas change cannot land first, the fallback is a deprecation stub in the barrel, deleted
-once it has.
+it.
+
+**Where that work lives, because a cross-repo change has no natural home and the first attempt got
+it wrong.** The saas side of any increment goes on a branch **named exactly as this repository's** —
+`feat/virtual-environments` — created off saas `develop`, and it stays **uncommitted** until the
+same explicit instruction that governs this repo. It is not made on `develop` directly: a
+half-landed cross-repo pair is already the hazard this step exists to sequence, and putting one
+half loose on the mainline is how the two get separated. Each increment that touches saas records
+its sites here, in this section, so the pairing is readable from the side that drives it.
+
+The name sweep alone could not prove the set was complete, because it cannot see a `ModelType(value)`
+built from a request string. Checked separately: there is exactly one such site, and it already
+catches `ValueError` into `ModelType.UNKNOWN`, for which `get_loader_class` returns `None` and the
+handler raises `No loader for model type: <str>`. A stale `'trocr'` therefore fails earlier and more
+clearly than before, rather than importing a module that no longer exists.
+
+**Left open, deliberately:** the real defect is the all-or-nothing barrel import — one `from
+ai.common.models import (...)` naming fourteen loaders (fifteen before this step), so deleting any
+one of them is a cross-repo blocker. This repository already forbids that shape for nodes
+(`test_a_node_imports_a_model_module_never_a_model_package`); saas is outside its reach. These five
+edits route around the problem; the next loader deletion meets it again.
 
 - **Tests (§8.1–8.3):** AST-walk / resolution-rule / `depends`-parameterization / model-server-pruning
   **unit tests**; the `vtest_alpha`/`vtest_beta` **fixture nodes**; the **no-venv-conflict-fails** and
@@ -2116,11 +2239,12 @@ entangled and 4 depends on 5.
   Python-backend floor, and `nodes/**` had been matching it only by accident. The `ai/**` shrink
   itself stays deferred **with a written trigger** (§4.9), because a base process that loads models
   has no environment yet and dropping the pins would leave it installing unpinned rather than not at
-  all. What it does not deliver: OCR/Surya is **not** on this path — an OCR env pulls all four
-  engine files into one constraint set regardless of what base holds. Item 2 has since shipped and
-  did **not** change that either, deliberately: the `ocr` node reaches all four engines statically,
-  so the walk is right to keep them. What item 2 did deliver is that a *per-engine* component
-  scopes to its own engine, which leaves 2A-4 as the only remaining step for Surya.
+  all. What it does not deliver: OCR/Surya is **not** on this path — an OCR env pulls every engine
+  file into one constraint set regardless of what base holds (four of them then, three since
+  increment 2.5 deleted TrOCR). Item 2 has since shipped and did **not** change that either,
+  deliberately: the `ocr` node reaches every engine statically, so the walk is right to keep them.
+  What item 2 did deliver is that a *per-engine* component scopes to its own engine, which leaves
+  2A-4 as the only remaining step for Surya.
 - **2 — AST within-family over-inclusion is closed, and the deferred *decision* dissolved rather
   than being made.** §4.8 offered Options 1/2 as a choice; measurement showed they are halves of
   one fix — Option 1 alone moves nothing (870 → 870), Option 2 alone never reaches a barrel
@@ -2131,8 +2255,9 @@ entangled and 4 depends on 5.
   engines import `PIL` — fixed in the same change. And the ancestor import-closure residual item 1
   handed over (`ai/web/__init__` → `ai.account`) closed on a stronger fact than backstop coverage:
   it is empty in package terms, tree-wide, and pinned by a test. What it deliberately does not
-  deliver is `ocr` itself, still at 13 files because the node reaches all four engines statically;
-  what it does deliver is that a 2A-4 per-engine component finally scopes to its own engine.
+  deliver is `ocr` itself, still at 13 files then — 12 since increment 2.5 — because the node
+  reaches every engine statically; what it does deliver is that a 2A-4 per-engine component finally
+  scopes to its own engine.
 
 **What is NOT done, stated separately so the group is not read as closed.**
 - **3's other half — `ENV_ID` per test worker.** Deliberately not built: declarative node tests are
@@ -2193,8 +2318,8 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
    Two step-7 flags recorded: a return-only (`venv→main`) client has `input: []` (does the engine
    instantiate an input-less filter?), and `venv_source_stub` is registered nowhere / not special-cased
    in C++ (child-engine acceptance is open — stub creation is isolated in one helper for an easy revision).
-6. **Bridge: extract shared base + new `venv` node** (all 15 lanes; `image`/`video`/`audio`); network-
-   remote untouched.
+6. **Bridge: extract shared base + new `venv` node** (all 13 data lanes; `image`/`video`/`audio`);
+   network-remote untouched.
 7. **Local spawn + transport (v1 = WS-over-loopback unchanged):** spawn the venv child (its overlay) and
    point the existing `remote` WS bridge at it over loopback (Bearer token; raise the ~1 MB AV ceiling);
    routing through main's engine graph (step 8.3), not a transport-layer hub. No layer-2 swap in v1.
@@ -2482,7 +2607,9 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
    *Cost inherited, not introduced:* children are still spawned sequentially, each awaited to
    readiness before the next, so two cold environments now **sum** rather than dying at 30 s.
    Strictly better than before (that run did not complete at all), and the overlap is fake until
-   8.7 gives each child its own `install.lock` — see §4.10.
+   8.7 gives each child its own `install.lock`. *Superseded on that last clause:* 8.7A did give each
+   environment its own directory and therefore its own lock, so the overlap would now be real —
+   parallel spawn stays out of scope for a weaker reason, recorded in §4.10.
    *Increment 8.5B — **DONE, live-verified**: orphan-safe teardown (`ProcessGuard`).* Teardown was
    cooperative, so anything a run spawned that is **not itself an engine** outlived the server.
    That class is the whole increment: F1 measured that killing the server leaves **zero**
@@ -2743,7 +2870,10 @@ Three layers; each test is tagged with the phase that first makes it runnable (*
   about to land under a loaded module, and an environment merely *providing* a different version
   with **nothing to install** — each paired with the case that must stay silent, since a check that
   only ever fires is indistinguishable from one that always fires. The nothing-to-install pair is
-  the load-bearing one: it is where a gated check would never run at all.
+  the load-bearing one: it is where a gated check would never run at all. Those fixtures plant a
+  **real site with `*.dist-info` names**, never a stub carrying `__version__`: the stub form is what
+  let a module-version-against-distribution-version comparison keep four tests green while refusing
+  every healthy warm environment, and one case pins the build component a module version drops.
   The **orchestration** half sits in `test_venv_env.py` rather than either, because that is where
   `run_scoped_install` lives: a returned refusal is re-raised only *after* `mark_installed`, and the
   restart that follows finds a matching hash and rebuilds nothing. Both assertions are needed — the
@@ -3056,7 +3186,9 @@ measured).
   reached via `--node_path=`, never staged); `nodes/test/venv_runtime/test_venv_conflict_e2e.py` (the §8.3
   acceptance, automated in `nodes:test`). **Implemented (2A increment 1):** `.../rocketlib-python/lib/ast_deps.py` (provider→module
   resolution + transitive AST walk) with `test_ast_deps.py` — the §4.8 prototype is now a passing unit
-  test (13 tests green).
+  test. *It was 13 cases at increment 1 and is **38** as of 2026-08-08, having absorbed the
+  ancestor-package rule and the self-describing-directory rule; treat any number here as a snapshot
+  and read the live one off the suite, per §6.*
 - `packages/server/engine-lib/rocketlib-python/lib/depends.py` — `ensure_constraints` /
   `_find_requirement_files` / `_get_combined_path` / `_get_constraints_path` / `_get_site_packages` /
   `model_cache_dir` / `FileLock`; the AST **walk** (over the entry-module paths the partitioner
@@ -3070,7 +3202,7 @@ measured).
   every probe rule testable without a subprocess), and one module per family. **Stdlib-only** — it is
   read by `depends.py`, so importing anything from the engine side would make the rules untestable
   under bare `pytest`; the same reason `venv_env.py` mirrors helpers instead of importing `depends`.
-- UI: `packages/shared-ui/src/components/canvas/util/graph.ts` (`getProjectComponents`),
+- UI: `apps/shared/src/components/canvas/util/graph.ts` (`getProjectComponents`),
   `.../context/FlowGraphContext.tsx` (`onNodeDragStop`, `isValidConnection`),
   `.../node/node-group/NodeGroup.tsx`, `packages/client-typescript/src/client/types/pipeline.ts`,
   `apps/vscode/src/providers/views/Project/ProjectWebview.tsx`.

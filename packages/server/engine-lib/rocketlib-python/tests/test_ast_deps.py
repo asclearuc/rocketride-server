@@ -340,7 +340,7 @@ def test_a_self_describing_directory_yields_only_declared_files(tmp_path):
 def test_an_ocr_engine_module_scopes_to_its_own_requirements():
     """The precondition 2A-4 rests on, and the reason this item is not cosmetic.
 
-    A 2A-4 Surya component would seed its walk here. Today an `ocr` environment gets all four
+    A 2A-4 Surya component would seed its walk here. Today an `ocr` environment gets all three
     engine files, so the resolver holds opencv at 4.13 and backtracks surya-ocr to 0.16.1 while
     surya.py targets the 0.17 API: splitting the node buys nothing until the walk stops handing
     the environment every engine.
@@ -352,7 +352,6 @@ def test_an_ocr_engine_module_scopes_to_its_own_requirements():
     assert not names & {
         'requirements_easyocr.txt',
         'requirements_doctr.txt',
-        'requirements_trocr.txt',
     }
 
 

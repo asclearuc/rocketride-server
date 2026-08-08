@@ -246,9 +246,11 @@ export const DeploymentView: React.FC<IDeploymentViewProps> = ({ documentTitle, 
 	const sources = useMemo(
 		() =>
 			components
-				.filter((c: { config?: { mode?: string } }) => c.config?.mode === 'Source')
-				.map((c: { id?: string; name?: string; provider?: string }) => ({ id: c.id || c.name || c.provider || '', name: c.name || c.id || c.provider || '' }))
-				.filter((src: { id: string }) => src.id === sourceId),
+				// `config` is open (Record<string, unknown>), so `mode` needs the cast
+				// rather than an inline re-annotation of an already-typed component.
+				.filter((c) => (c.config as { mode?: string } | undefined)?.mode === 'Source')
+				.map((c) => ({ id: c.id || c.name || c.provider || '', name: c.name || c.id || c.provider || '' }))
+				.filter((src) => src.id === sourceId),
 		[components, sourceId]
 	);
 	const componentNames: Map<string, string> = useMemo(() => {

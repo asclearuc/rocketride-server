@@ -37,7 +37,11 @@
 import type { PipelineInputConnection, INodeConfig, IControlConnection, IPosition, IDimensions } from 'shell';
 
 // Re-export all general types so flow consumers can import from one place
-export type { IProject, IProjectComponent, IComponentUI, IControlConnection, IInputConnection, IPosition, IDimensions, IEnvironment, IService, IServiceCatalog, INodeConfig, IValidateResponse, IComponentValidatePayload, IValidatePipelinePayload, IServiceSchema, IToolchainExport, IToolchainState, IForm, IFormData, ITaskStatus, IFlowData } from 'shell';
+export type { IProject, IProjectComponent, IComponentUI, IControlConnection, IInputConnection, IPosition, IDimensions, IService, IServiceCatalog, INodeConfig, IValidateResponse, IComponentValidatePayload, IValidatePipelinePayload, IServiceSchema, IToolchainExport, IToolchainState, IForm, IFormData, ITaskStatus, IFlowData } from 'shell';
+
+// Taken straight from the SDK rather than the shell barrel: the container is the
+// only consumer, so it does not need to become shell surface to reach the canvas.
+export type { PipelineEnvironment as IEnvironment } from 'rocketride';
 
 export { IServiceCapabilities, ITaskState, DEFAULT_TOOLCHAIN_STATE } from 'shell';
 
