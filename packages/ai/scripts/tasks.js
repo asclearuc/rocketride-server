@@ -54,7 +54,6 @@ function makeSyncAiAction() {
         run: async (ctx, task) => {
             task.output = 'Scanning for changes...';
             const stats = await syncDir(SRC_DIR, DIST_DIR, {
-                mirror: false,
                 package: true,
                 // The mcp-widgets vite workspace lives inside the module
                 // (modules/mcp/apps); only its built dist/ belongs in the

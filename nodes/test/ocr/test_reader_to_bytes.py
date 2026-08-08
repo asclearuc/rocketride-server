@@ -30,7 +30,7 @@ import pytest
 # numpy/PIL are stubbed too: the bytes-like branch under test touches neither, and
 # a fresh OSS dist has no Pillow (the image nodes are in skip_nodes, so nothing
 # triggers its depends()). Requiring them would make this guard skip silently there.
-_OCR_ENGINES = (('easyocr', 'EasyOCR'), ('doctr', 'DocTR'), ('surya', 'Surya'), ('trocr', 'TrOCR'))
+_OCR_ENGINES = (('easyocr', 'EasyOCR'), ('doctr', 'DocTR'), ('surya', 'Surya'))
 
 _STUB_NAMES = (
     'rocketlib',

@@ -25,7 +25,7 @@
 OCR Reader Module.
 
 Uses ai.common.models OCR wrappers for model server compatibility.
-Supports EasyOCR, DocTR, Surya, and TrOCR engines.
+Supports EasyOCR, DocTR and Surya engines.
 """
 
 import io
@@ -39,7 +39,6 @@ from ai.common.config import Config
 from ai.common.models.ocr.easyocr import EasyOCR
 from ai.common.models.ocr.doctr import DocTR
 from ai.common.models.ocr.surya import Surya
-from ai.common.models.ocr.trocr import TrOCR
 from rocketlib import debug
 
 
@@ -97,7 +96,6 @@ OCR_ENGINES = {
     'easyocr': EasyOCR,
     'doctr': DocTR,
     'surya': Surya,
-    'trocr': TrOCR,
 }
 
 
@@ -109,7 +107,6 @@ class Reader(ReaderBase):
     - EasyOCR: Multi-language support, good general purpose
     - DocTR: Document-focused, good for structured documents
     - Surya: Multilingual, 90+ languages
-    - TrOCR: Transformer-based, Microsoft model
 
     The model server wrappers auto-detect whether to use remote model server
     or fall back to local inference.
@@ -147,7 +144,7 @@ class Reader(ReaderBase):
         Initialize the specified OCR engine.
 
         Args:
-            engine: Engine name ('easyocr', 'doctr', 'surya', 'trocr')
+            engine: Engine name ('easyocr', 'doctr', 'surya')
             languages: List of language codes for EasyOCR
             config: Node configuration dictionary
 
@@ -171,11 +168,6 @@ class Reader(ReaderBase):
 
         elif engine == 'surya':
             return OCRClass()
-
-        elif engine == 'trocr':
-            # TrOCR supports different model variants
-            model = config.get('trocr_model', 'microsoft/trocr-base-printed')
-            return OCRClass(recognition_model=model)
 
         else:
             return EasyOCR(languages=languages)
@@ -244,7 +236,6 @@ class Reader(ReaderBase):
         - EasyOCR: {'text': '...', 'boxes': [...]}
         - DocTR: {'text': '...', 'boxes': [...]}
         - Surya: {'text': '...', ...}
-        - TrOCR: {'text': '...', ...}
 
         Args:
             result: OCR result from engine

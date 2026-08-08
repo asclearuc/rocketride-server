@@ -11,7 +11,7 @@ This package provides:
 Subpackages:
 - audio: Whisper (transcription), Kokoro TTS (model server)
 - gliner: GLiNER (zero-shot NER)
-- ocr: EasyOCR, DocTR, Surya, TrOCR
+- ocr: EasyOCR, DocTR, Surya
 - transformers: SentenceTransformer, pipeline, AutoModel, AutoTokenizer
 
 The loaders use a unified interface so the model server can work with any
@@ -31,7 +31,6 @@ from .gliner import GLiNER, GLiNERLoader
 from .ocr import EasyOCR, EasyOCRLoader
 from .ocr import DocTR, DocTRLoader
 from .ocr import Surya, SuryaLoader
-from .ocr import TrOCR, TrOCRLoader
 
 # Transformer models
 from .transformers import SentenceTransformer, SentenceTransformerLoader
@@ -80,8 +79,6 @@ __all__ = [
     'DocTRLoader',
     'Surya',
     'SuryaLoader',
-    'TrOCR',
-    'TrOCRLoader',
     # Transformers
     'SentenceTransformer',
     'SentenceTransformerLoader',

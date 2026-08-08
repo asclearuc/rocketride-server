@@ -1324,6 +1324,41 @@ def _family_work(constraints_path: str, target_site: str, trigger: Optional[list
     return work
 
 
+def _loaded_family_version(family) -> Optional[str]:
+    """The *distribution* version behind an already-imported family namespace.
+
+    Deliberately not ``module.__version__``. A resolution and a ``*.dist-info`` both speak
+    distribution versions, and for this family the two vocabularies never agree: every
+    ``opencv-*`` wheel carries a build component (``4.13.0.92``) that ``cv2.__version__``
+    (``4.13.0``) drops. Comparing across that gap makes a correctly installed environment
+    read as shadowed on every call — measured, after it failed the whole nodes lane.
+
+    Reads the site the module was actually loaded from, which is the only thing that can
+    answer "another environment" in the first place. The **last member present wins**,
+    matching the family's own rule that the widest variant writes the namespace last.
+    Returns ``None`` when the origin cannot be established; a caller that cannot tell must
+    not refuse.
+    """
+    module = sys.modules.get(family.import_name)
+    if module is None:
+        return None
+    paths = list(getattr(module, '__path__', None) or [])
+    if paths:
+        site = os.path.dirname(paths[0])
+    else:
+        file = getattr(module, '__file__', None)
+        if not file:
+            return None
+        site = os.path.dirname(os.path.dirname(file))
+    installed = pkg_families.installed_versions(site)
+    owner_version = None
+    for member in family.members:
+        key = pkg_families.normalize(member.dist)
+        if key in installed:
+            owner_version = installed[key]
+    return owner_version
+
+
 def _shadowing(work: _FamilyWork) -> Optional[str]:
     """Why this process cannot run on the environment it just built, or ``None``.
 
@@ -1343,7 +1378,7 @@ def _shadowing(work: _FamilyWork) -> Optional[str]:
     loaded = sys.modules.get(work.family.import_name)
     if loaded is None:
         return None
-    loaded_version = getattr(loaded, '__version__', None)
+    loaded_version = _loaded_family_version(work.family)
     if work.passes:
         return (
             f'{work.family.import_name} is already imported in this process'
@@ -1382,10 +1417,10 @@ def _shadowing_check(constraints_path: str) -> Optional[RestartRequired]:
         if not any(pkg_families.normalize(m.dist) in resolved for m in family.members):
             continue
         version = pkg_families.align(family, resolved)
-        module_version = getattr(sys.modules[family.import_name], '__version__', None)
-        if version and module_version and module_version != version:
+        loaded_version = _loaded_family_version(family)
+        if version and loaded_version and loaded_version != version:
             return RestartRequired(
-                f'{family.import_name} was imported from another environment at {module_version};'
+                f'{family.import_name} was imported from another environment at {loaded_version};'
                 f' this one provides {version}. A sys.path insert does not re-import a loaded'
                 ' module, so restart the engine to pick it up.'
             )

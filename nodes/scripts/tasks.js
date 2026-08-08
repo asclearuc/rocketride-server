@@ -63,6 +63,10 @@ function makeSyncNodesAction(options = {}) {
         run: async (ctx, task) => {
             task.output = 'Scanning for changes...';
 
+            // mirror: false on BOTH passes, unlike ai:sync. Two source trees project
+            // into one destination and syncDir computes the delete set per source, so
+            // mirroring either pass would delete everything the other wrote. The cost
+            // is that a file removed from nodes/src stays staged until nodes:clean.
             const stats = {};
             await syncDir(SRC_DIR, DIST_DIR, { mirror: false, package: true }, stats);
 

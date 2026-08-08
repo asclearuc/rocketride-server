@@ -262,14 +262,12 @@ def requirements_file_disabled(req_path: Path) -> tuple[bool, str]:
       ``opencv-python-headless==4.11.0.86`` against the engine's
       ``opencv-contrib-python==4.13.0.92`` (override comes from
       ``ai.common.opencv`` at import time, after install).
-    * ``requirements_trocr.txt`` — ``craft-text-detector`` pulls
-      ``opencv-python<4.5.4.62``; same kind of shim-handled override.
 
     Disabled files are paired with ``# contract-check: ignore`` markers on
     the consuming source's import lines (e.g.,
     ``from surya.recognition import RecognitionPredictor  # contract-check: ignore``),
     so the framework never tries to verify the contract either. Result:
-    surya/trocr go completely off the framework's radar.
+    surya goes completely off the framework's radar.
 
     Args:
         req_path: Path to a ``requirement*.txt`` file.

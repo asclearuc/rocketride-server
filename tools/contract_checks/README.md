@@ -172,7 +172,7 @@ Two sibling markers for **requirements files** (a parallel to `# contract-check:
 | Marker | Default lane behaviour | Under `--install-all` | Use for |
 | ------ | ---------------------- | --------------------- | ------- |
 | `# contract-check: skip-install` | Skip: `[skip-install]` line | **Installs**: `[install-all]` bypass line | Heavy Tier-2 bundles (kokoro, whisper, etc.). PR lane fast; nightly verifies. |
-| `# contract-check: disable` | Skip: `[disable]` line | **Still skipped**: `[disable]` line, no bypass | Fundamental incompatibilities (surya/trocr's opencv pin) where attempting install just produces a guaranteed `[install-failed]`. Paired with `# contract-check: ignore` on the consuming imports so the contract isn't checked either. |
+| `# contract-check: disable` | Skip: `[disable]` line | **Still skipped**: `[disable]` line, no bypass | Fundamental incompatibilities (surya's opencv pin) where attempting install just produces a guaranteed `[install-failed]`. Paired with `# contract-check: ignore` on the consuming imports so the contract isn't checked either. |
 
 `disable` is strictly stronger than `skip-install`. If a file has both, `disable` wins.
 
@@ -190,7 +190,7 @@ Install-layer status lines (`[disable]`, `[skip-install]`, `[install-all]`, `[in
 
 ### Effects in detail
 
-- **Default PR lane** (`./builder.cmd check-externals:run`): both markers cause the file's `depends()` call to be bypassed. Stdout shows `[skip-install] <path>: <reason>` or `[disable] <path>: <reason>` so the bypass is visible in CI logs. Packages stay uninstalled; their contract rows show `[SKIP] package not installed in engine env` (unless paired with `# contract-check: ignore` on the imports, in which case there's no contract row at all, see the surya/trocr pattern below).
+- **Default PR lane** (`./builder.cmd check-externals:run`): both markers cause the file's `depends()` call to be bypassed. Stdout shows `[skip-install] <path>: <reason>` or `[disable] <path>: <reason>` so the bypass is visible in CI logs. Packages stay uninstalled; their contract rows show `[SKIP] package not installed in engine env` (unless paired with `# contract-check: ignore` on the imports, in which case there's no contract row at all, see the surya pattern below).
 - **Nightly cron lane** (`./builder.cmd check-externals:run --install-all`):
   - `skip-install`-marked files: marker is **ignored**. Stdout shows `[install-all] <path>: bypassing skip-install marker`, then `depends()` is called. Most succeed; contracts get verified.
   - `disable`-marked files: marker is **honoured**. Stdout shows the same `[disable]` line as the PR lane. `--install-all` does not override `disable`, that's the whole point of the stronger marker.
@@ -205,12 +205,11 @@ When `depends()` raises for a file that was attempted (i.e., NOT `disable`d AND 
 
 This is the drift signal for the install layer itself. If a previously-installable file starts failing, the `[install-failed]` line appears in nightly logs and we can act. Files with fundamental conflicts should use `disable` precisely so they never reach this branch, `[install-failed]` lines are reserved for unexpected failures.
 
-### What's currently marked (9 files)
+### What's currently marked (13 files)
 
 | Marker | File | Why marked | Paired `# contract-check: ignore` on imports? |
 | ------ | ---- | ---------- | --- |
 | `disable` | `packages/ai/src/ai/common/models/ocr/requirements_surya.txt` | `opencv-python-headless==4.11.0.86` transitive pin | Yes: 3 imports in `surya.py` |
-| `disable` | `packages/ai/src/ai/common/models/ocr/requirements_trocr.txt` | `opencv-python<4.5.4.62` transitive pin (via craft-text-detector) | Yes: 1 import in `trocr.py` |
 | `skip-install` | `packages/ai/src/ai/common/models/audio/requirements_kokoro.txt` | ~200 MB audio model deps | No: verified on nightly |
 | `skip-install` | `packages/ai/src/ai/common/models/audio/requirements_whisper.txt` | ~400 MB ASR deps (ctranslate2, av, onnxruntime) | No |
 | `skip-install` | `packages/ai/src/ai/common/models/gliner/requirements_gliner.txt` | ~300 MB NER deps + mecab C compile | No |
@@ -218,6 +217,11 @@ This is the drift signal for the install layer itself. If a previously-installab
 | `skip-install` | `packages/ai/src/ai/common/models/ocr/requirements_easyocr.txt` | ~150 MB OCR engine + CRAFT detector | No |
 | `skip-install` | `packages/ai/src/ai/common/models/transformers/requirements_sentence_transformers.txt` | ~100 MB embedding loader | No |
 | `skip-install` | `packages/ai/src/ai/common/models/vision/requirements_vision.txt` | ~50 MB vision embeddings | No |
+| `skip-install` | `packages/ai/src/ai/common/models/vision/requirements_background.txt` | BiRefNet extras (kornia/timm/einops) on the transformers baseline | No |
+| `skip-install` | `packages/ai/src/ai/common/models/vision/requirements_caption.txt` | Florence-2 extras (einops/timm) on the transformers baseline | No |
+| `skip-install` | `packages/ai/src/ai/common/models/vision/requirements_detection.txt` | rf-detr + timm pull a large tree | No |
+| `skip-install` | `packages/ai/src/ai/common/models/vision/requirements_pose.txt` | rtmlib + onnxruntime-gpu pull a large tree | No |
+| `skip-install` | `packages/ai/src/ai/common/models/vision/requirements_segmentation.txt` | pycocotools build + Mask2Former weights | No |
 
 The `disable` files are paired with import-line ignores because they will *never* be installable, verifying their contracts would always SKIP and add noise. The `skip-install` files keep their imports unmarked because nightly `--install-all` installs them and can actually verify the contracts.
 

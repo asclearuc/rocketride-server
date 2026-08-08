@@ -174,28 +174,63 @@ def _work(version, passes=()):
     return D._FamilyWork(family=family, version=version, members=family.members[:1], passes=passes)
 
 
-def test_a_loaded_namespace_about_to_be_rewritten_demands_a_restart(monkeypatch):
+def _load_cv2_from(monkeypatch, tmp_path, dist_version, dist='opencv-python-headless'):
+    """Plant a ``cv2`` loaded out of a real site holding one member at ``dist_version``.
+
+    A stub carrying ``__version__`` would not do: ``cv2.__version__`` is ``4.13.0`` for every
+    ``4.13.0.9x`` wheel, so a fixture that hands the check a four-component module version
+    tests a Python that does not exist — which is how the mismatch reached a full nodes lane
+    before anything failed. The site is what the check actually reads.
+    """
+    site = tmp_path / 'site'
+    (site / f'{dist.replace("-", "_")}-{dist_version}.dist-info').mkdir(parents=True)
+    package = site / 'cv2'
+    package.mkdir()
+    module = type('M', (), {'__version__': '.'.join(dist_version.split('.')[:3]), '__path__': [str(package)]})()
+    monkeypatch.setitem(D.sys.modules, 'cv2', module)
+
+
+def test_a_loaded_namespace_about_to_be_rewritten_demands_a_restart(monkeypatch, tmp_path):
     """On Linux the write *succeeds* and the running process keeps serving the old module while
     the environment reports the new one — the silent half of the problem, and the worse one.
     """
-    monkeypatch.setitem(D.sys.modules, 'cv2', type('M', (), {'__version__': '4.13.0.92'})())
+    _load_cv2_from(monkeypatch, tmp_path, '4.13.0.92')
     passes = (pkg_families.InstallPass(dist='opencv-python-headless', version='4.11.0.86'),)
     assert D._shadowing(_work('4.11.0.86', passes)) is not None
 
 
-def test_a_loaded_namespace_at_another_version_demands_a_restart_with_nothing_to_install(monkeypatch):
+def test_a_loaded_namespace_at_another_version_demands_a_restart_with_nothing_to_install(monkeypatch, tmp_path):
     """Shadowing: base aligns over the union of every requirement file, an overlay over its own
     consumers, so the two legitimately differ — and a ``sys.path`` insert does not re-import
     what is already loaded. The environment is right and the *process* is wrong, which is the
     one case measurement cannot catch.
     """
-    monkeypatch.setitem(D.sys.modules, 'cv2', type('M', (), {'__version__': '4.13.0.92'})())
+    _load_cv2_from(monkeypatch, tmp_path, '4.13.0.92')
     assert D._shadowing(_work('4.11.0.86')) is not None
 
 
-def test_an_agreeing_loaded_namespace_with_nothing_to_install_is_not_a_refusal(monkeypatch):
-    monkeypatch.setitem(D.sys.modules, 'cv2', type('M', (), {'__version__': '4.13.0.92'})())
+def test_an_agreeing_loaded_namespace_with_nothing_to_install_is_not_a_refusal(monkeypatch, tmp_path):
+    _load_cv2_from(monkeypatch, tmp_path, '4.13.0.92')
     assert D._shadowing(_work('4.13.0.92')) is None
+
+
+def test_the_build_component_a_module_version_drops_is_not_a_shadow(monkeypatch, tmp_path):
+    """The regression this pair of comparisons was getting wrong.
+
+    ``cv2.__version__`` reports ``4.13.0`` while every member of the resolution is pinned at
+    ``4.13.0.92``. Comparing the module version against a distribution version made a healthy
+    environment refuse to run on itself, and it did so only where ``depends()`` had nothing to
+    install — so a freshly cleaned tree passed and a warm one failed 64 collections.
+    """
+    _load_cv2_from(monkeypatch, tmp_path, '4.13.0.92')
+    assert D.sys.modules['cv2'].__version__ == '4.13.0'
+    assert D._shadowing(_work('4.13.0.92')) is None
+
+
+def test_a_namespace_whose_origin_cannot_be_read_is_never_a_refusal(monkeypatch):
+    """No ``__path__``/``__file__``, no site, no evidence — and no basis to refuse."""
+    monkeypatch.setitem(D.sys.modules, 'cv2', type('M', (), {'__version__': '4.13.0'})())
+    assert D._shadowing(_work('4.11.0.86')) is None
 
 
 def test_an_unimported_namespace_is_never_a_refusal(monkeypatch):
@@ -226,7 +261,7 @@ def test_shadowing_is_checked_even_when_there_is_nothing_to_do(monkeypatch, tmp_
     never rebuilt and a satisfied ``depends()`` returns early, so the pipeline would run
     silently on the build the parent had already loaded.
     """
-    monkeypatch.setitem(D.sys.modules, 'cv2', type('M', (), {'__version__': '4.13.0.92'})())
+    _load_cv2_from(monkeypatch, tmp_path, '4.13.0.92')
     monkeypatch.setattr(D, '_install_dry_run', lambda *a, **k: [])
     monkeypatch.setattr(D, '_family_work', lambda *a, **k: [])
 
