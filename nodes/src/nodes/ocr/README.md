@@ -94,22 +94,22 @@ The `bengali`, `thai`, `tamil`, and `telugu` families are selectable via `ocr.sc
 
 ---
 
-## OpenCV compatibility
+## OpenCV
 
-All four engines share the `cv2` namespace but require different OpenCV builds. The node installs a single unified build, `opencv-contrib-python==4.13.0.92`, via `ai.common.opencv`, which also uninstalls competing variants (`opencv-python`, `opencv-python-headless`, `opencv-contrib-python-headless`) so only one `cv2` is active at runtime.
+The three OCR engines and img2table all reach `cv2`, and all four `opencv-*` PyPI distributions write that same import directory — only one can be active at a time, and the last one installed owns it. uv sees unrelated distributions and never reports a conflict between them.
 
-Upstream pins (as of the versions currently used):
+The node used to settle this itself, importing an `ai.common.opencv` shim that pinned all four distributions to `4.13.0.92`. That shim is gone: `cv2` is now owned by the engine's shared-namespace family mechanism (`lib/pkg_families/`, `virtual-environments.md` §4.16), which aligns every member an environment resolves onto one version, installs them subset-first so the widest build writes the directory last, and verifies the result by importing `cv2` inside the finished environment. Nothing in this node pins OpenCV, and nothing should.
 
-| Engine  | PyPI package                               | Upstream OpenCV requirement            | Matches project's 4.13.0.92? |
-| ------- | ------------------------------------------ | -------------------------------------- | ---------------------------- |
-| EasyOCR | `easyocr` 1.7.2                            | `opencv-python-headless` (unpinned)    | Yes                          |
-| DocTR   | `python-doctr` 1.0.1                       | `opencv-python <5.0.0, >=4.5.0`        | Yes                          |
-| Surya   | `surya-ocr` 0.17.1                         | `opencv-python-headless==4.11.0.86`    | No (hard pin to 4.11.0.86)   |
-| TrOCR   | `craft-text-detector` 0.4.3 (detector dep) | `opencv-python <4.5.4.62, >=3.4.8.29`  | No (caps below 4.5.4.62)     |
+Upstream requirements, at the versions the engine currently resolves:
 
-Surya and TrOCR's detector pin OpenCV to versions the project deliberately overrides. They work because `ai.common.opencv` runs `depends()` at import time and force-aligns all four OpenCV variants to 4.13.0.92 after the engines are installed. Always import `from ai.common.opencv import cv2` before importing an OCR engine, or the wrong `cv2` may be resolved.
+| Consumer  | PyPI package         | Upstream OpenCV requirement          | Resolved here |
+| --------- | -------------------- | ------------------------------------ | ------------- |
+| EasyOCR   | `easyocr` 1.7.2      | `opencv-python-headless` (unpinned)  | 4.13.0.92     |
+| DocTR     | `python-doctr` 1.0.1 | `opencv-python <5.0.0, >=4.5.0`      | 4.13.0.92     |
+| Surya     | `surya-ocr` 0.16.1   | `opencv-python-headless` (unpinned)  | 4.13.0.92     |
+| img2table | `img2table` 2.0.0    | `opencv-contrib-python`              | 4.13.0.92     |
 
-For the same reason, `IGlobal.py` imports `ai.common.opencv` before img2table: img2table internally imports `cv2` at load time, so the correct OpenCV package must already be active.
+img2table is why "widest build last" matters here: it calls `cv2.ximgproc.niBlackThreshold`, which only the `contrib` builds carry, and the family's probe asserts `cv2.ximgproc` in exactly the environments that installed one. That is a property of the resolution, not of an import order — `IGlobal.py` imports img2table like any other module, and the ordering that used to be bought by importing a shim first is now bought by the install itself.
 
 ---
 

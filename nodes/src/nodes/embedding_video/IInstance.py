@@ -121,7 +121,7 @@ class IInstance(IInstanceBase):
         Args:
             video_bytes (bytes): The complete video file content.
         """
-        from ai.common.opencv import cv2
+        import cv2
         from ai.common.image import ImageProcessor
         import tempfile
         import os

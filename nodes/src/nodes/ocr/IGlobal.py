@@ -36,10 +36,6 @@ depends(requirements)
 import numpy as np
 from PIL import Image
 
-# Import opencv BEFORE img2table to ensure correct package is installed
-# img2table internally imports cv2, so this must come first
-from ai.common.opencv import cv2  # noqa: F401 - ensures correct opencv
-
 # img2table 2.0 (2026-05-10) rewrote its OCR plug-in API and moved the base
 # class. Detect which version is installed so this adapter works against both.
 try:

@@ -391,11 +391,12 @@ def _install_all_requirements(trees, *, install_all: bool, verbose: bool) -> Non
 
             # `disable` is checked FIRST and is strictly stronger than
             # `skip-install` — disabled files are never installed by the
-            # framework, even under --install-all. Use it for fundamental
-            # incompatibilities (e.g., surya's opencv conflict) where
-            # attempting install just produces a guaranteed [install-failed]
-            # line and wastes CI time. Paired with `# contract-check: ignore`
-            # on the consuming imports so the contract isn't checked either.
+            # framework, even under --install-all. Use it only where uv
+            # cannot resolve the file against the compiled constraints at
+            # all, so attempting install just produces a guaranteed
+            # [install-failed] line and wastes CI time. Paired with
+            # `# contract-check: ignore` on the consuming imports so the
+            # contract isn't checked either.
             #
             # Install-layer status lines ([disable], [skip-install],
             # [install-all], [install]) go to STDOUT alongside the contract

@@ -60,10 +60,6 @@ class DocTRLoader(BaseLoader):
         """Load docTR OCR predictor."""
         DocTRLoader._ensure_dependencies()
 
-        # Import opencv BEFORE doctr - this ensures opencv-contrib-python-headless
-        # is installed and any conflicting opencv packages are removed
-        from ai.common.opencv import cv2  # noqa: F401
-
         from doctr.models import ocr_predictor
         from ai.common.torch import torch
 

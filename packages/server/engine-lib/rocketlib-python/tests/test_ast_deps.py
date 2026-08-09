@@ -340,10 +340,13 @@ def test_a_self_describing_directory_yields_only_declared_files(tmp_path):
 def test_an_ocr_engine_module_scopes_to_its_own_requirements():
     """The precondition 2A-4 rests on, and the reason this item is not cosmetic.
 
-    A 2A-4 Surya component would seed its walk here. Today an `ocr` environment gets all three
-    engine files, so the resolver holds opencv at 4.13 and backtracks surya-ocr to 0.16.1 while
-    surya.py targets the 0.17 API: splitting the node buys nothing until the walk stops handing
-    the environment every engine.
+    A 2A-4 Surya component would seed its walk here, and without this scoping it would drag in
+    every engine's requirements — splitting the node buys nothing until the walk stops doing that.
+
+    Deliberately *not* a claim about why surya-ocr resolves to 0.16.1. It used to say the walk's
+    over-inclusion held opencv at 4.13 and backtracked surya from there; the opencv half of that
+    was the shim's four pins, and with the shim deleted the resolution still lands on 0.16.1. The
+    cause is recorded in `virtual-environments.md` §4.16 and is not this test's business.
     """
     roots = {'nodes': _NODES_SRC, 'ai': _AI_SRC}
     seed = os.path.join(_AI_SRC, 'ai', 'common', 'models', 'ocr', 'surya.py')
