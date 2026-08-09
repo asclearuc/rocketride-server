@@ -15,8 +15,9 @@ What the resolver cannot give has to be imposed from outside it, which is what t
 package is: **which members may be installed at all**, **one version among those that
 co-install**, and **a fixed install order with a known winner**. It is written as data
 because the two real cases need different subsets of that — opencv needs agreement and
-ordering, onnxruntime needs only exclusion — and because both are handled today by two
-*different* hand-written hacks.
+ordering, onnxruntime needs only exclusion — and because each used to be carried by its
+own hand-written hack. Both hacks are gone: the opencv shim's four pins with the cv2
+ownership move, the copied onnxruntime pins and the static exclusion with this one.
 
 Two rules are easy to undo by accident and are therefore stated here as well as in the
 design document:
@@ -149,18 +150,19 @@ class InstallPass:
 def _registry() -> tuple[Family, ...]:
     # Imported here rather than at module scope so a declaration module can import the
     # dataclasses above without a cycle.
+    from .onnxruntime import ONNXRUNTIME
     from .opencv import CV2
 
-    return (CV2,)
+    return (CV2, ONNXRUNTIME)
 
 
 def families() -> tuple[Family, ...]:
     """Every registered family.
 
-    ``onnxruntime`` is declared in this package but deliberately **not** registered yet: a
-    family changes what its environments install the moment it appears here, and that
-    change belongs to the commit that also removes the five copied pins and declares the
-    namespace version.
+    A family changes what its environments install the moment it appears here, which is
+    why ``onnxruntime`` waited: registering it had to land together with the declaration
+    of its namespace version and the deletion of the copied pins, or the owner fallback
+    would have installed ``-gpu`` at a derived version nobody had validated.
     """
     return _registry()
 

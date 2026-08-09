@@ -30,6 +30,7 @@ except ImportError:  # engLib is built into engine.exe
 pytestmark = pytest.mark.skipif(not _HAVE_ENGLIB, reason='depends needs engLib (engine interpreter)')
 
 CV2_MEMBERS = ('opencv-python-headless', 'opencv-python', 'opencv-contrib-python-headless', 'opencv-contrib-python')
+ONNXRUNTIME_MEMBERS = ('onnxruntime', 'onnxruntime-gpu')
 
 
 def _constraints(tmp_path, text):
@@ -86,6 +87,21 @@ def test_the_excludes_file_is_content_addressed_not_rewritten():
     assert 'beta' in _read(second) and 'alpha' not in _read(second)
 
 
+def test_the_base_exclusion_set_is_uv_alone_on_every_platform(monkeypatch):
+    """Guards the hack's return directly. A family member re-added here would not duplicate the
+    family's own exclusions — it would **disarm the family**: this set is what the trigger's
+    dry-run is given, a dry-run resolved without a member reports no member, and the ordered
+    passes then never run (see the dry-run test below).
+
+    Both platforms are asserted because the string that used to live here was on a
+    ``!= 'Darwin'`` branch: checking only the host that happens to run the suite would not
+    notice a branch re-added on the other arm.
+    """
+    for system in ('Darwin', 'Linux', 'Windows'):
+        monkeypatch.setattr(D.platform, 'system', lambda system=system: system)
+        assert D._base_excludes() == ('uv',), f'unexpected base exclusions on {system}'
+
+
 # ---------------------------------------------------------------------------
 # the trigger, and what it must not be given
 # ---------------------------------------------------------------------------
@@ -96,8 +112,12 @@ def test_the_dry_run_is_given_the_base_exclusion_set_and_not_the_family_one(monk
 
     Hand the dry-run the family exclusions and it resolves *without* the members, so its list
     contains none of them, the trigger concludes the family is not in play, the ordered passes
-    never run — and ``cv2`` disappears from every environment as an ImportError rather than a
-    build failure.
+    never run — and the namespace disappears from every environment as an ImportError rather
+    than a build failure.
+
+    Asserted for both families. For onnxruntime it is the sharper case: plain ``onnxruntime``
+    is the only member a non-Darwin resolution ever names, so hiding it here is the whole
+    difference between the family firing and the family being silently inert.
     """
     seen = {}
 
@@ -113,7 +133,7 @@ def test_the_dry_run_is_given_the_base_exclusion_set_and_not_the_family_one(monk
     D._install_requirements_inner(str(requirements), _constraints(tmp_path, 'numpy==2.5.1\n'))
 
     assert 'uv' in seen['content']
-    for member in CV2_MEMBERS:
+    for member in CV2_MEMBERS + ONNXRUNTIME_MEMBERS:
         assert member not in seen['content']
 
 
@@ -277,8 +297,13 @@ def test_shadowing_is_checked_even_when_there_is_nothing_to_do(monkeypatch, tmp_
 def test_the_shadowing_check_costs_nothing_when_the_namespace_is_not_loaded(monkeypatch, tmp_path):
     """A ``sys.modules`` lookup per registered family; the resolution is read only past that.
     ``builder nodes:test`` makes a great many ``depends()`` calls, and this one is on all of them.
+
+    *Every* registered namespace has to be absent for the early return to hold, so both are
+    cleared — an engine test process that happened to hold one of them would otherwise make
+    this read the resolution and fail for a reason that has nothing to do with the rule.
     """
     monkeypatch.delitem(D.sys.modules, 'cv2', raising=False)
+    monkeypatch.delitem(D.sys.modules, 'onnxruntime', raising=False)
     reads = []
     monkeypatch.setattr(D, '_read_resolution', lambda path: reads.append(path) or {})
     assert D._shadowing_check(str(tmp_path / 'absent.txt')) is None

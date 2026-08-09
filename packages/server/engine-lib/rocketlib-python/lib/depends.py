@@ -1010,14 +1010,17 @@ def ensure_constraints() -> str:
 def _base_excludes() -> tuple[str, ...]:
     """The exclusions that hold for every install, family machinery aside.
 
-    `uv` is bootstrapped by depends.py and pip-installing it crashes on Windows. Plain
-    `onnxruntime` clobbers onnxruntime-gpu in the same folder on non-Darwin; that line is
-    a hand-written family rule and moves into `pkg_families` with the declaration.
+    `uv` is bootstrapped by depends.py and pip-installing it crashes on Windows. That is
+    the whole set, and it is **platform-independent**: the plain-`onnxruntime` line that
+    used to sit here was a hand-written family rule, and it now comes from
+    `pkg_families.excluded()` like every other member.
+
+    Re-adding a member here would not merely duplicate the family's own exclusions — it
+    would disarm the family. This set is what the trigger's dry-run is given, and a
+    dry-run resolved without a member reports no member, so the ordered passes never run
+    and the namespace goes missing as an ImportError. See :func:`_install_dry_run`.
     """
-    excludes = ['uv']
-    if platform.system() != 'Darwin':
-        excludes.append('onnxruntime')
-    return tuple(excludes)
+    return ('uv',)
 
 
 def _write_excludes_file(extra: tuple[str, ...] = ()) -> str:
@@ -1442,9 +1445,9 @@ def _run_family_passes(work: _FamilyWork, constraints_path: str, target_site: Op
     # The BASE exclusions, never the family's own — measured, because the failure is silent.
     # uv's `--excludes` excludes from *resolution*, so a pass handed its family's set drops the
     # very member it was asked to install: every pass reports success, nothing lands, and the
-    # namespace is simply absent afterwards. The base set is still needed here (plain
-    # onnxruntime must stay out of a `-gpu` pass's resolution), and the ordering this pass
-    # exists to impose is enforced by running one spec at a time, not by exclusions.
+    # namespace is simply absent afterwards. The base set keeps nothing out of a pass's
+    # resolution these days — it is `uv` alone — and the ordering this pass exists to impose is
+    # enforced by running one spec at a time, not by exclusions.
     excludes_rel = os.path.relpath(_write_excludes_file(), exe_dir)
     for step in work.passes:
         spec = f'{step.dist}=={step.version}'

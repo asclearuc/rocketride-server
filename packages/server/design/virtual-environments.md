@@ -1184,6 +1184,20 @@ to the **base** compile only, never to `venvs/<proj>/<env>/`. Nothing to fix tod
 not landed, and the lock as a CI lint gate is orthogonal. Recorded here rather than in the workflow
 because this is the design it would break.
 
+**A second collision with the same lock, and §7 scope item 5 created it.** That lock is compiled
+from `nodes/src/nodes/**/requirements.txt` and nothing else, so it cannot see a `namespace_version`
+declared in `lib/pkg_families/` — and onnxruntime's version now lives *only* there. The committed
+lock still pins `onnxruntime==1.20.1` / `onnxruntime-gpu==1.20.1 ; sys_platform != 'darwin'`, a
+number this tree no longer names anywhere (finding 5 below records the move to `1.22.0`, and PyPI
+withdrew that release for the `-gpu` build); its next regeneration drops `-gpu` altogether and
+resolves plain `onnxruntime` transitively. Neither value is the declared one. So if consumption ever
+lands, `-c constraints.lock` would constrain a namespace whose version deliberately appears in no
+requirement file, while the ordered pass installs the declared version — a disagreement **by
+construction**, not by drift, and therefore not one a fresher lock fixes. Whoever lands consumption
+owns the choice: either a family's declaration reaches that compile the way it already reaches the
+drift hash (§4.16), or family members are excluded from the lock as they already are from the
+install.
+
 Findings behind the cost estimate, to re-verify when the question is reopened:
 
 1. **A local model server exists — in the saas repo** (`rocketride-saas/extension/src/extension/
@@ -1203,12 +1217,13 @@ Findings behind the cost estimate, to re-verify when the question is reopened:
 4. Base loses early conflict detection: two conflicting model families fail loudly at startup today,
    quietly and late afterwards.
 5. Checked and **not** an issue: `onnxruntime-gpu` is pinned **explicitly**, not inherited from the
-   union. *Corrected — the original entry said `1.20.1` in "both `requirements_whisper.txt` and
-   `requirements_pose.txt`", and both halves have moved: the version is `1.22.0` (1.20.1 was
-   withdrawn from PyPI for the `-gpu` build), and the pin is copied across **five** files —
-   `requirements_whisper.txt`, `requirements_gliner.txt`, `requirements_pose.txt`,
-   `nodes/anonymize/` and `nodes/audio_transcribe/`. The finding's conclusion is unchanged; the
-   duplication it undercounted is what §4.16's second family exists to remove.*
+   union. *Corrected twice, and the finding's conclusion survives both. First: the original entry
+   said `1.20.1` in "both `requirements_whisper.txt` and `requirements_pose.txt`", and both halves
+   had moved — the version became `1.22.0` (1.20.1 was withdrawn from PyPI for the `-gpu` build),
+   and the pin turned out to be copied across **five** files. Then §7 scope item 5 removed the
+   duplication entirely: the explicit pin is now a single declared `namespace_version` in
+   `lib/pkg_families/onnxruntime.py`, so "pinned explicitly, not inherited from the union" is still
+   true and is now true in one place.*
 
 **Key by stable IDs; name is metadata.**
 
@@ -1685,18 +1700,19 @@ away from an environment that had them (`cv2.ximgproc` disappearing from a direc
 
 What the resolver cannot give is imposed from outside it, as **data**: which members may be installed
 at all, one version among those that co-install, and a fixed install order with a known winner. Two
-hand-written hacks used to carry that, and they leave one at a time rather than with the mechanism
+hand-written hacks used to carry that, and they left one at a time rather than with the mechanism
 that replaced them — a family is inert while something else is still contradicting it, so each
-removal is its own increment with its own measurement. **One is now gone.** The opencv shim's four
-`==4.13.0.92` pins were deleted by §7 scope item 4, and `cv2` became the first family to actually
-decide anything: it now *derives* its version from what this environment's consumers resolved. The
-hard-coded `onnxruntime` line in `_write_excludes_file` still stands and goes when that family
-registers (§7, scope item 5) — until then the static exclusion does a job the data cannot yet do.
+removal was its own increment with its own measurement. **Both are now gone.** The opencv shim's
+four `==4.13.0.92` pins were deleted by §7 scope item 4, and `cv2` became the first family to
+actually decide anything: it now *derives* its version from what this environment's consumers
+resolved. The ten copied `onnxruntime` pins and the hard-coded line in `_base_excludes()` went with
+§7 scope item 5, which registered that family: the pins became one declared `namespace_version`, and
+the exclusion became `pkg_families.excluded()` like every other member's.
 
 | family | members (subset → superset) | shape | state |
 | --- | --- | --- | --- |
 | `cv2` | `-headless`, `opencv-python`, `-contrib-headless`, **`-contrib`** | the members this environment resolves install, in declared order; the last one wins | registered |
-| `onnxruntime` | `onnxruntime` (Darwin), **`onnxruntime-gpu`** (non-Darwin) | one installs per platform; the other is excluded | **declared, not registered** |
+| `onnxruntime` | `onnxruntime` (Darwin), **`onnxruntime-gpu`** (non-Darwin) | one installs per platform; the other is excluded | registered |
 
 All four `cv2` members stay declared even though this tree now resolves only three: the declaration
 is about who *can* write the namespace, not who does here. Since the shim went,
@@ -1706,20 +1722,57 @@ declaration is the namespace, the resolution decides membership.
 Two is the whole population, checked rather than assumed: sweeping every distribution named in every
 `requirement*.txt` under `packages/ai/src` and `nodes/src` turns up no third namespace-sharing set.
 
-**Why onnxruntime is written but withheld from the registry.** A family changes what its
-environments install the moment it appears there, and for this one the change would not be neutral:
-an environment whose only consumer is transitive installs *nothing* today, and registering the
-family without also declaring its version would have the owner fallback install `onnxruntime-gpu` at
-a **derived** version — plain onnxruntime's own, several minor releases above anything this tree has
-pinned. It registers together with the declaration and the deletion of the copied pins, which is one
-change; until then the static exclusion keeps doing its job alone.
+**Why onnxruntime was written long before it was registered, and what registering it did.** A family
+changes what its environments install the moment it appears in the registry, and for this one the
+change was not neutral, so declaration and registration were deliberately separated. Registering it
+without also declaring its version would have had the owner fallback install `onnxruntime-gpu` at a
+**derived** version — plain onnxruntime's own, several minor releases above anything this tree has
+pinned. So registration, the declared `1.22.0`, and the deletion of the ten copied pins landed as one
+change. Three consequences, all of them expected and none of them a version move:
+
+- **An overlay that installed nothing now installs ~200 MB — derived, not measured, and flagged as
+  such because its two siblings below were measured.** An environment whose only onnxruntime consumer
+  is transitive (`agent_crewai` → `crewai` → `chromadb`) resolves *plain* `onnxruntime`, which the
+  static exclusion used to drop on non-Darwin while nothing named `-gpu` — so nothing landed and the
+  namespace was simply absent. The owner fallback now installs `-gpu` there. That is the namespace
+  acquiring an owner, which is the point. It follows from `install_set()`'s empty-case fallback
+  rather than from a run: the increment's verification built no scoped overlay, because the base
+  already held `-gpu` at the declared version (see the probe bullet below, which is the same fact
+  seen from the other side). The first scoped build of such an environment is where this becomes an
+  observation.
+- **`onnxruntime-gpu` leaves the resolution, and takes three distributions with it.** Nothing names
+  `-gpu` any more, so it disappears from `constraints.txt` along with `coloredlogs` (its only
+  requester) and `humanfriendly`/`pyreadline3` behind it. It is still what gets *installed*, now by
+  the ordered pass rather than the main install. Its tail therefore arrives **unpinned**: the pass
+  still passes `-c constraints.txt`, but those three are no longer in the file. **This is the
+  accepted cost of a declared-version family** — a derived block naming a member nothing resolves
+  would make the second compile unconditional and permanent — and it is the same gap the constraint
+  *transfer* follow-up closes.
+- **The five shared deps do not move.** `protobuf`, `flatbuffers`, `sympy`, `numpy` and `packaging`
+  lose `-gpu` from their `# via` blocks and nothing else: read from its metadata rather than assumed,
+  `onnxruntime-gpu 1.22.0` declares exactly one bound among them, `numpy>=1.21.6`, against a resolved
+  `2.5.1`. One of the five actually moving would be a finding, not this removal's doing.
+
+**And here cold and warm agree, which is worth stating because the opencv half of this section says
+the opposite so emphatically.** The `--rebuild-cache` resolve taken straight after this landed is
+**byte-identical** to the warm one — zero diff lines, the same four departures and no version
+anywhere. So the warm/cold split that made the opencv table a trap is not a property of this
+mechanism; it was a property of *that* family's unpinned members meeting a stale cache. Reading "the
+version column is not durable" as a general law of §4.16 would be the mirror of the mistake the
+opencv paragraph warns against. What makes the difference is structural: a family with a **declared**
+`namespace_version` takes no part in resolution at all, so there is nothing for a cache to be stale
+about.
 
 **The four steps.** After an environment's normal compile, *detect* families from the produced
 `constraints.txt` (never from declarations — both real cases arrive transitively); *align* on one
 version `V`; *couple and verify* by appending `<member>==V` to the already-generated `combined.txt`
 under a `# derived by pkg_families` block and compiling again; then *install in order* by explicit
 uv runs, widest last; then **prove** the result by running the family's declared code inside the
-environment that was just built.
+environment that was just built. **The middle step is conditional, and since scope item 5 half the
+registered population skips it:** a family that *declares* its version has nothing to derive, so `V`
+is read rather than computed and no second compile happens at all. `cv2` takes the long path,
+`onnxruntime` the short one — a split that was invisible while `cv2` was the only registered family,
+which is why it belongs in the summary and not only in the rules below.
 
 #### Probes — where "version X works" stops being an assumption
 
@@ -1756,13 +1809,32 @@ different member in `sys.modules` and would answer about the wrong one.
   — is **inconclusive**, a statement about the *probe*. Treating it as a negative verdict sends an
   operator to change a version number over a machine that could not run the check. **Every failure
   shape stops the build, in either family — none narrows**; the distinction buys the message, and it
-  is what the deferred search will key on. Only `cv2`'s probe actually *runs* yet, since onnxruntime
-  is declared and not registered (above): its first live run is the commit that registers it.
+  is what the deferred search will key on.
   `cv2` is `fail-environment` in both of its modes, which is also why its failure
   message names the **cause** rather than a lever: no number repairs a missing `libGL`.
-  `onnxruntime` separates them — the CUDA provider absent means the runtime is missing (an
-  environment may legitimately hold `-gpu` without torch, since `faster-whisper` does not require
-  it), while a provider that refuses on session creation is a version fact.
+- **Registering a family *arms* its probe; it does not run it.** A probe fires only where the family
+  actually installs something — `_apply_probe` is gated on the ordered passes being non-empty — and
+  an environment with nothing to install has nothing new to prove. So scope item 5 armed
+  onnxruntime's without firing it: on a warm base `-gpu` is already at the declared version, no pass
+  runs, and no probe runs. Its first real fire belongs to a fresh runner or a scoped overlay that
+  installs a member. A corollary worth stating because the artefact invites the opposite reading:
+  **an absent `probes.unproved` means "never failed", not "ran and passed"** — the marker is only
+  written on failure or downgrade, so it cannot certify a run.
+- **What onnxruntime's probe proves is narrower than its shape suggests — measured, not assumed.**
+  The declaration separates "missing runtime" from "wrong version", and that separation is real: an
+  environment may legitimately hold `-gpu` without torch, since `faster-whisper` does not require it,
+  and there a missing CUDA runtime is not something a lower version repairs. But **neither arm can
+  currently fire.** `fail-version` guards an attribute reference, which cannot raise;
+  `fail-environment` keys on `get_available_providers()`, which reports the providers the *wheel was
+  built with* rather than the ones whose DLLs load — ORT does not preload the CUDA DLLs on import,
+  and an import with `torch/lib` off the search path still lists `CUDAExecutionProvider`. What the
+  probe therefore proves when it does fire is that **`import onnxruntime` works in the environment
+  just built** — the namespace resolves and the extension loads, which is precisely the
+  shared-namespace question this package exists for. A missing CUDA runtime passes it. The authored
+  split stays because it is what the deferred narrowing search keys on; making it a running check
+  means `preload_dlls()` or a session on a synthesized model, both of which add a new way to fail a
+  build, and `preload_dlls()` looks for the `torch/lib` a torch-free overlay legitimately lacks.
+  Named follow-up, not silently assumed working.
 - **`needs` are tri-state.** onnxruntime's probe demands `CUDAExecutionProvider`, correct only where
   a GPU exists, so it is **skipped** on a CPU-only host rather than failed. But *unknown* is not
   *absent*: a GPU box whose probe was skipped looks exactly like success while checking nothing, so
@@ -2242,7 +2314,7 @@ That fold happened in increment 2.5 on purpose: the working notes were untracked
 still load-bearing had to reach a tracked file before the increment that needs it.
 2B is closed, so the old "DEFERRED, sequenced after 2B" and "Do 2B first" no longer apply.
 
-Scope, in the order it lands. **Done: 1, 2, 3, 4. Remaining: 5–6** — keep this line current, because a phase
+Scope, in the order it lands. **Done: 1, 2, 3, 4, 5. Remaining: 6** — keep this line current, because a phase
 entry that says "next" long after the thing shipped is how §7 went stale before.
 
 1. **`lib/pkg_families/`** *(landed)* — the registry, environment facts, alignment and the ordered install,
@@ -2251,13 +2323,15 @@ entry that says "next" long after the thing shipped is how §7 went stale before
    was provably inert before anything depended on it. Item 4 is what made it decide something, and
    the two were separated for exactly that reason — a mechanism and its first live effect measured in
    one commit are indistinguishable from a mechanism nobody checked.
-   onnxruntime is declared here but deliberately *not* registered —
-   registering a family changes what its environments install, and for that one the change is not
-   neutral until its version is declared.
+   onnxruntime was declared here but deliberately *not* registered —
+   registering a family changes what its environments install, and for that one the change was not
+   neutral until its version was declared. Item 5 registered it.
 2. **Probes** *(landed)* — subprocess proof of the environment just built against a generated
    script, three verdicts plus *inconclusive*, an unproved marker that crosses the drift and
-   `*.dist-info` gates, and one global probe-strictness lever. Both families declare a probe;
-   onnxruntime's runs only once its family registers at item 5.
+   `*.dist-info` gates, and one global probe-strictness lever. Both families declare a probe.
+   Item 5 **armed** onnxruntime's rather than running it: a probe fires only where its family
+   installs something, so a warm base with `-gpu` already at the declared version runs no pass and
+   no probe. §4.16 records what that probe does and does not prove when it finally fires.
 3. **TrOCR and `craft-text-detector` leave the tree** *(landed)*, which had to precede the opencv
    move: craft's `opencv-python < 4.5.4.62` and Surya 0.17's `opencv-python-headless == 4.11.0.86`
    cannot share one namespace once the shim stops overriding both, and uv reports no conflict
@@ -2314,9 +2388,33 @@ entry that says "next" long after the thing shipped is how §7 went stale before
    published site regenerates at deploy and is correct; the in-repo blocks catch up on a
    release-track branch. Reading those two files and concluding the increment missed them is the
    wrong conclusion, which is why it is written down.
-5. **onnxruntime as the second family** — the ten copied `onnxruntime-gpu==1.22.0` /
-   `onnxruntime==1.22.0` lines across five requirement files become one `namespace_version`, and
-   the hard-coded exclusion in `_write_excludes_file` becomes data.
+5. **onnxruntime as the second family** *(landed)* — the ten copied `onnxruntime-gpu==1.22.0` /
+   `onnxruntime==1.22.0` lines across five requirement files became one declared
+   `namespace_version`, and the hard-coded exclusion in `_base_excludes()` became
+   `pkg_families.excluded()`. That set is now `('uv',)` and **platform-independent**; re-adding a
+   member there would not duplicate the family's exclusions but disarm the family, since the
+   trigger's dry-run is given exactly that set.
+   *The measured delta is not the one this entry used to imply.* "onnxruntime keeps resolving at
+   `1.22.0` from one place" is wrong about the resolution: `_align_families` skips a family whose
+   version is **declared**, so there is no second compile and nothing writes `1.22.0` into
+   `constraints.txt`. What actually happens is that `-gpu` leaves the resolution entirely — nothing
+   names it — taking `coloredlogs`, `humanfriendly` and `pyreadline3` with it, while `1.22.0` remains
+   what is *installed*, by the ordered pass. §4.16 carries that delta, the unpinned tail it creates,
+   and the `agent_crewai` overlay that starts installing where it installed nothing.
+   *Two things this increment corrected rather than added.* The probe was **armed, not fired** — see
+   item 2 — and checking why turned up that neither of its failure arms can currently fire, so it
+   proves the import and not the CUDA runtime; §4.16 states that plainly and names the follow-up
+   instead of leaving the code's own comment to overclaim. And one fact the deleted comments carried
+   that lived nowhere else — rtmlib/gliner declare onnxruntime unpinned while faster-whisper wants
+   `<2,>=1.14`, which is what bounds the authored number — moved into `ONNXRUNTIME.notes` rather than
+   being deleted with the pins.
+   *One generated artefact goes stale, exactly as in item 4 and for the same reason:* two of the five
+   files are node `requirements.txt`, and `audio_transcribe/README.md`'s generated `## Dependencies`
+   block still lists `onnxruntime`. `nodes:docs-generate` refuses to run outside
+   `main`/`stage`/`develop`, so the in-repo block catches up on a release-track branch while the
+   published site regenerates at deploy. **One README, not two** — `anonymize/README.md` lists
+   `gliner` alone and needs nothing; checked rather than assumed, since the obvious expectation is
+   that the two node files behave alike.
 6. **The OCR node split** (Layout S, granularity M) and the honest `surya-ocr>=0.17,<0.18` range.
 
 **A new numbered step, because half of it is out of this repository:** *remove TrOCR from the saas
@@ -3008,9 +3106,13 @@ Three layers; each test is tagged with the phase that first makes it runnable (*
   not; the CUDA fact parsed from the real torch file and **absent under Darwin markers rather than
   wrong**; the GPU fact resolved lazily and answering *unknown* rather than *absent*. Every input is
   injected, so none of it needs a GPU, `uv`, or a network.
-  `test_depends_families.py` needs `engLib` and runs under the engine: the trigger's dry-run is
-  given the **base** exclusion set and never the family one (the single easiest way to implement the
-  whole thing wrongly and still see green unit tests); a dry-run naming only members still counts as
+  `test_depends_families.py` needs `engLib` and runs under the engine: the base exclusion set is
+  `('uv',)` on **every** platform, asserted with `platform.system` patched, because the family
+  member that used to sit there was behind a `!= 'Darwin'` branch and a host-only assertion would
+  miss a branch re-added on the other arm; the trigger's dry-run is
+  given the **base** exclusion set and never the family one — for **both** families, the single
+  easiest way to implement the whole thing wrongly and still see green unit tests; a dry-run naming
+  only members still counts as
   nothing to do; an ordered pass is never handed its own family to exclude — measured on the live
   engine, because `--excludes` excludes from *resolution* and a pass that excludes its own target
   reports success while installing nothing; and shadowing in both of its refusing shapes — a write
