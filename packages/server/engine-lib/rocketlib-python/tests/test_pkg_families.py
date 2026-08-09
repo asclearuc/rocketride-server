@@ -56,25 +56,30 @@ def facts(environment=LINUX, gpu=None, torch_requirements=None):
 # ---------------------------------------------------------------------------
 
 
-def test_the_registry_holds_cv2_alone_until_onnxruntime_earns_its_place():
-    """Registering onnxruntime changes what environments install, so it waits for the commit
-    that also deletes the five copied pins. Registered here, an ``agent_crewai``-shaped overlay
-    would start installing a ~200 MB CUDA build at a *derived* version nobody validated, in the
-    increment whose whole contract is that nothing changes.
+def test_the_registry_holds_both_families_and_each_is_reachable():
+    """Why onnxruntime arrived second, kept because the assertion no longer says it: registering
+    a family changes what its environments install *at that moment*, and registering this one
+    before its version was declared would have had an ``agent_crewai``-shaped overlay install a
+    ~200 MB CUDA build at a *derived* version nobody validated. It landed together with the
+    declared version and the deletion of the five copied pins.
     """
-    assert [family.name for family in pkg_families.families()] == ['cv2']
-    assert pkg_families.family_by_name('onnxruntime') is None
+    assert [family.name for family in pkg_families.families()] == ['cv2', 'onnxruntime']
+    assert pkg_families.family_by_name('onnxruntime') is ONNXRUNTIME
+    assert pkg_families.family_by_import('onnxruntime') is ONNXRUNTIME
 
 
-def test_all_member_dists_covers_only_registered_families():
-    """The early return subtracts this set. An unregistered family's members are not excluded
-    from anything, so subtracting them would hide real work from the gate.
+def test_all_member_dists_covers_every_registered_family():
+    """The early return subtracts this set, which is what keeps a member excluded *by design*
+    (plain onnxruntime on non-Darwin) from reading as permanently missing work and reinstalling
+    the world on every call. Miss a member here and that member becomes the leak.
     """
     assert pkg_families.all_member_dists() == {
         'opencv-python-headless',
         'opencv-python',
         'opencv-contrib-python-headless',
         'opencv-contrib-python',
+        'onnxruntime',
+        'onnxruntime-gpu',
     }
 
 

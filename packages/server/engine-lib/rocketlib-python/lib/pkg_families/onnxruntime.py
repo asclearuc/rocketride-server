@@ -5,16 +5,15 @@
 
 """The ``onnxruntime`` family: two distributions, mutually exclusive by platform.
 
-**Declared here and deliberately NOT registered yet** — see ``families()``. Registering a
-family changes what its environments install the moment it happens, and for this one the
-change is not neutral: an environment whose only consumer is transitive (``agent_crewai``
--> ``crewai`` -> ``chromadb``) resolves plain ``onnxruntime`` and installs nothing today,
-because the static exclusion drops the plain member and nothing names ``-gpu``. Register
-it before the version is declared and the owner fallback would install ``-gpu`` at a
-*derived* version — plain onnxruntime's own, five minor releases above anything this tree
-has ever pinned — in the increment whose entire contract is "nothing changes", and before
-the probes exist. It registers together with the deletion of the five copied pins and the
-move of the static exclusion, which is one commit.
+Registering a family changes what its environments install the moment it happens, which is
+why this one was declared here well before it joined ``families()``: an environment whose
+only consumer is transitive (``agent_crewai`` -> ``crewai`` -> ``chromadb``) resolves plain
+``onnxruntime`` and used to install nothing at all, because the static exclusion dropped
+the plain member and nothing names ``-gpu``. Registering before the version was declared
+would have had the owner fallback install ``-gpu`` at a *derived* version — plain
+onnxruntime's own, five minor releases above anything this tree has ever pinned. So
+registration, the declared version and the deletion of the five copied pins landed as one
+commit, and that overlay now gets ``-gpu`` at the authored number instead of nothing.
 
 Unlike ``cv2`` this family needs only **exclusion**, not agreement: on each platform
 exactly one member is active, so they never co-install. That difference dissolves a trap
@@ -36,20 +35,30 @@ from __future__ import annotations
 
 from . import Family, Member, Probe
 
-# This is the probe the whole mechanism exists for: no resolver can check which CUDA an
-# `onnxruntime-gpu` wheel was built against, because PyPI metadata does not say. Only
-# running it can.
+# **What this probe actually proves today: that `import onnxruntime` works in the environment
+# just built** — the namespace resolves and the extension loads, which is the shared-namespace
+# question this package exists for. It does *not* prove the CUDA runtime is present. Measured,
+# so nobody has to re-derive it:
 #
-# **It separates "wrong version" from "missing runtime", and that line is drawn now rather
-# than when the deferred search needs it.** `onnxruntime-gpu` does not vendor the CUDA
-# runtime — it expects the `nvidia-*` wheels (which `torch+cu128` drags in) or system
-# libraries — and a scoped environment can legitimately hold it *without* torch, since
-# `faster-whisper` does not require torch. So "no CUDA provider at all" there means cudnn is
-# absent, which no lower version repairs, while "the provider is there and refuses when a
-# session is created" is a version fact and is where onnxruntime's own error text names the
-# CUDA it wanted. Today both stop the build and the difference only chooses the operator's
-# message; when narrowing arrives, only the second may step down. Drawing it later would
-# cost ~200 MB per pointless attempt.
+# - the `fail-version` arm cannot fire. `onnxruntime.InferenceSession` below is an attribute
+#   reference, not a session construction, so the guarded expression cannot raise;
+# - the `fail-environment` arm cannot fire either. `get_available_providers()` reports the
+#   providers the **wheel was built with**, not the ones whose DLLs can load: ORT does not
+#   preload the CUDA DLLs on import (`preload_dlls()` is the caller's to invoke), and an import
+#   with `torch/lib` off the DLL search path still lists `CUDAExecutionProvider`.
+#
+# The split below is therefore an **authored intention, not a running check** — kept because it
+# is what the deferred narrowing search will key on, and because the distinction is real even
+# where this code cannot yet observe it: `onnxruntime-gpu` does not vendor the CUDA runtime (it
+# expects the `nvidia-*` wheels that `torch+cu128` drags in, or system libraries) and a scoped
+# environment can legitimately hold it *without* torch, since `faster-whisper` does not require
+# torch. There, "no CUDA provider" would mean a missing runtime that no lower version repairs,
+# while a provider refusing at session creation would be a version fact.
+#
+# Making it a real check means `preload_dlls()` under a `getattr` guard, or a session on a
+# synthesized model. Both add a new way to fail a build, and `preload_dlls()` looks for
+# `torch/lib` — which the torch-free scoped environment above legitimately lacks. Named
+# follow-up, deliberately not taken here.
 _ONNXRUNTIME_PROBE = """
 import onnxruntime
 
@@ -88,5 +97,9 @@ ONNXRUNTIME = Family(
         '(which torch+cu128 drags in) or system libraries. A scoped environment can hold '
         'it without torch -- faster-whisper does not require torch -- so "no CUDA '
         'provider" there means a missing runtime, which no lower version repairs.',
+        'What bounds the number, kept from the same deleted comment and re-checked against '
+        'installed metadata: rtmlib and gliner declare onnxruntime unpinned, faster-whisper '
+        'declares <2,>=1.14. The exact value is ours to choose, but it has to stay inside '
+        'that range -- this is the only place that constraint is now written down.',
     ),
 )
