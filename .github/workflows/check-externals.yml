@@ -112,9 +112,9 @@ jobs:
 
       - name: Run check-externals (markers respected)
         # The builder task's own steps build the engine + the four trees, then
-        # invoke the CLI. No --install-all: the 12 skip-install bundles and the
-        # 1 disable file stay uninstalled (fast). Tee the output so the
-        # annotate step can scan it.
+        # invoke the CLI. No --install-all: the 13 skip-install bundles stay
+        # uninstalled (fast). No file is currently `disable`d. Tee the output so
+        # the annotate step can scan it.
         #
         # --autoinstall: let the builder install its own Node deps + missing
         #                tooling on a fresh runner (mirrors _build.yaml's Build).
@@ -192,9 +192,12 @@ jobs:
       - name: Run check-externals
         # --rebuild-cache: full uv pip compile from scratch (catches upstream
         #                  releases since the last constraint resolution).
-        # --install-all:   install the 12 skip-install bundles and verify them.
-        #                  The 1 disable file (surya) stays skipped —
-        #                  disable beats install-all.
+        # --install-all:   install the 13 skip-install bundles and verify them.
+        #                  No file is `disable`d, so nothing is exempt here.
+        #                  surya joined this set when its `disable` premise was
+        #                  measured false; it installs, but its imports keep the
+        #                  `# contract-check: ignore` markers from that era, so
+        #                  nightly proves the install and not the contracts.
         # workflow_dispatch can opt out of --install-all via the input.
         shell: bash
         env:

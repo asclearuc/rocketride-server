@@ -71,10 +71,10 @@ class SuryaLoader(BaseLoader):
         """
         SuryaLoader._ensure_dependencies()
 
-        # Import opencv first to ensure correct version (may be used by surya)
-        from ai.common.opencv import cv2  # noqa: F401
-
-        # disable contract check for surya due to opencv conflict (see README)
+        # These three are unverified by the contract framework: the engine resolves surya-ocr
+        # 0.16.1 while this loader targets the 0.17 API. Not an opencv conflict — 0.17 needs
+        # transformers>=4.56.1 against the tree's pinned 4.53.3. Revisiting belongs to the OCR
+        # node split, which is what moves the version (virtual-environments.md §7, item 6).
         from surya.foundation import FoundationPredictor  # contract-check: ignore  see comment above
         from surya.recognition import RecognitionPredictor  # contract-check: ignore  see comment above
         from surya.detection import DetectionPredictor  # contract-check: ignore  see comment above

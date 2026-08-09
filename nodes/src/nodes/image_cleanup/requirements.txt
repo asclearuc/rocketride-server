@@ -1,2 +1,3 @@
-# opencv is handled by ai.common.opencv module
+# headless: this node calls core and imgproc only, never a GUI function
+opencv-python-headless<5
 pillow

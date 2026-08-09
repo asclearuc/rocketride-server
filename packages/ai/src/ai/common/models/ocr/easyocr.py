@@ -93,10 +93,6 @@ class EasyOCRLoader(BaseLoader):
         """
         EasyOCRLoader._ensure_dependencies()
 
-        # Import opencv BEFORE easyocr - this ensures opencv-contrib-python-headless
-        # is installed and any conflicting opencv packages are removed
-        from ai.common.opencv import cv2  # noqa: F401
-
         import easyocr
         from ai.common.torch import torch
 

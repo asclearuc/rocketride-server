@@ -51,7 +51,6 @@ _STUB_NAMES = (
     'ai',
     'ai.common',
     'ai.common.config',
-    'ai.common.opencv',
     'depends',
 )
 
@@ -96,7 +95,6 @@ def _install_min_stubs() -> None:
     sys.modules['ai.common'] = ai_common
 
     _mk('ai.common.config', Config=_Config)
-    _mk('ai.common.opencv', cv2=object())
     _mk('depends', depends=_noop)
 
 

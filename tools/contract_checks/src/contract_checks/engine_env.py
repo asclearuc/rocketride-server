@@ -251,23 +251,28 @@ def requirements_file_disabled(req_path: Path) -> tuple[bool, str]:
 
     A disable marker is strictly stronger than ``skip-install``: the file
     is NEVER installed by the framework, even when ``--install-all`` is
-    passed. Use it for files whose packages have **fundamental
-    incompatibilities** with the engine's pinned environment that uv
-    cannot resolve — typically because a transitive dependency pins a
-    library to a version the engine has overridden via a runtime shim.
+    passed. Use it only where uv cannot resolve the file against the
+    engine's compiled constraints at all, so attempting the install buys a
+    guaranteed ``[install-failed]`` and nothing else.
 
-    Canonical examples:
+    "Cannot resolve" is the whole bar, and it is narrower than it looks.
+    Two nearby shapes are **not** this:
 
-    * ``requirements_surya.txt`` — ``surya-ocr`` pulls
-      ``opencv-python-headless==4.11.0.86`` against the engine's
-      ``opencv-contrib-python==4.13.0.92`` (override comes from
-      ``ai.common.opencv`` at import time, after install).
+    * A file that resolves to an older release than its consumer was
+      written against installs perfectly well. That mismatch belongs in the
+      requirement's range, or in ``# contract-check: ignore`` on the
+      imports that moved — not here.
+    * Two distributions writing one import namespace are not a resolution
+      failure either; uv never reports them as one. ``lib/pkg_families``
+      holds those at a single version and installs them in a fixed order,
+      so a file whose only problem was a competing ``cv2`` variant resolves
+      like any other.
 
     Disabled files are paired with ``# contract-check: ignore`` markers on
     the consuming source's import lines (e.g.,
-    ``from surya.recognition import RecognitionPredictor  # contract-check: ignore``),
-    so the framework never tries to verify the contract either. Result:
-    surya goes completely off the framework's radar.
+    ``from some.sdk import Client  # contract-check: ignore``), so the
+    framework never tries to verify a contract whose package it refused to
+    install.
 
     Args:
         req_path: Path to a ``requirement*.txt`` file.

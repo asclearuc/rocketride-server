@@ -819,19 +819,30 @@ variant — so the backstop is a narrow safety net, not the primary mechanism.
   resolves to a file which exists** is *self-describing*: there, only the declared files are
   collected. Every other directory keeps the blanket co-location. Data-driven rather than a
   `ai/common/models/` path constant, because `_REQUIREMENTS_FILE` **is** the model-loader
-  convention and appears nowhere else — 16 declaring files, all under `ai/common/models/`, and not
-  one under `nodes/src`. (A grep finds 17: the seventeenth is `base.py`'s
-  `_REQUIREMENTS_FILE: Optional[...] = None`, an `ast.AnnAssign` the walker's `ast.Assign` branch
-  does not see — and which the resolved-path clause below would neutralise anyway, since `None`
-  names no file.) *Increment 2.5 deleted `trocr.py`, one of the declarers, so the tree now reads 15
-  and 16. What carries the argument is the shape — every declarer under one directory, plus one
-  annotation the walker cannot see — not the tally.*
+  convention and appears nowhere else — **15** declaring files, all under `ai/common/models/`, and not
+  one under `nodes/src`. Everything else the name touches lives in `base.py`, which the walker's
+  `ast.Assign` branch is blind to by construction: the `_REQUIREMENTS_FILE: Optional[...] = None`
+  annotation is an `ast.AnnAssign` (and the resolved-path clause below would neutralise it anyway,
+  since `None` names no file), plus a docstring mention and two `cls._REQUIREMENTS_FILE` reads.
+  *A plain grep therefore finds **19**, not the declarer count* — this parenthetical used to say 17,
+  then 16, having counted `base.py` as one line when it is four; the arithmetic was wrong before
+  increment 2.5 deleted `trocr.py` and stayed wrong after. What carries the argument is the shape —
+  every declarer under one directory, and every non-declarer occurrence in one file the walker cannot
+  see — not the tally, which is exactly why nobody caught it.
   Two implementation facts are load-bearing. The value is never a plain
   string (`os.path.join(dirname(__file__), 'x.txt')`, a list of those, or `dirname + '/x.txt'`), so
   `_requirement_basenames` looks through Call arguments and BinOp operands; and it hangs off a
   **new branch keyed on the exact name**, never the pre-existing `'REQUIREMENT' in id.upper()`
-  substring, which would also catch the lowercase `requirements` local in `ai/common/`,
-  `ai/common/opencv/`, `ai/web/` and `ai/` and make those self-describing too.
+  substring, which would also catch the lowercase `requirements` local of the co-located-`depends()`
+  convention — `requirements = dirname(realpath(__file__)) + '/requirements.txt'` — and make every
+  directory carrying one self-describing too. That is **seven** `ai/**` packages (`ai/common/`,
+  `ai/common/avi/`, `ai/common/image/`, `ai/common/torch/`, `ai/account/`, `ai/modules/task/`,
+  `ai/web/`), and was eight until §7 scope item 4 deleted `ai/common/opencv/`. *The four-name list
+  this sentence used to give named only three of them, plus `ai/` — which feeds `depends()` the
+  module constant `CONST_AI_REQUIREMENTS`, not a lowercase local, and so belongs to the other half of
+  the substring hazard rather than this one.* The argument rests on the **shape** of that local, a
+  bare lowercase name no substring test can tell from the declaration; the enumeration is given only
+  because a short list reads as an exhaustive one.
 
   **Degradation, stated exactly.** A declaring module the walk never reached is safe by
   construction. A declaration resolving to nothing is safe when it is the directory's only one —
@@ -845,26 +856,38 @@ variant — so the backstop is a narrow safety net, not the primary mechanism.
   makes an incomplete declaration harmful. A completeness audit over `ai/common/models/**` found
   exactly one: `easyocr.py`, `doctr.py`, `surya.py` and `utils.py` import `PIL`, but `Pillow` was
   declared only in `requirements_trocr.txt` — blanket co-location had been supplying it. Added bare
-  to the other three. A walk seeded at `surya.py` reaches `ai.common.opencv`, `ai.common.torch` and
-  `ai.web.metrics` but **not** `ai.common.image`, so nothing else would have.
+  to the other three. A walk seeded at `surya.py` reaches `ai.common.torch` and `ai.web.metrics` but
+  **not** `ai.common.image`, so nothing else would have. (It reached the opencv shim too, until §7
+  scope item 4 deleted it; that member never declared `Pillow`, so the audit's conclusion does not
+  move — which is the only reason this line can be corrected without re-running it.)
 
-  **`ocr` was unchanged at 13 files, by design — and reads 12 since increment 2.5.**
+  **`ocr` was unchanged at 13 files, by design — and reads 10 on the tree as it now stands.**
   `nodes/ocr/ocr.py` imports every engine unconditionally — the engine is a *runtime* config choice,
   so each is genuinely statically reachable and the walk is right to keep them. The table above is
-  the measurement of *this* item and stays at 13; the count moved only because 2.5 deleted TrOCR and
-  with it `requirements_trocr.txt` (re-measured against the tree: `ocr` 12, with `detect`,
-  `audio_transcribe` and `embedding_image` unmoved at 9, 8 and 9 — the same method, so the shift is
-  the deletion and nothing else). The payoff is conditional and measured: a walk
-  seeded at `ai/common/models/ocr/surya.py`, which is what a 2A-4 `nodes.ocr.surya` component would
-  look like, goes from all three engine files to `requirements_surya.txt` alone. That is the
-  precondition 2A-4 rests on, pinned by `test_an_ocr_engine_module_scopes_to_its_own_requirements`.
-  It removes one of Surya's two blockers: the same walk still keeps
-  `ai/common/opencv/requirements_{1,2}.txt` at `4.13.0.92`, and removing that shim — **deleted
-  outright, not demoted to a re-export**, since nothing imports it afterwards — is 2A-4's business
-  (§7, scope item 4), not this item's. *Do not read that as "and then Surya is unblocked":* measured
-  on a craft-free tree with the shim removed, the base still resolves `4.13.0.92` and `surya-ocr`
-  still backtracks to `0.16.1` (§4.16), so the second blocker survives the pin's removal and is a
-  separate question.
+  the measurement of *this* item and stays at 13; the count has moved twice since and neither move
+  was this item's doing. Increment 2.5 deleted TrOCR and with it `requirements_trocr.txt` (13 → 12);
+  scope item 4 deleted the opencv shim and with it `requirements_{1,2}.txt` (12 → 10). Re-measured
+  against the tree by the same method after the second: `ocr` **10**, `image_cleanup` **5**,
+  `embedding_video` **10** — the three walks the shim was in — with `detect`, `audio_transcribe` and
+  `embedding_image` unmoved at 9, 8 and 9. Same method throughout, so every shift is a deletion and
+  nothing else.
+  *Take the number off the tree, not off this page.* The measurement is
+  `discover_for_providers([provider], nodes/src, packages/ai/src)` from `rocketlib-python/lib/ast_deps.py`
+  — stdlib-only, so it runs under bare Python with no engine — and `len(result.requirement_files)` is
+  the count. `test_ast_deps.py` is the same call with assertions on it; a walk that has drifted shows
+  up there first.
+  The payoff is conditional and measured: a walk seeded at `ai/common/models/ocr/surya.py`, which is
+  what a 2A-4 `nodes.ocr.surya` component would look like, goes from all three engine files to
+  `requirements_surya.txt` alone — **5** files now, 7 before the shim went. That is the precondition
+  2A-4 rests on, pinned by `test_an_ocr_engine_module_scopes_to_its_own_requirements`.
+  It removed one of Surya's two blockers, and scope item 4 has since removed the other: the walk no
+  longer keeps `ai/common/opencv/requirements_{1,2}.txt` at `4.13.0.92`, because that shim is
+  **deleted outright, not demoted to a re-export** — nothing imported it afterwards. *Do not read
+  that as "and then Surya is unblocked":* on the landed tree `surya-ocr` still backtracks to
+  `0.16.1`, and the cause turned out to be `transformers`, not opencv at all (§4.16). Both blockers
+  are gone and Surya did not move, which is the useful result — it converts "the pin is probably not
+  what holds it" from an argument into a measurement. *No opencv version is quoted here on purpose:*
+  it now depends on whether the resolve is warm or cold, and §4.16 owns that distinction.
 
   **The barrels stay; the invariant moved to the nodes.** A family barrel is a public surface with
   an explicit `__all__`, and PEP 562 would not help the walk anyway (see the Option B note above).
@@ -1149,7 +1172,7 @@ hand-maintained — the thing the glob avoided; and `_FIRST_PARTY` is `('nodes',
 `extension.*` is invisible to the walk until the roots become configurable, making it a
 cross-repository change. In favour of the effort: **no** module of the OSS base process (`ai/web`,
 `ai/modules`, `ai/account`, `ai/eaas.py`) imports `ai.common.models`, `ai.common.torch` or the
-image/avi/opencv helpers (VERIFIED), so the true runtime set really is small.
+image/avi helpers (VERIFIED), so the true runtime set really is small.
 
 **A collision to hold this design against, found while closing item 1's premise.**
 `.github/workflows/lock-node-deps.yml` builds a committed **universal** lock over every
@@ -1660,16 +1683,25 @@ treats them as independent distributions and will never report a conflict betwee
 one installed silently owns the namespace — and a subset arriving after a superset takes modules
 away from an environment that had them (`cv2.ximgproc` disappearing from a directory that had it).
 
-What the resolver cannot give is imposed from outside it, as **data** rather than as the two
-different hand-written hacks that still carry it today: which members may be installed at all, one
-version among those that co-install, and a fixed install order with a known winner. Those two hacks
-— the `ai.common.opencv` shim's four pins and the hard-coded `onnxruntime` line in
-`_write_excludes_file` — are removed by later increments, not by the one that built this mechanism.
+What the resolver cannot give is imposed from outside it, as **data**: which members may be installed
+at all, one version among those that co-install, and a fixed install order with a known winner. Two
+hand-written hacks used to carry that, and they leave one at a time rather than with the mechanism
+that replaced them — a family is inert while something else is still contradicting it, so each
+removal is its own increment with its own measurement. **One is now gone.** The opencv shim's four
+`==4.13.0.92` pins were deleted by §7 scope item 4, and `cv2` became the first family to actually
+decide anything: it now *derives* its version from what this environment's consumers resolved. The
+hard-coded `onnxruntime` line in `_write_excludes_file` still stands and goes when that family
+registers (§7, scope item 5) — until then the static exclusion does a job the data cannot yet do.
 
 | family | members (subset → superset) | shape | state |
 | --- | --- | --- | --- |
 | `cv2` | `-headless`, `opencv-python`, `-contrib-headless`, **`-contrib`** | the members this environment resolves install, in declared order; the last one wins | registered |
 | `onnxruntime` | `onnxruntime` (Darwin), **`onnxruntime-gpu`** (non-Darwin) | one installs per platform; the other is excluded | **declared, not registered** |
+
+All four `cv2` members stay declared even though this tree now resolves only three: the declaration
+is about who *can* write the namespace, not who does here. Since the shim went,
+`-contrib-headless` is requested by nobody and simply never appears in an install set — the
+declaration is the namespace, the resolution decides membership.
 
 Two is the whole population, checked rather than assumed: sweeping every distribution named in every
 `requirement*.txt` under `packages/ai/src` and `nodes/src` turns up no third namespace-sharing set.
@@ -1928,20 +1960,22 @@ or not anything could ever install it. The remedy is to remove the declaration, 
 alignment.
 
 The worked example is what increment 2.5 acted on, and it is recorded here because it is the fact
-base the shim deletion (§7, scope item 4) opens against — it lived outside git until this increment
-folded it in:
+base the shim deletion (§7, scope item 4) opened against — it lived outside git until increment 2.5
+folded it in, one increment before the item that needed it:
 
 - `craft-text-detector` 0.4.3, reached transitively from TrOCR, requires
   `opencv-python <4.5.4.62, >=3.4.8.29`; `surya-ocr` 0.17.1 requires
   `opencv-python-headless==4.11.0.86`.
 - **uv reports no conflict between them** — they are different distributions, which is precisely the
-  condition this section exists for. The `ai.common.opencv` shim's `==4.13.0.92` overrides both, so
-  today the collision is invisible rather than absent.
+  condition this section exists for. The opencv shim's `==4.13.0.92` overrode both, so for as long as
+  it existed the collision was invisible rather than absent — which is why it had to be reasoned
+  about before it could be removed, not after.
 - Had craft still been declared when the shim went, a resolution holding `opencv-python` at 4.5.x
   beside headless at 4.11.0.86 would have become available; alignment takes the minimum and the
   second pass pins headless where surya forbids it. **Three endings were possible and two break the
   base environment.** (Counterfactual, and it is why craft went first — for what the shim's removal
-  actually does on the tree as it now stands, see the measurement below.)
+  actually did, see the measurement below, which is now a record of the tree rather than a forecast
+  about it.)
 - A *proxied* TrOCR component does not escape it. Requirement files are model-server-blind — nothing
   in a `requirement*.txt` says which process will load the model — and the saas model server is a
   base process of this same engine on the same Python 3.12, where craft's opencv range has no wheel
@@ -1951,30 +1985,102 @@ So the uncertainty was **removed rather than resolved**: craft goes because it c
 installed, and TrOCR goes with it because craft is its detector. That is what makes the unpinned
 namespace a question worth measuring instead of a question with two wrong answers already in it.
 
-**Then it was measured, and the answer refutes what §7 scope item 4 predicts.** With craft out of
-the tree, both shim requirement files were removed temporarily and the base recompiled — *compile
-only*, deliberately: `depends()` returns silently on a missing file, so running the suite in that
-state would import the 4.13 wheels already on disk and come back green having measured nothing.
-Expected `4.11.0.86`. Measured: the base **stays at `4.13.0.92`** and `surya-ocr` **stays backtracked
-at `0.16.1`**. Once the shim is gone nothing in the tree pins opencv at all, so the resolution is
-purely transitive and every consumer is unpinned:
+**The mirror case, and it is the cheaper lesson of the two.** "This can never be installed" is also
+something the tree can *assert* rather than discover, and `requirements_surya.txt` did: it carried
+`# contract-check: disable`, whose whole meaning is that uv cannot resolve the file at all, on the
+stated grounds that surya's opencv pin lost to the shim's. Scope item 4 measured it — one
+`depends()` call against the compiled constraints — and it installs cleanly at `0.16.1`. The claim
+had been false for as long as the marker existed, and nothing could have noticed, because the marker
+is precisely an instruction never to try. A declaration that a package is uninstallable is a
+measurement like any other and decays like any other; the difference from the craft case is that
+craft's was true and this one was not. It is `skip-install` now, and no file in the tree is
+`disable`d.
 
-| distribution | version without the shim | requested by |
+**Then it was measured, and the measurement is now the tree.** With craft out, both shim requirement
+files were first removed *temporarily* and the base recompiled — *compile only*, deliberately:
+`depends()` returns silently on a missing file, so running the suite in that state would have
+imported the 4.13 wheels already on disk and come back green having measured nothing. Expected
+`4.11.0.86`. Measured: the base **stays at `4.13.0.92`** and `surya-ocr` **stays backtracked at
+`0.16.1`**. Scope item 4 then deleted the shim for real, and the landed compile reproduced both
+numbers — which is the only reason the dry run is worth recording at all. Nothing in the tree pins
+opencv to an exact version any more, so the resolution is essentially transitive. *Essentially, not
+entirely* — the two nodes' `opencv-python-headless<5` is an upper bound the tree still owns, and the
+cold measurement below is where that distinction stops being pedantic:
+
+| distribution | version — **warm resolve only**, see below | requested by |
 | --- | --- | --- |
 | `opencv-contrib-python` | 4.13.0.92 | `img2table`, `mediapipe`, `rtmlib` |
 | `opencv-python` | 4.13.0.92 | `python-doctr`, `rtmlib`, `albucore` |
 | `opencv-python-headless` | 4.13.0.92 | `albucore`, `albumentations`, `easyocr`, `surya-ocr` |
 | `opencv-contrib-python-headless` | **absent** | the shim alone asked for it |
 
-Deleting the shim therefore changes the family's **composition**, not its version: the fourth member
-stops being installed because nobody else ever wanted it. The `4.11.0.86` prediction rested on
-`surya-ocr` resolving to 0.17, and it does not — **why it does not is unmeasured.** A hand-built
-`uv pip compile` probe does not reproduce the build's index configuration (it died on an unrelated
-`certifi` against `download.pytorch.org`) and would have measured the probe rather than the tree; the
-way to ask is to put `surya-ocr>=0.17` into `requirements_surya.txt` and read the engine's own
-compile. That is scope item 4's opening question, not a blocker for the increment that removed craft
-— 2.5 is correct whichever ending the unpinned namespace has, since removing craft is what makes the
-question answerable at all.
+The **requester** column is the durable half and the **version** column is not; the next paragraph is
+why, and the header says so because a table quoted out of its section is exactly how `4.13.0.92`
+would become an invariant nobody meant to assert.
+
+Deleting the shim therefore changed the family's **composition**, not its version: the fourth member
+stopped being installed because nobody else ever wanted it. Two consequences, neither of them what
+the item originally promised. `lib/pkg_families/` stopped being inert — the version it aligns on is
+derived from this table instead of handed to it by four pins, so the *next* opencv move belongs to
+whichever consumer causes it and the probe is what will notice. And the probe's `ximgproc` branch
+stopped being hypothetical: `opencv-contrib-python` is still resolved here, by `img2table`, so the
+contrib assertion genuinely runs in the base and would fail loudly if the ordered install ever let a
+subset write the namespace last.
+
+**That table is the *warm* resolution, and reading it as an invariant is the mistake this paragraph
+exists to prevent.** `uv pip compile` runs without `--upgrade`, so it prefers whatever
+`constraints.txt` already holds; `ai:clean` does not touch `dist/server/cache/`, so a local rebuild
+keeps `4.13.0.92` by preference, not by constraint. A **from-scratch** resolve is a different
+question, and it is the one every CI runner asks — a fresh runner has no cache at all, PR lane
+included. Measured with `--rebuild-cache` immediately after the deletion landed:
+
+- the three surviving members went to **`4.14.0.94`**, an upstream release published since the cache
+  was built — the version is now genuinely tracked rather than declared;
+- and `opencv-contrib-python` alone resolved to **`5.0.0.93`**. Nothing in the tree caps it:
+  `img2table` asks `>=4`, `mediapipe` and `rtmlib` ask bare. **This is the first time the family's
+  members have actually diverged, and across a major at that** — precisely the split the four pins had
+  been hiding.
+
+The mechanism did its job on its first live outing, and the log is worth quoting because it names the
+lever: `cv2: opencv-contrib-python moved 5.0.0.93 -> 4.14.0.94 from opencv-python-headless (via -r
+cache/combined.txt, albucore, albumentations, easyocr, surya-ocr)`. `align()` took the minimum, the
+second compile pinned contrib back, the ordered passes installed subset-first, and the probe proved
+the result — *Proving cv2 at 4.14.0.94*. The `-r cache/combined.txt` in that requester list is the
+two nodes' `opencv-python-headless<5`: **the cap this repository owns is part of what held the
+namespace together**, which is the concrete reason those declarations are a range and not a bare
+name.
+
+**One thing the resolution already proves, and it moves the question.** The `opencv-python-headless`
+row lists **`surya-ocr` among its requesters at `4.13.0.92`** — a distribution cannot request a
+version it pins away from, so the *resolved* Surya (0.16.1) pins no opencv at all. Only 0.17.1 does.
+OpenCV was therefore never what pushed the backtrack, and removing the pins could not have released
+it. Something else in the union refuses 0.17.
+
+**Asked directly, and the answer is `transformers`.** Scope item 4 put `surya-ocr>=0.17` into
+`requirements_surya.txt` *on the shim-free tree* — the order matters, because asking while the shim
+still pinned opencv would have collided with those pins and handed back the opencv story that is
+already known to be a dead end — and read the engine's own compile. It named no opencv distribution
+at all:
+
+> Because `surya-ocr>=0.17.0,<0.21.0` depends on `transformers>=4.56.1` … and `surya-ocr>=0.21.0`
+> depends on `transformers>=5.12.1` … and because you require `surya-ocr>=0.17` and
+> `transformers==4.53.3`, we can conclude that your requirements are unsatisfiable.
+
+`transformers==4.53.3` is pinned in two authored files — `requirements_transformers.txt` and
+`requirements_vision.txt` — so uv falls back to the newest Surya whose window admits that pin, which
+is `0.16.1`. **The backtrack was always a `transformers` fact wearing an opencv costume**, and no
+amount of opencv work could have released it. That is why removing four pins moved no version.
+
+Two things the same compile printed, both of which price scope item 6. The available releases are
+`0.17.0`, `0.17.1`, `0.20.0`, `0.21.0`, `0.21.1`, `0.21.2`, `0.22.0`, `0.22.1` — the tree is not one
+release behind but seven. And the wall is two-stepped: the honest `surya-ocr>=0.17,<0.18` range costs
+`transformers>=4.56.1`, while anything from `0.21` costs `transformers>=5.12.1`. Item 6 is therefore
+not "move Surya" but "move `transformers`", and its cost depends on which step it stops at.
+
+*Recorded here rather than in item 6 because the next person to see `0.16.1` in a resolution will
+come looking for the opencv reason.* And never hand-run `uv pip compile` to re-ask: it does not
+reproduce the build's index configuration (an earlier attempt died on an unrelated `certifi` against
+`download.pytorch.org`) and would measure the probe rather than the tree.
 
 ---
 
@@ -2129,19 +2235,23 @@ question answerable at all.
 opencv de-conflict" any more: the OCR split is the framework's *first consumer*, not its subject.
 The mechanism is §4.16, and so is the fact base the investigation produced — the craft/Surya
 collision, why uv reports no conflict between two distributions sharing `cv2`, the three endings
-that were possible had craft stayed, and **the measurement of what removing the shim actually does
-now that it has gone** — all under *a package that can never be installed must not be declared*.
+that were possible had craft stayed, and **the measurement of what removing the shim actually did,
+now that both craft and the shim are gone** — all under *a package that can never be installed must
+not be declared*.
 That fold happened in increment 2.5 on purpose: the working notes were untracked, so every fact
 still load-bearing had to reach a tracked file before the increment that needs it.
 2B is closed, so the old "DEFERRED, sequenced after 2B" and "Do 2B first" no longer apply.
 
-Scope, in the order it lands. **Done: 1, 2, 3. Remaining: 4–6** — keep this line current, because a phase
+Scope, in the order it lands. **Done: 1, 2, 3, 4. Remaining: 5–6** — keep this line current, because a phase
 entry that says "next" long after the thing shipped is how §7 went stale before.
 
 1. **`lib/pkg_families/`** *(landed)* — the registry, environment facts, alignment and the ordered install,
    with `cv2` as its only registered inhabitant. Verified by resolving and installing **identically
-   to today**: the shim still pins all four opencv members, so the machinery is provably inert
-   before anything depends on it. onnxruntime is declared here but deliberately *not* registered —
+   to the tree it landed on**: the shim still pinned all four opencv members then, so the machinery
+   was provably inert before anything depended on it. Item 4 is what made it decide something, and
+   the two were separated for exactly that reason — a mechanism and its first live effect measured in
+   one commit are indistinguishable from a mechanism nobody checked.
+   onnxruntime is declared here but deliberately *not* registered —
    registering a family changes what its environments install, and for that one the change is not
    neutral until its version is declared.
 2. **Probes** *(landed)* — subprocess proof of the environment just built against a generated
@@ -2154,21 +2264,56 @@ entry that says "next" long after the thing shipped is how §7 went stale before
    between them because they are different distributions. `trocr.py` and `requirements_trocr.txt`
    are gone with their `contract-check` markers, both barrels and the `ocr` node lost the engine,
    and the `ocr` walk reads 12 requirement files instead of 13 (§4.8). `services.json` and the node
-   README keep their `trocr` entries until item 6, because the README's PARAMS block is generated
-   from the schema and the two cannot be corrected apart; a stale `engine: trocr` is safe, since
-   `OCR_ENGINES.get` returns `None` and the node falls back to EasyOCR. Half of it was out of this
-   repository — see the saas step below.
-4. **The opencv ownership move** — the `ai.common.opencv` shim is deleted outright rather than
-   demoted to a re-export (nothing imports it afterwards, in this repo or in saas), its two
-   requirement files go with it, and the two nodes that were riding its pins declare
-   `opencv-python-headless<5` of their own. **No base-environment override**: the base aligns
-   exactly as an overlay does.
-   *The version it lands on is now measured, and it is not the one this item used to name.* This
-   read "moves from `4.13.0.92` to `4.11.0.86` in every installation"; a dry run on a craft-free
-   tree with both shim files removed says the base **stays at `4.13.0.92`** while
-   `opencv-contrib-python-headless` leaves the resolution entirely, because `surya-ocr` still
-   backtracks to `0.16.1` (§4.16 carries the table and the open question of *why*). Start from that
-   measurement, not from the old sentence.
+   README's **generated PARAMS block** keep their `trocr` entries until item 6, because that block is
+   generated from the schema and the two cannot be corrected apart; a stale `engine: trocr` is safe,
+   since `OCR_ENGINES.get` returns `None` and the node falls back to EasyOCR. *Item 4 has since
+   corrected the README's **hand-written** OpenCV table, which is a different thing and was wrong on
+   its own terms:* that table named `craft-text-detector` 0.4.3 and its `opencv-python <4.5.4.62`
+   cap — a resolution claim about a distribution 2.5 had already removed from the tree, on a page
+   `docs:gather` publishes. Generated and hand-written are separable even inside one file; only the
+   generated half is coupled to `services.json`. Half of it was out of this repository — see the saas
+   step below.
+4. **The opencv ownership move** *(landed)* — the `ai.common.opencv` shim was deleted outright rather
+   than demoted to a re-export (nothing imported it afterwards, in this repo or in saas) and its two
+   requirement files went with it. Its *real* consumers became a plain `import cv2`; its
+   side-effect-only importers — the three OCR loaders and `nodes/ocr/IGlobal.py`, which imported it
+   under `# noqa: F401` purely so its `depends()` ran first — lost the import entirely, because a
+   bare `import cv2` has no side effect and the ordering they were buying is now bought by
+   `install_batches()` at install time. The two nodes left without any other source of `cv2` —
+   `image_cleanup` and `embedding_video` — declare `opencv-python-headless<5` of their own; headless
+   because their combined surface is 21 core/imgproc/videoio symbols with no `ximgproc` and no GUI
+   call, and a range rather than a pin because `align()` derives V from what consumers resolve and a
+   node that pinned would invert that. **No base-environment override**: the base aligns exactly as
+   an overlay does, which is what makes `lib/pkg_families/` stop being inert.
+   *The version it landed on was measured before the deletion and reproduced by it, and it is not the
+   one this item used to name.* This read "moves from `4.13.0.92` to `4.11.0.86` in every
+   installation". It does not — and the honest answer has two halves, because **the version now
+   depends on whether the resolve is warm or cold**, which it never did while the shim's pins existed:
+   - *Warm* (a local rebuild, which reuses `constraints.txt` as preferences): the tree **stays at
+     `4.13.0.92`** while `opencv-contrib-python-headless` leaves the resolution entirely, because
+     `surya-ocr` still backtracks to `0.16.1` and the resolved Surya pins no opencv at all.
+   - *Cold* (`--rebuild-cache`, and what every CI runner does — a fresh runner has no cache, PR lane
+     included): the members went to **`4.14.0.94`**, and `opencv-contrib-python` alone resolved to
+     **`5.0.0.93`** — the family's first real divergence, across a major. Alignment caught it, the
+     second compile pinned contrib back, and the probe proved the result. The cap that supplied the
+     minimum came partly from the two nodes' `opencv-python-headless<5`, which is why those
+     declarations are a range and not a bare name.
+
+   §4.16 carries both measurements, the requester table, and the answer to *why* Surya backtracks
+   (`transformers`, not opencv). The AST walk shrank with the deletion: `ocr` reads 10 requirement
+   files instead of 12, `image_cleanup` 5 instead of 7, `embedding_video` 10 instead of 12 (§4.8).
+   One marker moved too: `requirements_surya.txt` was `contract-check: disable` on the premise that
+   its install could never succeed — measured false here, it installs cleanly at `0.16.1` — so it is
+   `skip-install` now and **no file in the tree is `disable`d**. Nightly `--install-all` therefore
+   installs it; its three `# contract-check: ignore` markers stay, so what nightly gains is install
+   drift, not contract coverage, and lifting them belongs to item 6 with the version move.
+   *One artefact deliberately not updated, because it cannot be from here:* a node README's
+   `## Dependencies` block is generated from that node's `requirements.txt`, so changing
+   `image_cleanup` and `embedding_video` makes theirs stale — and `nodes:docs-generate` refuses to
+   run outside `main`/`stage`/`develop`, to keep feature-branch diffs free of generated churn. The
+   published site regenerates at deploy and is correct; the in-repo blocks catch up on a
+   release-track branch. Reading those two files and concluding the increment missed them is the
+   wrong conclusion, which is why it is written down.
 5. **onnxruntime as the second family** — the ten copied `onnxruntime-gpu==1.22.0` /
    `onnxruntime==1.22.0` lines across five requirement files become one `namespace_version`, and
    the hard-coded exclusion in `_write_excludes_file` becomes data.
@@ -2243,8 +2388,10 @@ entangled and 4 depends on 5.
   file into one constraint set regardless of what base holds (four of them then, three since
   increment 2.5 deleted TrOCR). Item 2 has since shipped and did **not** change that either,
   deliberately: the `ocr` node reaches every engine statically, so the walk is right to keep them.
-  What item 2 did deliver is that a *per-engine* component scopes to its own engine, which leaves
-  2A-4 as the only remaining step for Surya.
+  What item 2 did deliver is that a *per-engine* component scopes to its own engine, which left
+  2A-4 as the remaining step for Surya. Scope item 4 has since landed and Surya did **not** move:
+  both of its blockers are gone and the resolution still holds `surya-ocr` at `0.16.1`, so what
+  remains is item 6 alone, and its subject is a version range rather than a namespace.
 - **2 — AST within-family over-inclusion is closed, and the deferred *decision* dissolved rather
   than being made.** §4.8 offered Options 1/2 as a choice; measurement showed they are halves of
   one fix — Option 1 alone moves nothing (870 → 870), Option 2 alone never reaches a barrel
@@ -2255,9 +2402,9 @@ entangled and 4 depends on 5.
   engines import `PIL` — fixed in the same change. And the ancestor import-closure residual item 1
   handed over (`ai/web/__init__` → `ai.account`) closed on a stronger fact than backstop coverage:
   it is empty in package terms, tree-wide, and pinned by a test. What it deliberately does not
-  deliver is `ocr` itself, still at 13 files then — 12 since increment 2.5 — because the node
-  reaches every engine statically; what it does deliver is that a 2A-4 per-engine component finally
-  scopes to its own engine.
+  deliver is `ocr` itself, still at 13 files then — 12 after increment 2.5, 10 after scope item 4 —
+  because the node reaches every engine statically; what it does deliver is that a 2A-4 per-engine
+  component finally scopes to its own engine.
 
 **What is NOT done, stated separately so the group is not read as closed.**
 - **3's other half — `ENV_ID` per test worker.** Deliberately not built: declarative node tests are

@@ -1,2 +1,4 @@
 transformers
 accelerate
+# headless: VideoCapture lives in videoio, which the headless wheel ships
+opencv-python-headless<5

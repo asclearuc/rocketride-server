@@ -172,17 +172,19 @@ Two sibling markers for **requirements files** (a parallel to `# contract-check:
 | Marker | Default lane behaviour | Under `--install-all` | Use for |
 | ------ | ---------------------- | --------------------- | ------- |
 | `# contract-check: skip-install` | Skip: `[skip-install]` line | **Installs**: `[install-all]` bypass line | Heavy Tier-2 bundles (kokoro, whisper, etc.). PR lane fast; nightly verifies. |
-| `# contract-check: disable` | Skip: `[disable]` line | **Still skipped**: `[disable]` line, no bypass | Fundamental incompatibilities (surya's opencv pin) where attempting install just produces a guaranteed `[install-failed]`. Paired with `# contract-check: ignore` on the consuming imports so the contract isn't checked either. |
+| `# contract-check: disable` | Skip: `[disable]` line | **Still skipped**: `[disable]` line, no bypass | Files uv cannot resolve against the engine's compiled constraints at all, where attempting install just produces a guaranteed `[install-failed]`. Paired with `# contract-check: ignore` on the consuming imports so the contract isn't checked either. |
 
 `disable` is strictly stronger than `skip-install`. If a file has both, `disable` wins.
 
 Mark a file by placing the marker on its own comment line (typically at the top so it's the first thing a reader sees):
 
 ```text
-# contract-check: disable  reason: surya transitively pins opencv-python-headless==4.11.0.86; the ai.common.opencv runtime shim handles the override; uv can't replay it.
-surya-ocr>=0.17.0
+# contract-check: disable  reason: <pkg> needs <dep> at a version the engine's constraints pin elsewhere, and no range satisfies both; uv cannot resolve the file at all.
+some-package>=1.0
 …
 ```
+
+The example is deliberately synthetic: **no file in the tree is currently `disable`d.** The one that was — `requirements_surya.txt` — carried that marker on the premise that its install could never succeed, and the premise was measured false: it installs cleanly. It is `skip-install` now. Quoting a real file here is what let that reason go stale unnoticed for as long as it did.
 
 ### Output routing
 
@@ -190,7 +192,7 @@ Install-layer status lines (`[disable]`, `[skip-install]`, `[install-all]`, `[in
 
 ### Effects in detail
 
-- **Default PR lane** (`./builder.cmd check-externals:run`): both markers cause the file's `depends()` call to be bypassed. Stdout shows `[skip-install] <path>: <reason>` or `[disable] <path>: <reason>` so the bypass is visible in CI logs. Packages stay uninstalled; their contract rows show `[SKIP] package not installed in engine env` (unless paired with `# contract-check: ignore` on the imports, in which case there's no contract row at all, see the surya pattern below).
+- **Default PR lane** (`./builder.cmd check-externals:run`): both markers cause the file's `depends()` call to be bypassed. Stdout shows `[skip-install] <path>: <reason>` or `[disable] <path>: <reason>` so the bypass is visible in CI logs. Packages stay uninstalled; their contract rows show `[SKIP] package not installed in engine env` (unless paired with `# contract-check: ignore` on the imports, in which case there's no contract row at all — see the marked-file inventory below).
 - **Nightly cron lane** (`./builder.cmd check-externals:run --install-all`):
   - `skip-install`-marked files: marker is **ignored**. Stdout shows `[install-all] <path>: bypassing skip-install marker`, then `depends()` is called. Most succeed; contracts get verified.
   - `disable`-marked files: marker is **honoured**. Stdout shows the same `[disable]` line as the PR lane. `--install-all` does not override `disable`, that's the whole point of the stronger marker.
@@ -209,7 +211,7 @@ This is the drift signal for the install layer itself. If a previously-installab
 
 | Marker | File | Why marked | Paired `# contract-check: ignore` on imports? |
 | ------ | ---- | ---------- | --- |
-| `disable` | `packages/ai/src/ai/common/models/ocr/requirements_surya.txt` | `opencv-python-headless==4.11.0.86` transitive pin | Yes: 3 imports in `surya.py` |
+| `skip-install` | `packages/ai/src/ai/common/models/ocr/requirements_surya.txt` | opt-in OCR engine; engine resolves 0.16.1, not the 0.17 the loader targets (a `transformers` pin, not opencv) | Yes: 3 imports in `surya.py`, left from its `disable` era |
 | `skip-install` | `packages/ai/src/ai/common/models/audio/requirements_kokoro.txt` | ~200 MB audio model deps | No: verified on nightly |
 | `skip-install` | `packages/ai/src/ai/common/models/audio/requirements_whisper.txt` | ~400 MB ASR deps (ctranslate2, av, onnxruntime) | No |
 | `skip-install` | `packages/ai/src/ai/common/models/gliner/requirements_gliner.txt` | ~300 MB NER deps + mecab C compile | No |
@@ -223,7 +225,9 @@ This is the drift signal for the install layer itself. If a previously-installab
 | `skip-install` | `packages/ai/src/ai/common/models/vision/requirements_pose.txt` | rtmlib + onnxruntime-gpu pull a large tree | No |
 | `skip-install` | `packages/ai/src/ai/common/models/vision/requirements_segmentation.txt` | pycocotools build + Mask2Former weights | No |
 
-The `disable` files are paired with import-line ignores because they will *never* be installable, verifying their contracts would always SKIP and add noise. The `skip-install` files keep their imports unmarked because nightly `--install-all` installs them and can actually verify the contracts.
+**No file is currently `disable`d.** Were one, it would be paired with import-line ignores: verifying a contract whose package the framework refused to install would always SKIP and add noise. `skip-install` files keep their imports unmarked, because nightly `--install-all` installs them and can actually verify the contracts.
+
+`requirements_surya.txt` is the exception and it is a known, deliberate one: it keeps the three `# contract-check: ignore` markers it acquired while it was `disable`d, so nightly installs it but still verifies nothing. That is coverage left on the table on purpose — the loader targets the 0.17 API while the engine resolves 0.16.1, so lifting the ignores belongs with the version move (scope item 6), not with the marker downgrade.
 
 ### When to add a new marker
 
@@ -234,7 +238,7 @@ Use **`skip-install`** when:
 
 Use **`disable`** when:
 
-- A file's install reproducibly fails uv resolution against the engine's pinned constraints AND the conflict isn't going to resolve (typically a transitive opencv/torch/numpy pin override handled by a runtime shim).
+- A file's install reproducibly fails uv resolution against the engine's pinned constraints AND the conflict isn't going to resolve — a transitive pin the constraints contradict with no range satisfying both. Note what does *not* qualify: two distributions sharing one import namespace is not a resolution failure (uv never reports it as one), and `lib/pkg_families` already holds those at a single version.
 - You've confirmed the consuming code handles the package being absent (typically via try/except), so contract verification is meaningless without install.
 - **Also add `# contract-check: ignore` on every import of that package's modules** so the framework doesn't try to verify a contract whose dependency is permanently absent.
 
