@@ -22,99 +22,44 @@
 # =============================================================================
 
 """
-OCR Reader Module.
+Surya OCR Reader Module.
 
-Uses ai.common.models OCR wrappers for model server compatibility.
-Supports EasyOCR, DocTR and Surya engines.
+Uses the ai.common.models Surya wrapper for model server compatibility.
+
+Single-engine by construction: there is no engine picker here, and no
+``SCRIPT_FAMILIES`` table. Surya 0.17+ recognition is multilingual and
+auto-detecting, so the language list the EasyOCR path needs has no meaning
+for it. Keeping a dispatch table would also re-import the engines this
+component exists to leave behind.
 """
 
 import io
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import numpy as np
 from PIL import Image
 
 from ai.common.reader import ReaderBase
-from ai.common.config import Config
-from ai.common.models.ocr.easyocr import EasyOCR
-from ai.common.models.ocr.doctr import DocTR
 from ai.common.models.ocr.surya import Surya
 from rocketlib import debug
 
 
-# Script families with EasyOCR-supported languages
-# Reference: https://www.jaided.ai/easyocr/
-SCRIPT_FAMILIES = {
-    'latin': ['en'],  # Default: English only for reliability
-    'latin-extended': [
-        'en',
-        'fr',
-        'de',
-        'es',
-        'it',
-        'pt',
-        'nl',
-        'pl',
-        'ro',
-        'cs',
-        'sk',
-        'hu',
-        'hr',
-        'sl',
-        'sq',
-        'lt',
-        'lv',
-        'da',
-        'no',
-        'sv',
-        'id',
-        'ms',
-        'tl',
-        'vi',
-        'tr',
-        'az',
-        'uz',
-        'sw',
-        'la',
-        'oc',
-    ],
-    'cyrillic': ['ru', 'uk', 'be', 'bg', 'rs_cyrillic', 'mn', 'en'],  # mk not supported by EasyOCR; sr -> rs_cyrillic
-    'arabic': ['ar', 'fa', 'ur', 'ug', 'en'],
-    'devanagari': ['hi', 'mr', 'ne', 'en'],
-    'bengali': ['bn', 'as', 'en'],
-    'chinese-simplified': ['ch_sim', 'en'],
-    'chinese-traditional': ['ch_tra', 'en'],
-    'japanese': ['ja', 'en'],
-    'korean': ['ko', 'en'],
-    'thai': ['th', 'en'],
-    'tamil': ['ta', 'en'],
-    'telugu': ['te', 'en'],
-}
-
-# Map engine names to model server wrapper classes
-OCR_ENGINES = {
-    'easyocr': EasyOCR,
-    'doctr': DocTR,
-    'surya': Surya,
-}
-
-
 class Reader(ReaderBase):
     """
-    OCR Reader using model server wrappers.
+    Surya OCR Reader using the model server wrapper.
 
-    Supports multiple OCR engines via ai.common.models:
-    - EasyOCR: Multi-language support, good general purpose
-    - DocTR: Document-focused, good for structured documents
-    - Surya: Multilingual, 90+ languages
-
-    The model server wrappers auto-detect whether to use remote model server
-    or fall back to local inference.
+    The wrapper auto-detects whether to use a remote model server or fall
+    back to local inference.
     """
 
     def __init__(self, provider: str, connConfig: Dict[str, Any], bag: Dict[str, Any]):
         """
-        Initialize the OCR reader.
+        Initialize the Surya OCR reader.
+
+        There is deliberately no ``config.get('engine', ...)`` read here. The
+        standard component's ``Reader`` defaults that key to ``'easyocr'``, so
+        a copy that kept the lookup would resolve to EasyOCR in an environment
+        that does not have it -- silent in review, ImportError at first use.
 
         Args:
             provider: Node provider name
@@ -123,54 +68,9 @@ class Reader(ReaderBase):
         """
         super().__init__(provider, connConfig, bag)
 
-        # Get node configuration
-        config = Config.getNodeConfig(provider, connConfig)
+        self._ocr = Surya()
 
-        # Get OCR settings
-        engine = config.get('engine', 'easyocr').lower()
-        script_family = config.get('script_family', 'latin')
-
-        # Get languages for this script family (used by EasyOCR)
-        languages = SCRIPT_FAMILIES.get(script_family, ['en'])
-
-        # Initialize the OCR engine via model server wrapper
-        self._engine_name = engine
-        self._ocr = self._init_ocr_engine(engine, languages, config)
-
-        debug(f'OCR Reader initialized: engine={engine}, script_family={script_family}, languages={languages}')
-
-    def _init_ocr_engine(self, engine: str, languages: List[str], config: Dict[str, Any]):
-        """
-        Initialize the specified OCR engine.
-
-        Args:
-            engine: Engine name ('easyocr', 'doctr', 'surya')
-            languages: List of language codes for EasyOCR
-            config: Node configuration dictionary
-
-        Returns:
-            Initialized OCR engine instance
-        """
-        OCRClass = OCR_ENGINES.get(engine)
-
-        if OCRClass is None:
-            debug(f"Unknown OCR engine '{engine}', falling back to EasyOCR")
-            return EasyOCR(languages=languages)
-
-        if engine == 'easyocr':
-            return OCRClass(languages=languages)
-
-        elif engine == 'doctr':
-            # DocTR supports detection and recognition architecture options
-            det_arch = config.get('det_arch', 'db_resnet50')
-            reco_arch = config.get('reco_arch', 'crnn_vgg16_bn')
-            return OCRClass(detection_model=det_arch, recognition_model=reco_arch)
-
-        elif engine == 'surya':
-            return OCRClass()
-
-        else:
-            return EasyOCR(languages=languages)
+        debug('Surya OCR Reader initialized')
 
     def read(self, image_data) -> str:
         """
@@ -232,10 +132,8 @@ class Reader(ReaderBase):
         """
         Extract text from OCR result.
 
-        Different engines return different formats:
-        - EasyOCR: {'text': '...', 'boxes': [...]}
-        - DocTR: {'text': '...', 'boxes': [...]}
-        - Surya: {'text': '...', ...}
+        Branches on the *result type*, not on the engine, so this is carried
+        over from the standard component unchanged.
 
         Args:
             result: OCR result from engine

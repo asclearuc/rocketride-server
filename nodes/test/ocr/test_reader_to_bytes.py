@@ -4,7 +4,8 @@
 # =============================================================================
 
 """
-Regression tests for ``Reader._to_bytes`` in ``nodes/src/nodes/ocr/ocr.py``.
+Regression tests for ``Reader._to_bytes``, run against **both** OCR components
+(``nodes/src/nodes/ocr/standard/ocr.py`` and ``.../surya/ocr.py``).
 
 ``writeImage`` accumulates the image into a ``bytearray``, which is not a
 ``bytes`` subclass. Before the fix it fell through to
@@ -163,21 +164,41 @@ def _scoped_stubs() -> Iterator[None]:
             sys.modules[name] = mod
 
 
-_ocr_path = Path(__file__).parent.parent.parent / 'src' / 'nodes' / 'ocr' / 'ocr.py'
+_NODE_DIR = Path(__file__).parent.parent.parent / 'src' / 'nodes' / 'ocr'
 
+# `_to_bytes` is carried over unchanged into both components, so both copies
+# must satisfy the same assertions. The load happens at import time under the
+# scoped stubs, so this is a loop building {component: module}, not a fixture
+# over a path constant — there is no lazy load a fixture could re-point.
+#
+# `ocr.py`'s imports are absolute, so each copy execs under its own FLAT
+# synthetic name. (`test_write_documents.py` loads `IInstance.py`, whose
+# `from .IGlobal import ...` needs a synthetic parent package instead.)
+#
+# One stub set serves both: `_OCR_ENGINES` stubs easyocr, doctr AND surya, a
+# superset of what either copy imports, and an installed stub nothing imports
+# is inert.
+_READERS: dict[str, object] = {}
 with _scoped_stubs():
-    _spec = importlib.util.spec_from_file_location('_ocr_under_test', _ocr_path)
-    assert _spec is not None and _spec.loader is not None
-    _ocr = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_ocr)
+    for _component in ('standard', 'surya'):
+        _spec = importlib.util.spec_from_file_location(
+            f'_ocr_under_test_{_component}', _NODE_DIR / _component / 'ocr.py'
+        )
+        assert _spec is not None and _spec.loader is not None
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        _READERS[_component] = _mod.Reader
 
-Reader = _ocr.Reader
 
+@pytest.fixture(params=sorted(_READERS), ids=sorted(_READERS))
+def reader(request) -> object:
+    """
+    A ``Reader`` with ``__init__`` bypassed — ``_to_bytes`` needs no engine.
 
-@pytest.fixture
-def reader() -> object:
-    """A ``Reader`` with ``__init__`` bypassed — ``_to_bytes`` needs no engine."""
-    return Reader.__new__(Reader)
+    Bypassing the constructor is also what makes parametrising free: surya's
+    is a heavy reduction of standard's, and neither runs here.
+    """
+    return _READERS[request.param].__new__(_READERS[request.param])
 
 
 def _png_bytes() -> bytes:

@@ -4,7 +4,9 @@
 # =============================================================================
 
 """
-Tests for the OCR node's ``documents`` input lane (``IInstance.writeDocuments``).
+Tests for both OCR input lanes -- ``IInstance.writeDocuments`` and, since the
+component split, ``IInstance.writeImage`` -- against **both** components
+(``nodes/src/nodes/ocr/{standard,surya}/IInstance.py``).
 
 Guards two defects that survived since the initial commit because the fulltest
 feeds ``image/png``, which ``_determine_lane`` routes to the ``image`` lane:
@@ -34,6 +36,7 @@ from pathlib import Path
 from typing import Iterator
 
 import pytest
+from rocketlib import AVI_ACTION
 
 from ai.common.schema import Doc
 
@@ -87,18 +90,32 @@ def _scoped_stubs() -> Iterator[None]:
                 sys.modules[name] = mod
 
 
-_iinstance_path = Path(__file__).parent.parent.parent / 'src' / 'nodes' / 'ocr' / 'IInstance.py'
+_NODE_DIR = Path(__file__).parent.parent.parent / 'src' / 'nodes' / 'ocr'
 
+# ``writeDocuments`` is carried into both components, so both copies must show
+# the same observable text/document behaviour — a better property than
+# byte-equality, since surya's copy deliberately has no
+# ``extract_tables_from_image`` call at all.
+#
+# The load happens at import time under the scoped stubs, so this is a loop
+# building {component: class}, not a fixture over a path constant.
+#
+# Both execs reuse the single synthetic parent package: ``IInstance.py`` needs
+# one for its ``from .IGlobal import IGlobal`` to resolve, the stubbed
+# ``{_PKG}.IGlobal`` is the same ``object`` for either copy, and the
+# ``{_PKG}.IInstance`` entry is popped after each exec so the second load
+# cannot see the first.
+_IINSTANCES: dict[str, type] = {}
 with _scoped_stubs():
-    _spec = importlib.util.spec_from_file_location(f'{_PKG}.IInstance', _iinstance_path)
-    assert _spec is not None and _spec.loader is not None
-    _iinstance_mod = importlib.util.module_from_spec(_spec)
-    _iinstance_mod.__package__ = _PKG
-    sys.modules[f'{_PKG}.IInstance'] = _iinstance_mod
-    _spec.loader.exec_module(_iinstance_mod)
-    sys.modules.pop(f'{_PKG}.IInstance', None)
-
-IInstance = _iinstance_mod.IInstance
+    for _component in ('standard', 'surya'):
+        _spec = importlib.util.spec_from_file_location(f'{_PKG}.IInstance', _NODE_DIR / _component / 'IInstance.py')
+        assert _spec is not None and _spec.loader is not None
+        _iinstance_mod = importlib.util.module_from_spec(_spec)
+        _iinstance_mod.__package__ = _PKG
+        sys.modules[f'{_PKG}.IInstance'] = _iinstance_mod
+        _spec.loader.exec_module(_iinstance_mod)
+        sys.modules.pop(f'{_PKG}.IInstance', None)
+        _IINSTANCES[_component] = _iinstance_mod.IInstance
 
 
 class _StubReader:
@@ -142,8 +159,27 @@ class _StubInstance:
 PNG_BYTES = b'\x89PNG\r\n\x1a\n-not-a-real-png-but-opaque-to-the-node'
 
 
+_ACTIVE: type | None = None
+
+
+@pytest.fixture(params=sorted(_IINSTANCES), ids=sorted(_IINSTANCES), autouse=True)
+def _component(request):
+    """
+    Run every test in this module once per OCR component.
+
+    Autouse + a module global rather than a parameter on each test: they all
+    reach the class through ``_make()``, so threading it explicitly would touch
+    every one of them to assert a property that is the same for both. Yields the
+    component *name* for the few tests that assert where the two differ.
+    """
+    global _ACTIVE
+    _ACTIVE = _IINSTANCES[request.param]
+    yield request.param
+    _ACTIVE = None
+
+
 def _make(lanes: tuple[str, ...] = ('text',), result='hello world'):
-    node = IInstance.__new__(IInstance)
+    node = _ACTIVE.__new__(_ACTIVE)
     node.inbound_writeText = []
     # IInstanceBase.writeText/preventDefault: overridden, engine dispatch is out of scope here.
     node.writeText = node.inbound_writeText.append
@@ -197,6 +233,68 @@ class TestTextIsEmitted:
         node.writeDocuments([_doc()])
 
         assert node.instance.texts == ['hello world']
+
+
+class TestWriteImageLane:
+    """
+    The raw-image lane, driven BEGIN -> WRITE -> END.
+
+    ``extract_tables_from_image`` has two call sites and only ``writeDocuments``
+    is reachable from the tests above, so ``writeImage``'s ``AVI_ACTION.END``
+    branch was asserted by nothing. Leaving that line behind in the surya
+    component would raise ``AttributeError`` on every image it is handed --
+    which is why driving END at all is the surya-side guard, needing no
+    assertion of its own.
+
+    ``image/png``, never ``image/gif``: the GIF branch's two dependencies are
+    stubbed to return ``None`` (``numpy.array``, ``PIL.Image.open``), so taking
+    it would fail inside a fixture and read as a node defect.
+    """
+
+    def _drive(self, node, payload: bytes = PNG_BYTES) -> None:
+        node.writeImage(AVI_ACTION.BEGIN, 'image/png', b'')
+        if payload:
+            node.writeImage(AVI_ACTION.WRITE, 'image/png', payload)
+        node.writeImage(AVI_ACTION.END, 'image/png', b'')
+
+    def test_end_emits_the_read_text(self) -> None:
+        node = _make()
+        self._drive(node)
+
+        assert node.IGlobal.reader.calls == [PNG_BYTES]
+        assert node.instance.texts == ['hello world']
+
+    def test_list_result_is_joined(self) -> None:
+        node = _make(result=['hello', 'world'])
+        self._drive(node)
+
+        assert node.instance.texts == ['hello world']
+
+    def test_end_resets_the_accumulator(self) -> None:
+        node = _make()
+        self._drive(node)
+
+        assert node.image_data == b''
+
+    def test_end_without_data_reads_nothing(self) -> None:
+        node = _make()
+        self._drive(node, payload=b'')
+
+        assert node.IGlobal.reader.calls == []
+        assert node.instance.texts == []
+
+    def test_the_table_call_site_matches_the_component(self, _component: str) -> None:
+        """Standard feeds the table lane from END; surya has no such call."""
+        node = _make()
+        seen: list = []
+        if hasattr(node, 'extract_tables_from_image'):
+            node.extract_tables_from_image = lambda data, emit: seen.append((bytes(data), emit))
+        self._drive(node)
+
+        if _component == 'standard':
+            assert seen == [(PNG_BYTES, node.instance.writeTable)]
+        else:
+            assert not hasattr(node, 'extract_tables_from_image')
 
 
 class TestDocumentsLane:

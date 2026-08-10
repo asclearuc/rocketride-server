@@ -72,7 +72,7 @@ The repo has a **live** remote-sub-pipeline feature under `nodes/src/nodes/remot
 - **rewrites the graph** two ways — `prepareLocalPipeline` *inlines* a sub-pipeline (= "flatten");
   `prepareRemotePipeline` *inserts bridge/stub nodes + reroutes lanes* (= cut a boundary);
 - bridges lane data over a **token-authed WebSocket** (Bearer token, `~1 MB` chunking);
-- gates members by a **`REMOTING`** capability (on by default; cleared by `noremote`, `services.cpp:1737`).
+- gates members by a **`REMOTING`** capability (on by default; cleared by `noremote`, `services.cpp:1799`).
 
 Two facts that shape the design (both **verified** against the code):
 
@@ -266,7 +266,7 @@ keeps the full words **Virtual Environment** in the UI and a `VirtualEnv` prefix
 do not read as one concept.
 
 **No creation entry yet (deliberate).** The container's members are nested into
-`config.pipeline.components`, which the engine ignores until the partitioner lands (§4.3, §5.3). A
+`config.pipeline.components`, which the engine ignores until the partitioner lands (§4.3, §5 question 3). A
 creation button before that would let a user build a pipeline whose members silently vanish at run
 time, so the mechanics ship first and the entry point opens with the partitioner. Placing one today
 is possible only by authoring the document directly — which is what the acceptance fixtures do.
@@ -329,8 +329,8 @@ away. Membership carries no runtime meaning by itself — members keep their ids
 edge that crossed the boundary needs no rewriting. A pipeline with no containers is returned unchanged,
 by identity.
 
-This alone fixes the standing bug in §5.3: until now **every** grouped component was silently dropped
-from the run, and the pipeline still reported success. Verified on a document the editor actually
+This alone fixes the standing bug in §5 question 3: until now **every** grouped component was silently
+dropped from the run, and the pipeline still reported success. Verified on a document the editor actually
 wrote: `[dropper, parse, venv_vision, venv_audio, response_outside]` →
 `[dropper, parse, response_1, response_outside]`.
 
@@ -465,7 +465,9 @@ the rejected `venvEgress`/`venvIngress` reinvention; it is a sibling of `remote`
   byte-identically (**A1**) — is **deferred to 2C**, alongside the transport seam that §4.5 already
   defers there.
 - **AV multi-arg framing = metadata in the header, body is raw bytes (B1).** `image`/`audio`/`video`
-  carry `(action:int, mime:str, buffer:bytes)`, which the single-scalar `_send` cannot express. The
+  carry `(action, mime:str, buffer:bytes)`, which the single-scalar `_send` cannot express. *That
+  first argument reads as an `int` and is not one* — it is an `AVI_ACTION` member, which is what made
+  "put it on the header" look free; the concrete bullet below carries the consequence. The
   `venv` transport puts `action`/`mime` on the already-sent JSON header and ships the buffer as **raw
   bytes** (no base64), so multi-MB frames keep their throughput — base64-in-JSON (**B2**) was rejected
   for the ~33% inflation §4.5 warns about. The bridge does **not** synthesize `_begin`/`_end` framing for
@@ -476,10 +478,12 @@ the rejected `venvEgress`/`venvIngress` reinvention; it is a sibling of `remote`
   `INTERNAL` (`PROTOCOL_CAPS` BIT 6, `Url.hpp`) means *not returned in `services.json` at all* — the
   UI never sees the node, so it can't be shown, placed, or referenced. `nosaas` (BIT 13) is weaker: the
   node **is** in `services.json` but the UI Add-Node inventory/quick-add filter it out
-  (`apps/shared/src/components/canvas/util/helpers.tsx`, `.../panels/quick-add/QuickAddPopup.tsx`) —
-  and nothing in the C++ engine or the Python
+  (`apps/shared/src/components/canvas/util/helpers.tsx`,
+  `.../canvas/components/panels/quick-add/QuickAddPopup.tsx`, and `.../components/EmptyCanvasPrompt.tsx`) —
+  *grep for `IServiceCapabilities.NoSaas`, not for the string `nosaas`, which appears nowhere in the
+  app sources* — and nothing in the C++ engine or the Python
   server gates *execution* on `nosaas` (it is only parsed into `def.capabilities` at
-  `services.cpp:1779`; there is no engine "saas mode"). That is why `remote_server` carries
+  `services.cpp:1793`; there is no engine "saas mode"). That is why `remote_server` carries
   `["internal", "nosaas"]` while the user-placeable `remote` client carries only `["nosaas"]`. Both
   `venv` and `venv_server` are **synthesized by the partitioner and never user-placed**, so **both take
   `internal`** (mirroring `remote_server`, not the `remote` client); `nosaas` on top is redundant but
@@ -535,6 +539,18 @@ the rejected `venvEgress`/`venvIngress` reinvention; it is a sibling of `remote`
   2-arg form for BEGIN/END — so a bufferless frame crosses as a `none` payload and the far side replays
   the 2-arg call. The bridge is a transparent pass-through of already-framed calls; it does **not**
   synthesize `_begin`/`_end`. Raising the ~1 MB WS ceiling for large AV buffers stays a step-7 item.
+  **`action` crosses as its int and is rebuilt on arrival, and getting either half wrong is silent
+  (2A-4 item 6a).** `AVI_ACTION`'s members are pybind values with three properties that each break a
+  plausible implementation: they are **not JSON-serializable**, so putting the member on the header
+  kills every AV frame at `json.dumps`; they are **not ints**; and they do **not compare equal to
+  their own int**, so handing the decoded `0` to `writeImage` matches no branch and drops the frame
+  without an error. The encoder therefore emits `int(action)` and the decoder maps it back through an
+  explicit table (`AVI_ACTION(0)` is unavailable — the class takes no arguments). This shipped broken
+  and unnoticed until 6a, because **no driver had ever sent an AV lane across a boundary** — every
+  shape in `venv_live.py` is text — and **both** lane-table test tiers passed a bare int where the
+  engine passes the member, so the tests encoded the very assumption that was wrong. Even the
+  engine-tier one, which exists precisely to prove a payload survives `json.dumps` against the real
+  types, never handed it a real `AVI_ACTION`. The stub is now pybind-shaped (§8.1).
 - **Bridge nodes get no per-node pipeline transform.** C++ invokes the remote transform by a **hard-coded**
   `py::module::import("nodes.remote.client")` + `.attr("preparePipeline")` (`pipeline_config.cpp`), so it
   is remote-specific — nothing would call a `venv`-side `preparePipeline` even if one existed. venv graph
@@ -542,7 +558,11 @@ the rejected `venvEgress`/`venvIngress` reinvention; it is a sibling of `remote`
   `IGlobal`/`IInstance`.
 - **`services.*.json` follow the minimal `remote_server` template** (no `preconfig`/`shape`/`fields`):
   both bridge nodes are `internal` + synthesized, so there is no editor config form — the partitioner
-  writes their `config` (child URL/token, step 7) directly. And `internal` (BIT 6) hides a node from the
+  writes their `config` (child URL/token, step 7) directly. *That omission carries an obligation the
+  tree only wrote down in 2A-4 item 6a:* a service with no `preconfig` **must not call
+  `Config.getNodeConfig`**, which raises on exactly that combination from inside `beginGlobal` and
+  kills the node at startup. All three venv services files omit the section and no venv node calls the
+  helper — checked, not assumed, and now enforced tree-wide (§8.1). And `internal` (BIT 6) hides a node from the
   **client catalog** but does **not** un-register the provider — the engine keeps it in its ProviderIndex,
   so a synthesized `provider: venv`/`venv_server` still instantiates, exactly as `remote_server` does.
 - **Bridge (de)serialization is per-type, not uniform (reuses the `data_conn` vocabulary, D2).** All
@@ -861,33 +881,45 @@ variant — so the backstop is a narrow safety net, not the primary mechanism.
   scope item 4 deleted it; that member never declared `Pillow`, so the audit's conclusion does not
   move — which is the only reason this line can be corrected without re-running it.)
 
-  **`ocr` was unchanged at 13 files, by design — and reads 10 on the tree as it now stands.**
-  `nodes/ocr/ocr.py` imports every engine unconditionally — the engine is a *runtime* config choice,
-  so each is genuinely statically reachable and the walk is right to keep them. The table above is
-  the measurement of *this* item and stays at 13; the count has moved twice since and neither move
+  **`ocr` was unchanged at 13 files, by design — and there is no single `ocr` walk left to quote.**
+  `nodes/ocr/ocr.py` imported every engine unconditionally — the engine is a *runtime* config choice,
+  so each was genuinely statically reachable and the walk was right to keep them. *(That path is gone:
+  6a moved the file to `nodes/ocr/standard/ocr.py` and the surya import left with it — the four
+  engines of this measurement had already become three when increment 2.5 deleted TrOCR, and are two
+  there now.)*
+  The table above is
+  the measurement of *this* item and stays at 13; the count has moved three times since and no move
   was this item's doing. Increment 2.5 deleted TrOCR and with it `requirements_trocr.txt` (13 → 12);
-  scope item 4 deleted the opencv shim and with it `requirements_{1,2}.txt` (12 → 10). Re-measured
-  against the tree by the same method after the second: `ocr` **10**, `image_cleanup` **5**,
-  `embedding_video` **10** — the three walks the shim was in — with `detect`, `audio_transcribe` and
-  `embedding_image` unmoved at 9, 8 and 9. Same method throughout, so every shift is a deletion and
-  nothing else.
+  scope item 4 deleted the opencv shim and with it `requirements_{1,2}.txt` (12 → 10); **2A-4 item 6a
+  split the node in two**, so the provider `ocr` now reads **9** and the new provider `ocr_surya`
+  reads **7**, mutually exclusive. Re-measured against the tree by the same method after the second
+  move: `ocr` **10**, `image_cleanup` **5**, `embedding_video` **10** — the three walks the shim was
+  in — with `detect`, `audio_transcribe` and `embedding_image` unmoved at 9, 8 and 9. Same method
+  throughout, so every shift is a deletion or a split and nothing else.
   *Take the number off the tree, not off this page.* The measurement is
   `discover_for_providers([provider], nodes/src, packages/ai/src)` from `rocketlib-python/lib/ast_deps.py`
   — stdlib-only, so it runs under bare Python with no engine — and `len(result.requirement_files)` is
   the count. `test_ast_deps.py` is the same call with assertions on it; a walk that has drifted shows
   up there first.
-  The payoff is conditional and measured: a walk seeded at `ai/common/models/ocr/surya.py`, which is
-  what a 2A-4 `nodes.ocr.surya` component would look like, goes from all three engine files to
-  `requirements_surya.txt` alone — **5** files now, 7 before the shim went. That is the precondition
-  2A-4 rests on, pinned by `test_an_ocr_engine_module_scopes_to_its_own_requirements`.
+  The payoff was conditional and is now delivered: a walk seeded at `ai/common/models/ocr/surya.py`
+  goes from all three engine files to `requirements_surya.txt` alone — **5** files, 7 before the shim
+  went — and 2A-4 item 6a turned that seed into a real component, `nodes.ocr.surya`, whose own walk
+  reads **7** (the five plus the tree baseline and `ai/common/avi/`, which its `IInstance` reaches
+  for `rename_ext`). The module-level precondition is pinned by
+  `test_an_ocr_engine_module_scopes_to_its_own_requirements`; the component-level result by
+  `test_the_two_ocr_components_are_mutually_exclusive`.
   It removed one of Surya's two blockers, and scope item 4 has since removed the other: the walk no
   longer keeps `ai/common/opencv/requirements_{1,2}.txt` at `4.13.0.92`, because that shim is
   **deleted outright, not demoted to a re-export** — nothing imported it afterwards. *Do not read
-  that as "and then Surya is unblocked":* on the landed tree `surya-ocr` still backtracks to
-  `0.16.1`, and the cause turned out to be `transformers`, not opencv at all (§4.16). Both blockers
-  are gone and Surya did not move, which is the useful result — it converts "the pin is probably not
-  what holds it" from an argument into a measurement. *No opencv version is quoted here on purpose:*
-  it now depends on whether the resolve is warm or cold, and §4.16 owns that distinction.
+  that as "and then Surya is unblocked":* on the tree those items landed on, `surya-ocr` still
+  backtracked to `0.16.1`, and the cause turned out to be `transformers`, not opencv at all (§4.16).
+  Both blockers were gone and Surya did not move, which is the useful result — it converts "the pin
+  is probably not what holds it" from an argument into a measurement. *One word of that sentence
+  expired with 6a:* the tree now **pins** `surya-ocr==0.16.1` rather than backtracking to it, because
+  a scoped environment has no `transformers` pin to backtrack against and the bare name floated (§7
+  item 6a). Same version everywhere, arrived at by declaration instead of by accident.
+  *No opencv version is quoted here on purpose:* it depends on whether the resolve is warm or cold,
+  and §4.16 owns that distinction.
 
   **The barrels stay; the invariant moved to the nodes.** A family barrel is a public surface with
   an explicit `__all__`, and PEP 562 would not help the walk anyway (see the Option B note above).
@@ -1020,6 +1052,57 @@ variant — so the backstop is a narrow safety net, not the primary mechanism.
   after the change came back green at 2:59, counters identical to the floor. Recorded as an outcome
   rather than left standing as a hazard: an unfired prediction reads as a known danger forever.
 
+  **Four consequences of the rule, all found while splitting one node (2A-4 item 6a) and none
+  specific to it.** They are rules for any future component split, so they live here rather than in
+  §7.
+  - **(a) A component package's root must be requirements-free, or every component inherits it.**
+    `nodes/ocr/surya/` would have inherited `nodes/ocr/requirements.txt` — img2table, and with it
+    the contrib opencv variant — which is exactly the isolation the split exists to buy. Nothing
+    substitutes: a shared `common/` subpackage does not help, because `nodes/ocr/` is its ancestor
+    too, and a sibling top-level node harvests the file again the moment it shares code back.
+    Measured across the whole tree: **7** component-bearing nodes holding **19** components —
+    `agent_crewai` (3), `agent_deepagent` (2), `landing_ai` (2), `ocr` (2), `remote` (2),
+    `tool_google_workspace` (5), `venv` (3). Six of the seven roots carry the file, and **`ocr` is
+    the exception this rule created**: it is the only one whose components must not share a
+    dependency set, so it is the only root that had to give the file up. Read the six as evidence of
+    the default rather than of good practice — none of them has yet needed the isolation.
+  - **(b) An ancestor `__init__.py` is *executed* but never *walked*, so a re-export at the root is a
+    runtime dependency the requirement set does not show.** This is the one failure mode the walk
+    cannot warn about — by construction, since harvest-only is the deliberate trade above. The
+    failure is a startup `ImportError` in every scoped child, on a diff that looks like tidy
+    re-exports. Guarded since 6a by
+    `test_a_component_bearing_node_root_leaks_no_requirements`, which reads "component-bearing" off
+    `services*.json`'s `path` (a three-segment `nodes.<node>.<component>` is exactly the import that
+    executes the root) and asserts no import attracts a requirement file — *not* "zero imports":
+    `remote` and `venv` legitimately carry stdlib and the `depends` loader shim.
+  - **(c) `requirements.txt` placement has a second consumer nobody was tracking:** `contract_checks`
+    derives component identity from it, so moving or deleting one silently moves or deletes contract
+    coverage. Carry the *reason* it stays silent, because that is the generalisable half — the local
+    gate runs only the framework's unit tests (`check-externals:test`), the contract run itself
+    (`check-externals:run`) lives in a PR/nightly workflow whose PR lane is `continue-on-error`, and
+    a lost component makes every report **shorter** rather than redder. Three independent things
+    would each have to change for a coverage loss to turn a lane red. 6a's prerequisite commit
+    taught discovery to recurse; the gap it closed had been open since the install hook went
+    recursive without discovery following.
+  - **(d) The whole trade is only safe because no model module imports a third-party package at
+    module level — and the one that does, `numpy`, is carried by the tree baseline.** This outranks
+    the other three: it is a precondition of the *feature*, not of any split. Python executes
+    `ai/common/models/__init__.py` — the full catalogue, `.transformers` and `.vision` included — on
+    any `ai.common.models.*` import, so every scoped environment runs that chain at startup while
+    deliberately installing almost none of it. Scanned across all 25 files under `ai/common/models`:
+    every **model** import sits inside a method (`import easyocr` at `easyocr.py:96`, the three
+    `surya.*` at `surya.py:81-83`, and so on). *State the exception rather than rounding it off,
+    because the exception is what makes the rule checkable* — module level is **not**
+    stdlib-and-first-party only: `numpy` is eager at `audio/kokoro_loader.py:22` and
+    `transformers/sentence_transformers.py:19`, both squarely on the barrel's path, and it is safe
+    only because `nodes/requirements.txt` declares it for every node environment. Hoist one more
+    import and every scoped child in the feature dies at startup with the walk having said nothing.
+    **No longer unguarded:** 6a adds
+    `test_a_model_module_never_imports_a_third_party_package_at_module_level`, with `numpy`
+    allowlisted and the reason written at the allowlist. Both (b) and (d) traverse import-time
+    statements only — never `ast.walk`, which descends into method bodies and would report the
+    healthy tree as a total failure.
+
   **The price of Option A, concretely.** The abstract claim above — "a 4-node change, not a
   refactor" — has one measured consequence beyond those four files: an outside test that stubs the
   barrel breaks. `develop`'s `nodes/test/ocr/test_reader_to_bytes.py` stubs `ai.common.models` as a
@@ -1122,6 +1205,21 @@ biggest lever venvs pull is *not sharing one constraint resolution*.
   own `constraints.txt`. This is exactly what lets an env with `torch 2.0` and another with `torch 2.1`
   coexist — a shared per-project constraints file would collapse them into one resolution and defeat the
   isolation venvs exist for.
+- **The corollary nobody wrote down until it bit: the global compile is an anchor for every
+  *unpinned* name, and a scoped environment removes it.** "Resolves solely from the requirement
+  files its nodes reach" is the feature; it is also the hazard, because a bare distribution name in
+  a requirement file has whatever upper bound the *rest of the union* happens to impose, and the
+  union is exactly what an overlay does not have. The name then floats to its newest release there
+  and nowhere else, so the environment the split was built for is the only one that gets a version
+  nobody tested. **Measured on the first component split (§7 item 6a):** `requirements_surya.txt`
+  carried a bare `surya-ocr`, held at `0.16.1` in every environment only because `ai/**` resolves
+  beside `transformers==4.53.3`; scoped, it took `0.22.1`, whose API the loader does not target,
+  and a `>=0.16,<0.17` cap then took `0.16.7`, whose looser bounds let `transformers` reach `5.x`
+  and broke it from the other side. Two failures, one cause. *The question every scoping increment
+  now inherits:* for each name this environment newly resolves alone — **what was its upper bound,
+  and was the global compile supplying it?** The cheap answer is an exact pin where the tree already
+  installs exactly one version, which is a *declaration* of the status quo rather than a version
+  move; the expensive answer is the honest range, which is a resolve to measure.
 - **Why `ai` makes this essential:** `ai/**` modules carry their own pins (`torch/requirements.txt` →
   `torch==2.10.0+cu128`, `requirements_detection.txt` → `rfdetr`, …). Under one global compile every pin
   meets every other; per-env, only the pins of the `ai` modules an env's nodes actually reach (via the
@@ -1278,8 +1376,9 @@ starts — is drawn in **§3.1, view 1**.*
   - **Coverage, honestly.** The Windows branch — the one carrying the hard guarantee — is exercised
     by **no CI, ever**: there is no `runs-on: windows-*` in `.github/workflows` and no per-PR
     workflow runs Python tests at all. The POSIX branch is measured on WSL against the shipped
-    module (loaded by path, since `venv_spawn.py` is stdlib-only and `packages/ai` needs the
-    engine); the `packages/ai` suite itself has never run on Linux for this branch. **macOS is
+    module (loaded by path: `venv_spawn.py` lives under `packages/ai` but imports **only stdlib**,
+    so bypassing `ai/__init__.py` — which needs the engine — is what makes it loadable at all);
+    the `packages/ai` suite itself has never run on Linux for this branch. **macOS is
     unexercised by anything.**
 - **Install timing:** lazy on first run + opt-in deploy-time pre-warm; reuse `depends.py`'s existing
   install-progress reporting verbatim (`updateProgress` / heartbeat / sidecar), tagged per env.
@@ -2126,7 +2225,10 @@ name.
 row lists **`surya-ocr` among its requesters at `4.13.0.92`** — a distribution cannot request a
 version it pins away from, so the *resolved* Surya (0.16.1) pins no opencv at all. Only 0.17.1 does.
 OpenCV was therefore never what pushed the backtrack, and removing the pins could not have released
-it. Something else in the union refuses 0.17.
+it. Something else in the union refuses 0.17. *Read off 0.16.1's own metadata since (item 6a needed
+it for a different reason): `opencv-python-headless (>=4.11.0.86,<5.0.0.0)` — a **range**, which is
+what "requests without pinning" means concretely, and the same range that lets the Surya component's
+scoped overlay land on `4.14.0.94` beside a base that resolved the same number.*
 
 **Asked directly, and the answer is `transformers`.** Scope item 4 put `surya-ocr>=0.17` into
 `requirements_surya.txt` *on the shim-free tree* — the order matters, because asking while the shim
@@ -2142,12 +2244,36 @@ at all:
 `requirements_vision.txt` — so uv falls back to the newest Surya whose window admits that pin, which
 is `0.16.1`. **The backtrack was always a `transformers` fact wearing an opencv costume**, and no
 amount of opencv work could have released it. That is why removing four pins moved no version.
+*Since item 6a the global compile no longer has to backtrack to reach that number — `surya-ocr` is
+pinned `==0.16.1` outright — but the pin was added for the scoped side, not this one, and it changes
+nothing here: 0.16.1 is exactly where the fallback landed.*
 
 Two things the same compile printed, both of which price scope item 6. The available releases are
 `0.17.0`, `0.17.1`, `0.20.0`, `0.21.0`, `0.21.1`, `0.21.2`, `0.22.0`, `0.22.1` — the tree is not one
 release behind but seven. And the wall is two-stepped: the honest `surya-ocr>=0.17,<0.18` range costs
 `transformers>=4.56.1`, while anything from `0.21` costs `transformers>=5.12.1`. Item 6 is therefore
 not "move Surya" but "move `transformers`", and its cost depends on which step it stops at.
+
+**Measurement refines that pricing, and the refinement is what split item 6 in two.** The pin binds
+through the **global** compile, not through an OCR environment: the `ocr` walk never reaches
+`requirements_vision.txt` or `requirements_transformers.txt`, which live with eight *other*
+providers (`background_removal`, `caption`, `depth_estimate`, `detect`, `detect_segment`,
+`embedding_image`, `embedding_video` via vision; `ner` via transformers). So a scoped Surya
+component resolves free of the authored pin — that is 6a, and it moved no version. What is not free
+is `ai/**`, globbed into the global compile in both modes, where the honest range is unsatisfiable
+and the engine would refuse to start under `=0`/`auto`. Moving the pin there, across those eight
+providers, is 6b and is what still has to be measured.
+
+**6a's live run measured the scoped half of that, and it prices 6b from both directions.** Left
+unbounded, the Surya component's overlay resolved `surya-ocr==0.22.1` with `transformers==5.15.0` —
+the newest of both, seven releases past what the global compile can reach, installed cleanly. So the
+6b question "can a scoped environment run a modern Surya?" is answered *yes at the resolver*; what
+6b owes is the `ai/**` side, not the OCR side. The same run also priced the other direction: freedom
+from a pin is freedom in both senses, and the unbounded resolve **broke** — 0.22.1 moved the API
+this loader targets, and a `<0.17` cap then let `transformers` float to 5.x and break it from the
+other end. Hence `surya-ocr==0.16.1` today. **The lesson generalises past this file and is recorded
+in §4.9, under the per-env constraints strategy:** the global compile is an anchor for every unpinned
+name, and a scoped environment removes it.
 
 *Recorded here rather than in item 6 because the next person to see `0.16.1` in a resolution will
 come looking for the opencv reason.* And never hand-run `uv pip compile` to re-ask: it does not
@@ -2235,7 +2361,13 @@ reproduce the build's index configuration (an earlier attempt died on an unrelat
   from the store rather than streamed node-to-node. **AV metadata still crosses on the
   `writeVideo`/`writeAudio`/`writeImage` lanes**, so the bridge must still implement every AV lane
   (§4.4 is *not* reducible) — what drops is the per-frame **payload size** (small metadata vs multi-MB
-  buffers), which is what removes the ~1 MB-chunk throughput risk. **Interim** (pre-store): raw AV
+  buffers), which is what removes the ~1 MB-chunk throughput risk.
+  *Status changed with 2A-4 item 6a, in the direction nobody was watching:* an AV lane had never
+  crossed a boundary at all, and when one finally did it turned out the encoder had been shipping an
+  unserializable header the whole time (§4.4). Fixed, and an `image` lane now crosses live (§8.3) —
+  so the lane works and this risk is once again only about **throughput**, which stays unmeasured:
+  the crossing that proved the lane carried a small PNG, not a representative buffer.
+  **Interim** (pre-store): raw AV
   crosses these lanes and must meet a throughput target on the loopback WS bridge (2-hop hub multiplies
   buffer copies), with UI warning on a heavy-lane boundary and shared-memory zero-copy as the v2
   fallback. Store-fetch in the child needs account context (secrets/`ROCKETRIDE_CLIENT_ID` propagation).
@@ -2314,8 +2446,12 @@ That fold happened in increment 2.5 on purpose: the working notes were untracked
 still load-bearing had to reach a tracked file before the increment that needs it.
 2B is closed, so the old "DEFERRED, sequenced after 2B" and "Do 2B first" no longer apply.
 
-Scope, in the order it lands. **Done: 1, 2, 3, 4, 5. Remaining: 6** — keep this line current, because a phase
-entry that says "next" long after the thing shipped is how §7 went stale before.
+Scope, in the order it lands. **Done: 1, 2, 3, 4, 5, 6a. Remaining: 6b** — keep this line current, because a phase
+entry that says "next" long after the thing shipped is how §7 went stale before. Item 6 split in two
+once measurement showed the `transformers` pin binds through the **global** compile rather than
+through an OCR environment: 6a is the component split with no version moved, 6b is the honest range
+and the move it forces. 6a delivers the scoping precondition and is verifiable on its own, so it is
+not held hostage if 6b turns out expensive.
 
 1. **`lib/pkg_families/`** *(landed)* — the registry, environment facts, alignment and the ordered install,
    with `cv2` as its only registered inhabitant. Verified by resolving and installing **identically
@@ -2337,10 +2473,17 @@ entry that says "next" long after the thing shipped is how §7 went stale before
    cannot share one namespace once the shim stops overriding both, and uv reports no conflict
    between them because they are different distributions. `trocr.py` and `requirements_trocr.txt`
    are gone with their `contract-check` markers, both barrels and the `ocr` node lost the engine,
-   and the `ocr` walk reads 12 requirement files instead of 13 (§4.8). `services.json` and the node
-   README's **generated PARAMS block** keep their `trocr` entries until item 6, because that block is
-   generated from the schema and the two cannot be corrected apart; a stale `engine: trocr` is safe,
-   since `OCR_ENGINES.get` returns `None` and the node falls back to EasyOCR. *Item 4 has since
+   and the `ocr` walk went from 13 requirement files to 12 (§4.8). *Read that number as this
+   increment's delta, not as a current figure:* item 4 took it to 10, and after 6a there is no single
+   "`ocr` walk" left to count — there are two, at **9** (standard) and **7** (surya).
+   `services.json` and the node README's **generated PARAMS block** keep their `trocr` entries until
+   item 6, because that block is generated from the schema and the two cannot be corrected apart; a
+   stale `engine: trocr` is safe, since `OCR_ENGINES.get` returns `None` and the node falls back to
+   EasyOCR. **That deferral is discharged:** 6a removed both `trocr` entries from `services.json`, so
+   the generated block sheds them at the next deploy-time regeneration — nothing to hand-edit. The
+   runtime fallback stayed on purpose, and 6a's own removals are the reason it can be stated as a
+   rule rather than an accident: an engine with somewhere to go raises, an engine with nowhere to go
+   falls back. *Item 4 has since
    corrected the README's **hand-written** OpenCV table, which is a different thing and was wrong on
    its own terms:* that table named `craft-text-detector` 0.4.3 and its `opencv-python <4.5.4.62`
    cap — a resolution claim about a distribution 2.5 had already removed from the tree, on a page
@@ -2350,7 +2493,8 @@ entry that says "next" long after the thing shipped is how §7 went stale before
 4. **The opencv ownership move** *(landed)* — the `ai.common.opencv` shim was deleted outright rather
    than demoted to a re-export (nothing imported it afterwards, in this repo or in saas) and its two
    requirement files went with it. Its *real* consumers became a plain `import cv2`; its
-   side-effect-only importers — the three OCR loaders and `nodes/ocr/IGlobal.py`, which imported it
+   side-effect-only importers — the three OCR loaders and `nodes/ocr/IGlobal.py` (item 6a has since
+   moved that file to `nodes/ocr/standard/IGlobal.py`), which imported it
    under `# noqa: F401` purely so its `depends()` ran first — lost the import entirely, because a
    bare `import cv2` has no side effect and the ordering they were buying is now bought by
    `install_batches()` at install time. The two nodes left without any other source of `cv2` —
@@ -2365,7 +2509,9 @@ entry that says "next" long after the thing shipped is how §7 went stale before
    depends on whether the resolve is warm or cold**, which it never did while the shim's pins existed:
    - *Warm* (a local rebuild, which reuses `constraints.txt` as preferences): the tree **stays at
      `4.13.0.92`** while `opencv-contrib-python-headless` leaves the resolution entirely, because
-     `surya-ocr` still backtracks to `0.16.1` and the resolved Surya pins no opencv at all.
+     `surya-ocr` backtracks to `0.16.1` and the resolved Surya pins no opencv at all. *(Item 6a has
+     since made that a declared `==0.16.1` rather than a backtrack, for reasons on the scoped side;
+     the number this measurement turns on is unchanged.)*
    - *Cold* (`--rebuild-cache`, and what every CI runner does — a fresh runner has no cache, PR lane
      included): the members went to **`4.14.0.94`**, and `opencv-contrib-python` alone resolved to
      **`5.0.0.93`** — the family's first real divergence, across a major. Alignment caught it, the
@@ -2376,6 +2522,8 @@ entry that says "next" long after the thing shipped is how §7 went stale before
    §4.16 carries both measurements, the requester table, and the answer to *why* Surya backtracks
    (`transformers`, not opencv). The AST walk shrank with the deletion: `ocr` reads 10 requirement
    files instead of 12, `image_cleanup` 5 instead of 7, `embedding_video` 10 instead of 12 (§4.8).
+   *Same caveat as item 3's number: that 10 is this increment's delta, not a current figure — 6a
+   split the node, so there is no `ocr` walk reading 10 any more, there are two reading 9 and 7.*
    One marker moved too: `requirements_surya.txt` was `contract-check: disable` on the premise that
    its install could never succeed — measured false here, it installs cleanly at `0.16.1` — so it is
    `skip-install` now and **no file in the tree is `disable`d**. Nightly `--install-all` therefore
@@ -2415,7 +2563,93 @@ entry that says "next" long after the thing shipped is how §7 went stale before
    published site regenerates at deploy. **One README, not two** — `anonymize/README.md` lists
    `gliner` alone and needs nothing; checked rather than assumed, since the obvious expectation is
    that the two node files behave alike.
-6. **The OCR node split** (Layout S, granularity M) and the honest `surya-ocr>=0.17,<0.18` range.
+6. **The OCR node split and the honest Surya range** — split into 6a and 6b once measurement showed
+   the two are independent. 6a is below and has landed; 6b is at the end of this entry and is open.
+
+   **6a — the component split** (Layout S, granularity M) *(landed)* — **no version moved**, which is
+   what makes it verifiable on its own. `nodes/ocr/` became a package root holding two components:
+   `standard/` (`ocr://`, EasyOCR + DocTR + img2table tables) and `surya/` (`ocr_surya://`, Surya
+   text only). The protocol behind saved pipelines is unchanged; only `path` moved down a level.
+   Measured, the walks are now **9 and 7** requirement files and mutually exclusive:
+   `requirements_surya.txt` is absent from standard's set, and `requirements_{easyocr,doctr}.txt`
+   and `standard/requirements.txt` (img2table) are absent from surya's.
+   **Two properties of the root carry the whole thing, and both are consequences of §4.8's ancestor
+   rule rather than style.** The root has **no `requirements.txt`** — an ancestor's requirement
+   files are harvested by every descendant, so one there would hand img2table to the Surya child.
+   And its `__init__.py` **imports nothing** — an ancestor's `__init__` is *executed* on
+   `import nodes.ocr.surya` while never being *queued* for the walk, so a re-export there would be a
+   startup dependency the requirement set does not show and the walk cannot warn about. §4.8
+   consequences (a)–(d) generalise both.
+   *That deleted root `requirements.txt` is also why the `contract_checks` discovery fix
+   (`fix(contract-checks): discover nested components`) had to land first:* the framework derived
+   component identity from that exact file at exactly depth 1, so removing it would have deleted the
+   OCR node from contract checking — silently, since a lost component makes every report shorter
+   rather than redder.
+   **One user-visible removal, forced by the split rather than chosen.** `engine: surya` and
+   `table_engine: surya` are gone from the pickers, and with them the `surya` preconfig that set
+   both — Surya text with Surya-recognised table cells in one click. That combination cannot exist
+   once the environments are separated: Surya cells in the table stack mean importing Surya beside
+   img2table. Composition gives Surya text plus DocTR/EasyOCR cells; Surya cells are gone, not
+   relocated. Both values now **raise and name the component** instead of degrading — the table-side
+   check sits in `ModelServerOCR.__init__` rather than its lazy `ocr` property, because three
+   separate layers swallow that property's errors and a deferred raise would mean "text works,
+   tables silently produce nothing".
+   The `trocr` picker entries left in the same commit, discharging increment 2.5's deferral. Its
+   **runtime** fallback to EasyOCR stays: trocr has nowhere to be pointed at, and saved pipelines
+   naming it must keep loading. Surya has a component to name, which is the whole reason the two
+   are treated differently.
+
+   **Live-verified (§8.3), and the run turned three inferences into measurements** — that the two
+   requirement sets are mutually exclusive *in an installed overlay* and not only in the walk; that
+   the surya environment resolves a single `cv2` family member; and which copy of `surya` the child
+   actually imported. A scoped
+   pipeline — standard `ocr` in main, the Surya component in a Virtual Environment container, both
+   fed the same PNG off one webhook — returns two texts from two engines. The child's overlay holds
+   `surya-ocr==0.16.1`, `transformers==4.53.3` and **one** `cv2` family member
+   (`opencv-python-headless` 4.14.0.94, nothing to align, probe green), and holds **no** img2table,
+   easyocr or doctr in either `combined.txt` or `site-packages`. Its `combined.txt` names exactly
+   the seven files the walk predicts plus `nodes/venv/requirements.txt`, which every venv env carries
+   for the bridge.
+   *Origin was read off interpreter-written artifacts rather than a self-report, and it answers the
+   one question a list of absences cannot:* an overlay cannot hide a package base already has (§4.7),
+   and base **does** have `img2table` 2.0.0 installed, so "the child did not crash on img2table"
+   would have proved nothing. Not one `.pyc` under base's copy was touched during the run, while 39
+   were written under the overlay's `surya`. Python writes bytecode beside what it imports, so this
+   says which copy loaded without adding a line of instrumentation to the component.
+
+   **Three defects the static gate could not have found, all fixed in the same pass.**
+   - **A component whose services file declares no `preconfig` must not call
+     `Config.getNodeConfig`** — the helper raises `does not have a preconfig section`, and it raises
+     inside `beginGlobal`, so the node dies at startup. Measured, the tree already pairs the two: 24
+     of 172 services files omit the section and not one of their components calls the helper. It was
+     an unwritten rule; `test_contracts.py` now enforces it tree-wide.
+   - **An unpinned requirement is held in place by the global compile, and a scoped environment
+     removes that anchor.** This generalises past OCR and is the sharpest thing 6a found:
+     `requirements_surya.txt` carried a bare `surya-ocr`, pinned to 0.16.1 only because `ai/**`
+     resolves beside `transformers==4.53.3` in the global compile. The scoped child has no such
+     constraint, so the name floated — first to 0.22.1 (`No module named 'surya.foundation'`, the
+     API moved), then, under a `>=0.16,<0.17` cap, to 0.16.7, whose looser bounds let `transformers`
+     reach 5.15.0 and broke Surya from the other side. `==0.16.1` fixes both with one bound and
+     needs no second: that release declares `transformers >=4.51.2,<4.54.0` itself. **No version
+     moved** — 0.16.1 is what every environment already installed; the accident is now written down.
+     *Every scoping increment inherits this question:* what was this name's upper bound, and was it
+     the global compile supplying it?
+   - **The venv bridge could not carry an AV lane at all** (`fix(venv): send the AV action as an
+     int`, its own commit). `_make_av_encode` put the `AVI_ACTION` member straight into the JSON
+     header, so audio, video and image frames all died on `Object of type AVI_ACTION is not JSON
+     serializable`. Nothing had noticed because no driver had ever sent an AV lane across a
+     boundary and **both** lane-table test tiers passed a bare int where the engine passes the
+     member — the engine tier included, the one whose whole job is proving a payload survives
+     `json.dumps` against the real types. The
+     wire now carries `int(action)` and the decoder maps it back — a raw int cannot be handed to
+     `writeImage`, since node code branches on `action == AVI_ACTION.END`, which no int satisfies.
+     The stub is now pybind-shaped (not an int, not JSON-serializable, not equal to its own
+     int), which is what makes the guard mean anything.
+   **6b — the honest `surya-ocr>=0.17,<0.18` range** and the `transformers` move it forces —
+   **open**. Its gate is a measured resolve across the eight providers that carry
+   `transformers==4.53.3` through `requirements_vision.txt` and `requirements_transformers.txt`
+   (§4.16). The three `# contract-check: ignore` markers on `ai/common/models/ocr/surya.py`'s
+   `surya.*` imports lift here, with the version.
 
 **A new numbered step, because half of it is out of this repository:** *remove TrOCR from the saas
 side, first* — **done, ahead of the deletion here, so no stub was needed.** `rocketride-saas`
@@ -2485,11 +2719,21 @@ entangled and 4 depends on 5.
   all. What it does not deliver: OCR/Surya is **not** on this path — an OCR env pulls every engine
   file into one constraint set regardless of what base holds (four of them then, three since
   increment 2.5 deleted TrOCR). Item 2 has since shipped and did **not** change that either,
-  deliberately: the `ocr` node reaches every engine statically, so the walk is right to keep them.
+  deliberately: the monolithic `ocr` node reached every engine statically, so the walk was right to
+  keep them. **2A-4 item 6a is what changed the premise rather than the walk** — the node is now two
+  components, `standard/` reaches easyocr and doctr and `surya/` reaches surya, so each walk scopes
+  to its own engine because the *imports* stopped overlapping. Measured, 9 files and 7, mutually
+  exclusive.
   What item 2 did deliver is that a *per-engine* component scopes to its own engine, which left
   2A-4 as the remaining step for Surya. Scope item 4 has since landed and Surya did **not** move:
-  both of its blockers are gone and the resolution still holds `surya-ocr` at `0.16.1`, so what
-  remains is item 6 alone, and its subject is a version range rather than a namespace.
+  both of its blockers are gone and the resolution still holds `surya-ocr` at `0.16.1`. 6a has since
+  landed and deliberately moved no version either, so what remains is **6b**, and *that* one's
+  subject is a version range rather than a namespace — 6a's was the namespace.
+  *This entry is also where the ancestor rule's descendants belong, since the under-inclusion is its
+  premise:* §4.8 consequences **(b)** (an ancestor `__init__.py` is executed but never walked, the
+  one failure mode the walk cannot warn about) and **(d)** (that asymmetry is only safe because no
+  model module imports a third-party package at module level) are both direct children of it. 6a is
+  where each first bit, and each now has a static test.
 - **2 — AST within-family over-inclusion is closed, and the deferred *decision* dissolved rather
   than being made.** §4.8 offered Options 1/2 as a choice; measurement showed they are halves of
   one fix — Option 1 alone moves nothing (870 → 870), Option 2 alone never reaches a barrel
@@ -2501,8 +2745,10 @@ entangled and 4 depends on 5.
   handed over (`ai/web/__init__` → `ai.account`) closed on a stronger fact than backstop coverage:
   it is empty in package terms, tree-wide, and pinned by a test. What it deliberately does not
   deliver is `ocr` itself, still at 13 files then — 12 after increment 2.5, 10 after scope item 4 —
-  because the node reaches every engine statically; what it does deliver is that a 2A-4 per-engine
-  component finally scopes to its own engine.
+  because the monolithic node reached every engine statically; what it did deliver is that a
+  per-engine *module* scopes to its own engine, which was the precondition. **2A-4 item 6a collected
+  it:** the node is two components now, 9 files and 7, mutually exclusive — so the thing this item
+  could not deliver was never the walker's to fix, it was the node's shape.
 
 **What is NOT done, stated separately so the group is not read as closed.**
 - **3's other half — `ENV_ID` per test worker.** Deliberately not built: declarative node tests are
@@ -2547,7 +2793,7 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
 5. **Partitioner:** generalize `prepare_pipeline.py` (flatten non-isolated; cut isolated; insert bridge
    nodes; routing table; full-document node set).
    *Increment 1 — **DONE**:* flattening and the structural validations (§4.3), hooked into
-   `task_engine` before `_check_pipeline`, with 19 unit tests. This closes the §5.3 bug on its own:
+   `task_engine` before `_check_pipeline`, with 19 unit tests. This closes the §5-question-3 bug on its own:
    grouped components reach the engine instead of being dropped. It also unblocks the **creation
    entry** deferred from step 4 — a container now executes as an organizational group rather than
    losing its members.
@@ -2762,7 +3008,7 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
    recorded"), so child traces become part of replay with no registration needed — intended, but a
    volume *and* content change to the persisted artifact, not just a wire change. The catch is one
    level down: the v2 codec's keyframe/delta encoding branches on the literal name
-   (`run_log.py:840`, `if event == 'apaevt_flow'`), so `apaevt_venv_trace` skips it and child
+   (`run_log.py:885`, `if event == 'apaevt_flow'`), so `apaevt_venv_trace` skips it and child
    traces are stored **raw where main's are delta-compressed**. At `full` with two children that is
    a real multiplier, softened only by `truncate_event`'s payload cap. Accepted for v1 — the volume
    sits behind an opt-in trace level — and left in 2C rather than fixed here, because the fix is
@@ -2886,8 +3132,10 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
    parent commit it was still alive after 20 s.** That is the orphan class F1 identified, closed and
    measured rather than argued.
    *POSIX measured on WSL against the shipped module.* `e:\tmp\venv-drivers\posix_guard_check.py`
-   loads `venv_spawn.py` **by path** (it is stdlib-only, unlike anything under `packages/ai`, which
-   needs the engine), so Linux exercises the real `ProcessGuard` rather than a re-implementation of
+   loads `venv_spawn.py` **by path** — it sits at `ai/modules/task/venv_spawn.py` yet imports only
+   stdlib (`asyncio`, `ctypes`, `os`, `signal`, …), so loading it by file path skips the
+   `ai/__init__.py` that would demand the engine — so Linux exercises the real `ProcessGuard`
+   rather than a re-implementation of
    what it should do: 8/8 — own process group, `assign` accepted, child dead, **grandchild dead**,
    server-group process refused, server pgid never recorded, the script itself alive. *Rake found
    there:* a killed direct child stays a **zombie** until reaped, and `os.kill(pid, 0)` succeeds for
@@ -3094,6 +3342,23 @@ Three layers; each test is tagged with the phase that first makes it runnable (*
   file when `--node_path` nests inside the exe dir. One more pins the trade the rule rests on: the
   `ai.common.models` barrel needs nothing beyond the baseline at **import** time (`numpy`, `wave`,
   `rocketride`) — if that stops holding, harvest-only has become an under-inclusion.
+  **Two tree-wide invariants added by 2A-4 item 6a, one per consequence the ancestor rule leaves
+  unguarded (§4.8 (b) and (d)).** `test_a_model_module_never_imports_a_third_party_package_at_module_level`
+  parses every file under `ai/common/models` and allows stdlib, first-party and exactly one
+  third-party name, `numpy`, with the reason written at the allowlist;
+  `test_a_component_bearing_node_root_leaks_no_requirements` reads "component-bearing" off
+  `services*.json`'s `path` — a three-segment `nodes.<node>.<component>` is exactly the import that
+  executes the root — and asserts no import there attracts a requirement file, with `depends`
+  allowlisted. **Both traverse import-time statements only, never `ast.walk`**, and for *different*
+  reasons that must both be written down or the next reader copies the warning without the logic:
+  in the first, lazy imports are the desired state and `ast.walk` would descend into method bodies
+  and condemn the healthy tree; in the second, the trap is specifically *startup* execution, which a
+  function-level import is not. Both were checked by feeding them the thing they forbid — the
+  allowlists are the part that rots. A third, `test_the_two_ocr_components_are_mutually_exclusive`,
+  asserts the split's end result in **both** directions and never as a subset, on discriminators
+  whose provenance is clean: `ai/common/avi/requirements.txt` is legitimately in *both* sets (the
+  shared `writeDocuments` calls `rename_ext`), and an earlier draft used its absence from surya as
+  the discriminator, which would have failed against a correct implementation.
 - **Shared-namespace package families (§4.16)** — two files, and the split between them is the
   stdlib-only rule made visible. `test_pkg_families.py` runs under **bare `pytest`**, no engine: the
   alignment minimum over *every* member that appeared (including the case a "matching members only"
@@ -3153,6 +3418,28 @@ Three layers; each test is tagged with the phase that first makes it runnable (*
   base untouched, idempotent for the same env) and lands behind an injected `ROCKETRIDE_MOCK` shim;
   one argv builder serves base and overlay (base = overlay minus `--target`); `-r` includes are
   absolutized without backslashes, reach the drift hash, and a missing target is refused by name.
+- **Bridge lane table** (`nodes/venv/base/lanes.py`) — two tiers, split by what a stub can prove.
+  `test_venv_lanes.py` runs **bare**, under shallow `sys.modules` stubs: the table's keys match
+  `binder.hpp::MethodNames` minus framing, so a new engine lane fails loudly instead of leaving a
+  silent gap; `words` raises `LaneNotBridgeable` on both encode and decode; and per-lane
+  encode→decode reaches the right `instance.write*`. `test_venv_lanes_engine.py` runs **under the
+  engine** against the real `rocketlib`/`ai` types, which is the only tier that can prove a payload
+  survives `json.dumps` and decode rebuilds the real type — it is what caught the `IJson` extraction
+  and the pydantic `model_dump` enum. **The AV rows are the cautionary case (§4.4, 2A-4 item 6a):**
+  both tiers passed a bare `int` where the engine passes an `AVI_ACTION` member, so the header the
+  bridge actually ships was never serialized in a test and every audio/video/image frame died at the
+  boundary in production. The stub is now pybind-shaped — not an int, not JSON-serializable, not
+  equal to its own int — and the engine tier asserts the header survives `json.dumps` *and* that the
+  decoded argument arrives as the member, since node code branches on `action == AVI_ACTION.END`.
+  An unknown action on the wire is refused by name rather than passed through. [2B]
+- **Services-versus-code invariants** (`nodes/test/test_contracts.py`) — parametrised over every
+  python service in the tree. Added by 2A-4 item 6a: **a services file that declares no `preconfig`
+  must not call `Config.getNodeConfig`**, because that helper raises
+  `does not have a preconfig section` from inside `beginGlobal` and kills the node at startup. The
+  tree already paired the two — 24 of 172 files omit the section, and not one of their components
+  calls the helper — but nothing enforced it, and a component split is exactly where the pair comes
+  apart. Detected by **parsing** rather than grepping: the first version blamed the comment
+  explaining why the call is absent. [2B]
 - **Compatibility switch** — `ROCKETRIDE_SERVER_USE_VENV` unset(auto) / `0`(force-off, isolated group
   demoted to a plain group, global-glob) / `1`(force-on). [2A scoping paths; 2B demotion path]
 - **Model-server pruning** — a proxied node contributes only wrapper/networking deps, not `ai/**` heavy
@@ -3185,7 +3472,7 @@ and the conflict is isolated to the venv-scoping mechanism — fast, determinist
 **Home: `local_nodes` under `--node_path=` (2A-R item 4, DONE).** The directory is named
 `local_nodes` because that is the fixed name the engine scans: `--node_path=<dir>` puts `<dir>` on
 `sys.path` and registers `<dir>/local_nodes/**` as providers imported `local_nodes.<node>`
-(`python/init.cpp:160`, `services.cpp:1988`, user-facing in `docs/README-nodes.md`). §7 demanded a
+(`python/init.cpp:160`, `services.cpp:2002`, user-facing in `docs/README-nodes.md`). §7 demanded a
 home satisfying **both roles** — pins visible to dependency resolution *and* providers registered.
 This satisfies both while **splitting the first role away from the startup glob**, and that split is
 the point rather than a dodge: the startup compile is installation-wide behind one base hash
@@ -3282,9 +3569,13 @@ measured).
   worked. Measured: `pytest nodes/test` collected **2835** with the old name and **2903** after
   renaming to `nodes/test/venv_runtime/` — exactly the 68 files' worth of tests, of which 67
   predate 2A-R and had never once run inside `builder nodes:test`. The repository already knew
-  this name was a trap in the *other* tool — `.gitignore` carries an explicit
-  `!nodes/test/venv/` un-ignore because `venv/` is ignored there too — so the same collision was
-  sitting in two toolchains and had been noticed in only one. Renaming was preferred over
+  this name was a trap in the *other* tool — `.gitignore` ignores `venv/` and carried an explicit
+  `!nodes/test/venv/` un-ignore to get the directory tracked at all — so the same collision was
+  sitting in two toolchains and had been noticed in only one. *That un-ignore is gone with the
+  rename, which is correct and would otherwise read as this paragraph going stale:* what stands in
+  its place is a comment in `.gitignore` recording why the test directory is deliberately **not**
+  called `venv` and pointing at `venv_runtime/`, so the knowledge outlived the line that carried
+  it. Renaming was preferred over
   overriding `norecursedirs`: dropping `venv` from that list globally would make pytest descend
   into a developer's real virtualenv, and `.gitignore` shows they do create them.
 
@@ -3376,7 +3667,22 @@ measured).
   §8.2 chose `tabulate` because nothing in the SDK or engine runtime uses it, so even a leaked
   leftover is an unused pure-Python package at a version nothing pins. [2A → done]
 - **Lifecycle.** Purge, delete-with-nodes, and pipeline-delete reclaim the right `venvs/...` dirs and are
-  **blocked while a run is active**. Image lanes cross a venv boundary (all-lane bridge). [2B]
+  **blocked while a run is active** (8.6, live end to end). [2B]
+- **An image lane crosses a venv boundary — VERIFIED live (2A-4 item 6a), and it was the first time
+  any AV lane ever did.** `webhook → { ocr (main), [venv: ocr_surya] } → response`, one PNG, two
+  engines, two texts. The point was the two environments, and what it incidentally proved is that
+  the all-lane bridge's AV rows had never been exercised: they did not work at all until this run
+  (§4.4). Artifacts rather than a green run: the child's overlay holds `surya-ocr==0.16.1`,
+  `transformers==4.53.3` and **one** `cv2` family member (`opencv-python-headless` 4.14.0.94 —
+  nothing to align, probe green, no `ximgproc` to assert), and holds **no** img2table, easyocr or
+  doctr in either `combined.txt` or `site-packages`; its `combined.txt` names exactly the seven
+  files the walk predicts plus `nodes/venv/requirements.txt`, the bridge every venv env carries.
+  *Origin was read off interpreter-written bytecode, which needed no instrumentation in the
+  component and answers the one question a list of absences cannot:* an overlay cannot hide a
+  package base already has (§4.7), and base **does** hold `img2table` 2.0.0 — so "the child did not
+  crash" would have proved nothing. Not one `.pyc` under base's copy was touched during the run,
+  while 39 were written under the overlay's `surya`. Python writes bytecode beside what it imports.
+  [2B]
 - **Partitioner — VERIFIED on a live engine, not just in unit tests.** A container document driven
   through the SDK (`client.use` + `pipe`, the harness path) produced a task file whose top-level
   components were `[dropper_1, parse_1, response_1, response_outside]` with both containers gone —
@@ -3427,6 +3733,12 @@ measured).
   class list, and an explicit `VenvCommands.__init__` call — omit the third and the class still
   imports and still constructs, the handler map is simply never built, and the first command dies on
   `AttributeError` at connection time, far from the cause.
+- `nodes/src/nodes/venv/base/lanes.py` — the one lane table (§4.4). Dependency-free on purpose, which
+  is what lets a venv-`torch` image pass through main without main having `torch` (§4.6). Two rules
+  live here and both are silent when broken: `words` is an explicit not-bridgeable entry rather than
+  an omission, and an AV `action` crosses as `int(action)` and is mapped back to the `AVI_ACTION`
+  member on arrival — a member on the header is not JSON-serializable, and a bare int downstream
+  matches no branch.
 - `packages/ai/src/ai/modules/task/pipeline.py` — `resolve_implied_source` (source-in-venv guard).
 - `packages/ai/src/ai/modules/data/data_conn.py` — canonical lane serialization to reuse in the bridge.
 - **Testing:** `nodes/test/framework/pipeline.py` (declarative node tests are mini-pipelines → run
@@ -3435,9 +3747,10 @@ measured).
   reached via `--node_path=`, never staged); `nodes/test/venv_runtime/test_venv_conflict_e2e.py` (the §8.3
   acceptance, automated in `nodes:test`). **Implemented (2A increment 1):** `.../rocketlib-python/lib/ast_deps.py` (provider→module
   resolution + transitive AST walk) with `test_ast_deps.py` — the §4.8 prototype is now a passing unit
-  test. *It was 13 cases at increment 1 and is **38** as of 2026-08-08, having absorbed the
-  ancestor-package rule and the self-describing-directory rule; treat any number here as a snapshot
-  and read the live one off the suite, per §6.*
+  test. *It was 13 cases at increment 1 and is **41** as of 2026-08-10, having absorbed the
+  ancestor-package rule, the self-describing-directory rule and 6a's two tree-wide invariants plus
+  the OCR mutual-exclusion case; treat any number here as a snapshot and read the live one off the
+  suite, per §6.*
 - `packages/server/engine-lib/rocketlib-python/lib/depends.py` — `ensure_constraints` /
   `_find_requirement_files` / `_get_combined_path` / `_get_constraints_path` / `_get_site_packages` /
   `model_cache_dir` / `FileLock`; the AST **walk** (over the entry-module paths the partitioner

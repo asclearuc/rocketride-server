@@ -10,9 +10,11 @@ Tests needing the real node/ai source tree are skipped when it is not reachable.
 from __future__ import annotations
 
 import ast
+import glob
 import json
 import os
 import re
+import sys
 
 import pytest
 
@@ -340,8 +342,10 @@ def test_a_self_describing_directory_yields_only_declared_files(tmp_path):
 def test_an_ocr_engine_module_scopes_to_its_own_requirements():
     """The precondition 2A-4 rests on, and the reason this item is not cosmetic.
 
-    A 2A-4 Surya component would seed its walk here, and without this scoping it would drag in
+    The 2A-4 Surya component seeds its walk here, and without this scoping it would drag in
     every engine's requirements — splitting the node buys nothing until the walk stops doing that.
+    The component's own end-to-end assertion is
+    `test_the_two_ocr_components_are_mutually_exclusive` below; this one pins the module beneath it.
 
     Deliberately *not* a claim about why surya-ocr resolves to 0.16.1. It used to say the walk's
     over-inclusion held opencv at 4.13 and backtracked surya from there; the opencv half of that
@@ -393,6 +397,207 @@ def test_a_node_imports_a_model_module_never_a_model_package():
         + '. Importing a package runs its __init__, which re-exports every module beneath it, and '
         'each of those declares its own requirements into this node environment. Import the '
         'specific submodule instead.'
+    )
+
+
+def _import_time_imports(tree):
+    """Yield only the Import/ImportFrom nodes Python executes on import.
+
+    Deliberately NOT `ast.walk`, and the two callers below want it for different reasons.
+    `test_a_model_module_...` wants it because lazy imports are the *desired* state there:
+    `ast.walk` descends into method bodies and would report the healthy tree as a total failure.
+    `test_a_component_bearing_node_root_...` wants it because the trap it guards is specifically
+    *startup* execution of an ancestor `__init__`, and an import that only runs when a function is
+    called is not that. Measured, no component-bearing root has a function-level import today, so
+    both traversals agree right now — which is exactly why the choice has to be written down.
+
+    `If`/`Try`/`ClassDef` bodies run on import; `FunctionDef`/`AsyncFunctionDef` bodies do not.
+    """
+
+    def walk(body):
+        for node in body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                yield node
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            elif isinstance(node, ast.If):
+                yield from walk(node.body)
+                yield from walk(node.orelse)
+            elif isinstance(node, ast.Try):
+                yield from walk(node.body)
+                yield from walk(node.orelse)
+                yield from walk(node.finalbody)
+                for handler in node.handlers:
+                    yield from walk(handler.body)
+            elif isinstance(node, ast.ClassDef):
+                yield from walk(node.body)
+
+    return walk(tree.body)
+
+
+def _parse(path):
+    try:
+        return ast.parse(open(path, encoding='utf-8').read())
+    except (OSError, SyntaxError, ValueError):
+        return None
+
+
+@_needs_tree
+def test_the_two_ocr_components_are_mutually_exclusive():
+    """The end-to-end statement of what the 2A-4 item 6a split bought.
+
+    Asserted per component in BOTH directions and never as a subset: a subset assertion keeps
+    passing when a rule stops finding things, and the ancestor rule (§4.8) is exactly such a rule —
+    a `requirements.txt` left at `nodes/ocr/` would put img2table back into the surya environment
+    with nothing else in the tree noticing.
+
+    Discriminators are provenance-clean on purpose. `requirements_avi.txt`'s parent IS in both sets
+    and is not a defect: `IInstance.writeDocuments` calls `rename_ext`, core text behaviour both
+    components keep. An earlier draft used avi's absence as the surya discriminator and would have
+    failed against a correct implementation.
+    """
+    standard = {os.path.basename(p) for p in A.discover_for_providers(['ocr'], _NODES_SRC, _AI_SRC).requirement_files}
+    surya = {
+        os.path.basename(p) for p in A.discover_for_providers(['ocr_surya'], _NODES_SRC, _AI_SRC).requirement_files
+    }
+
+    # img2table's declarer is the standard component's own requirements.txt, so basenames alone
+    # cannot tell it from the tree baseline; check the full path for that one.
+    standard_paths = _rel(A.discover_for_providers(['ocr'], _NODES_SRC, _AI_SRC))
+    surya_paths = _rel(A.discover_for_providers(['ocr_surya'], _NODES_SRC, _AI_SRC))
+
+    assert 'requirements_surya.txt' not in standard
+    assert 'nodes/src/nodes/ocr/standard/requirements.txt' in standard_paths
+
+    assert 'requirements_surya.txt' in surya
+    assert not surya & {'requirements_easyocr.txt', 'requirements_doctr.txt'}
+    assert 'nodes/src/nodes/ocr/standard/requirements.txt' not in surya_paths
+
+    # The ancestor rule's own trace: the requirements-free package root contributes nothing, while
+    # the tree baseline still reaches both.
+    assert 'nodes/src/nodes/ocr/requirements.txt' not in standard_paths | surya_paths
+    assert 'nodes/src/nodes/requirements.txt' in standard_paths & surya_paths
+
+
+# `numpy` is the ONE third-party name the model catalogue may import eagerly. It is safe by
+# declaration, not by luck: `nodes/requirements.txt` — the tree baseline every node inherits by the
+# ancestor rule — lists it, so it is in every node environment including the scoped ones. If that
+# stops being true this comment is where the next reader looks.
+_EAGER_THIRD_PARTY_ALLOWED = {'numpy'}
+
+_FIRST_PARTY_TOPS = {'ai', 'rocketlib', 'rocketride'}
+
+
+@_needs_tree
+def test_a_model_module_never_imports_a_third_party_package_at_module_level():
+    """A standing precondition of the whole venv feature, not of any one split.
+
+    `ast_deps` harvests an ancestor package's requirement files but deliberately never QUEUES its
+    `__init__.py` (see the comment at the ancestor rule). Python executes them anyway: any
+    `import ai.common.models.ocr.<engine>` runs `ai/common/models/__init__.py`, which imports the
+    entire catalogue — `.transformers` and `.vision` included — in every scoped child, while those
+    families are deliberately not installed there.
+
+    That survives only because every MODEL import sits inside a method. Hoist one and every scoped
+    environment in the feature dies at startup with an ImportError, and the walk cannot warn,
+    because these barrels' requirements are harvested and never queued.
+    """
+    offenders = []
+    for dirpath, _dirs, files in os.walk(os.path.join(_AI_SRC, 'ai', 'common', 'models')):
+        if '__pycache__' in dirpath:
+            continue
+        for name in sorted(f for f in files if f.endswith('.py')):
+            path = os.path.join(dirpath, name)
+            tree = _parse(path)
+            if tree is None:
+                continue
+            for node in _import_time_imports(tree):
+                for mod in A._import_targets(node, path, {'nodes': _NODES_SRC, 'ai': _AI_SRC}):
+                    top = mod.split('.')[0]
+                    if top in sys.stdlib_module_names or top in _FIRST_PARTY_TOPS:
+                        continue
+                    if top in _EAGER_THIRD_PARTY_ALLOWED:
+                        continue
+                    rel = os.path.relpath(path, _REPO).replace(os.sep, '/')
+                    offenders.append(f'{rel} imports {mod}')
+    assert not offenders, (
+        'these model modules import a third-party package AT MODULE LEVEL: '
+        + '; '.join(offenders)
+        + '. Every scoped environment executes the whole ai.common.models barrel at startup while '
+        'installing only its own family, so this is a startup ImportError in every venv child — '
+        'and the walk cannot warn, because ancestor barrels are harvested, never queued. Move the '
+        'import inside the method that needs it.'
+    )
+
+
+# `depends` is the engine's loader shim: no requirement file stands behind it, so it attracts
+# nothing into an environment. Named explicitly rather than pattern-matched, so a genuinely
+# third-party import — which resolves to nothing under the tree roots in exactly the same way —
+# is still caught.
+_ROOT_INIT_ALLOWED_TOPS = {'depends'}
+
+
+@_needs_tree
+def test_a_component_bearing_node_root_leaks_no_requirements():
+    """The executed-but-never-walked trap, on the node side.
+
+    A node root whose components live in subpackages is an ANCESTOR of each of them: the walk
+    harvests its requirement files but never queues its `__init__.py`, while Python executes that
+    file on every `import nodes.<node>.<component>`. A single re-export there drags the sibling
+    component's whole dependency set into a scoped child at startup, with no warning anywhere.
+
+    Scoped to "no import that attracts a requirement file" rather than "zero imports": measured,
+    four of the seven such roots import nothing, but `remote` and `venv` both carry stdlib and the
+    loader shim, and the blunt version would fail on two nodes doing nothing wrong.
+
+    "Component-bearing" is read off `services*.json`'s `path`, not off the directory listing: a
+    three-segment `nodes.<node>.<component>` is exactly the import the engine performs, and
+    therefore exactly when the root `__init__` is executed on the way past. The directory heuristic
+    is wrong in a way that matters — `tool_pipedrive` has a `tools/` subpackage and re-exports
+    `IGlobal`/`IInstance` at its root, which is correct for a monolithic node with nothing below it
+    to isolate.
+    """
+    roots = {'nodes': _NODES_SRC, 'ai': _AI_SRC}
+    nodes_dir = os.path.join(_NODES_SRC, 'nodes')
+    offenders = []
+    checked = []
+    for node in sorted(os.listdir(nodes_dir)):
+        node_dir = os.path.join(nodes_dir, node)
+        if not os.path.isdir(node_dir) or node.startswith(('.', '__')):
+            continue
+        components = set()
+        for services in sorted(glob.glob(os.path.join(node_dir, 'services*.json'))):
+            try:
+                data = json.loads(A.strip_jsonc(open(services, encoding='utf-8').read()))
+            except (OSError, ValueError):
+                continue
+            parts = (data.get('path') or '').split('.')
+            if len(parts) >= 3:
+                components.add(parts[2])
+        init = os.path.join(node_dir, '__init__.py')
+        if not components or not os.path.isfile(init):
+            continue
+        checked.append(node)
+        tree = _parse(init)
+        if tree is None:
+            continue
+        for imp in _import_time_imports(tree):
+            for mod in A._import_targets(imp, init, roots):
+                top = mod.split('.')[0]
+                if top in sys.stdlib_module_names or top in _ROOT_INIT_ALLOWED_TOPS:
+                    continue
+                offenders.append(f'nodes/{node}/__init__.py imports {mod}')
+
+    # `ocr` is the seventh and the one this rule was written for; an empty list would mean the
+    # services scan stopped matching rather than that the tree got clean.
+    assert 'ocr' in checked, f'the OCR split is not being checked; found only {checked}'
+    assert not offenders, (
+        'these component-bearing node roots import something that attracts a requirement file: '
+        + '; '.join(offenders)
+        + '. Python executes the root __init__ on every `import nodes.<node>.<component>`, so this '
+        'is a startup dependency of EVERY component under it — including the ones whose whole '
+        "purpose is not to have it. The walk cannot warn: an ancestor package's requirements are "
+        'harvested, its __init__ is never queued. Keep these roots import-free.'
     )
 
 

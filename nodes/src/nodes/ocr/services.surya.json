@@ -1,0 +1,98 @@
+{
+	//
+	// Required:
+	// 		The display title of the service
+	//
+	"title": "OCR Surya",
+	//
+	// Required:
+	//		The protocol prefix used in pipeline documents. Note the `://`
+	//		suffix - it is part of the value tree-wide.
+	//
+	"protocol": "ocr_surya://",
+	//
+	// Required:
+	//		Categorisation tags. Drives the docs-site category and the canvas
+	//		grouping; the same as the standard component, since both consume
+	//		images.
+	//
+	"classType": ["image"],
+	//
+	// Optional:
+	//		Capability flags. Chosen rather than inherited: Surya runs on the
+	//		same torch baseline as the engines it left behind.
+	//
+	"capabilities": ["gpu"],
+	//
+	// Required:
+	//		How the node registers itself in the pipeline
+	//
+	"register": "filter",
+	//
+	// Required:
+	//		The node implementation language
+	//
+	"node": "python",
+	//
+	// Required:
+	//		Module path the engine loads this component by. Three segments:
+	//		the component lives inside the `ocr` package, beside `standard`.
+	//
+	"path": "nodes.ocr.surya",
+	//
+	// Required:
+	//		URL prefix used for default URL mapping. Deliberately the same
+	//		`ocr` as the standard component - it is a family label, not the
+	//		protocol stem, and sharing it keeps the two providers grouped.
+	//		Written out rather than omitted: nothing is inherited between
+	//		sibling services files.
+	//
+	"prefix": "ocr",
+	//
+	// Required:
+	//		Description shown in listings. A list of strings, not a string.
+	//
+	"description": [
+		"A component that extracts machine-readable text from images and scanned documents using the Surya OCR engine. ",
+		"Surya 0.17+ recognition is multilingual and auto-detecting, so there is no language or script-family setting to choose. ",
+		"Text only: this component has no table stack. To also extract tables, place it beside the standard OCR node, ",
+		"which keeps EasyOCR/DocTR text and img2table table detection. ",
+		"Intended to run inside a Virtual Environment container so its dependencies stay out of the shared runtime."
+	],
+	//
+	// Optional:
+	//		Icon shown on the canvas. Shared with the standard component,
+	//		which is precedented (landing_ai shares one across both its files).
+	//
+	"icon": "ocr.svg",
+	//
+	// Optional:
+	//		Documentation link
+	//
+	"documentation": "https://docs.rocketride.org",
+	//
+	// Required:
+	//		Lane mapping. The `image` lane produces text ONLY - no `table`.
+	//		This is where "no tables" becomes a declared fact rather than a
+	//		Python one, and it must agree with IInstance, which has no
+	//		extract_tables_from_image and no calls to it.
+	//
+	"lanes": {
+		"documents": ["text"],
+		"image": ["text"]
+	},
+	//
+	// Required:
+	//		Present and EMPTY, deliberately. The docs generator skips any
+	//		services file with no `fields` key at all
+	//		(gen-node-tables.mjs: `if (!data || !data.fields) continue;`),
+	//		which would drop this component's whole Schema section. With an
+	//		empty object the file is processed and the generator emits its own
+	//		"No configuration fields." line.
+	//
+	//		Empty because every field on the standard node is an engine
+	//		picker, an engine-specific option or a table setting - none of
+	//		which this single-engine, table-free component reads.
+	//
+	"fields": {}
+}

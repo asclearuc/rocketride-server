@@ -37,7 +37,7 @@
 	//		The path is the executable/script code - it is node dependent
 	// 		and is optional for most node
 	//
-	"path": "nodes.ocr",
+	"path": "nodes.ocr.standard",
 	//
 	// Required:
 	//		The prefix map when added/removed when convertting URLs <=> paths
@@ -137,18 +137,6 @@
 				"engine": "doctr",
 				"script_family": "latin",
 				"table_engine": "doctr"
-			},
-			"surya": {
-				"title": "Surya (Multi-language)",
-				"engine": "surya",
-				"script_family": "latin",
-				"table_engine": "surya"
-			},
-			"trocr": {
-				"title": "TrOCR (Transformer)",
-				"engine": "trocr",
-				"script_family": "latin",
-				"table_engine": "doctr"
 			}
 		}
 	},
@@ -161,13 +149,11 @@
 		"ocr.engine": {
 			"type": "string",
 			"title": "OCR Engine",
-			"description": "Select the OCR engine for text extraction. EasyOCR supports many languages with script families. DocTR is language-agnostic and good for documents. Surya supports multi-language. TrOCR uses transformer models.",
+			"description": "Select the OCR engine for text extraction. EasyOCR supports many languages with script families. DocTR is language-agnostic and good for documents. Surya moved to its own component (ocr_surya://).",
 			"default": "easyocr",
 			"enum": [
 				["easyocr", "EasyOCR (Multi-language)"],
-				["doctr", "DocTR (Document-focused)"],
-				["surya", "Surya (Multi-language)"],
-				["trocr", "TrOCR (Transformer)"]
+				["doctr", "DocTR (Document-focused)"]
 			]
 		},
 		"ocr.script_family": {
@@ -208,12 +194,11 @@
 		"ocr.table_engine": {
 			"type": "string",
 			"title": "Table OCR Engine",
-			"description": "Select the OCR engine used for table text extraction. DocTR is optimized for document tables. EasyOCR and Surya are general-purpose alternatives.",
+			"description": "Select the OCR engine used for table text extraction. DocTR is optimized for document tables. EasyOCR is a general-purpose alternative.",
 			"default": "doctr",
 			"enum": [
 				["doctr", "DocTR (Document-focused)"],
-				["easyocr", "EasyOCR"],
-				["surya", "Surya"]
+				["easyocr", "EasyOCR"]
 			]
 		},
 		"ocr.easyocr_options": {

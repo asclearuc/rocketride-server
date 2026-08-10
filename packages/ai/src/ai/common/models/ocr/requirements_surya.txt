@@ -1,6 +1,22 @@
-# contract-check: skip-install  reason: opt-in OCR engine on top of the project's torch baseline. PR lane skips; nightly --install-all installs and verifies. Was `disable` on the premise that the install could never succeed; measured false — it installs cleanly at surya-ocr 0.16.1. The engine resolves 0.16.1, not the 0.17 this loader targets, and the cause is transformers, not opencv: surya-ocr>=0.17 needs transformers>=4.56.1 (>=0.21 needs 5.12.1) against the tree's pinned transformers==4.53.3. The honest >=0.17,<0.18 range is scope item 6 and costs a transformers move. The `# contract-check: ignore` markers on the surya.* imports in surya.py were paired with `disable` and stay for now — revisiting them belongs to item 6, which moves the version they are written against.
+# contract-check: skip-install  reason: opt-in OCR engine on top of the project's torch baseline. PR lane skips; nightly --install-all installs and verifies. Was `disable` on the premise that the install could never succeed; measured false — it installs cleanly at surya-ocr 0.16.1. The honest >=0.17,<0.18 range is scope item 6b and costs a transformers move: surya-ocr>=0.17 needs transformers>=4.56.1 (>=0.21 needs 5.12.1) against the tree's pinned transformers==4.53.3. The `# contract-check: ignore` markers on the surya.* imports in surya.py were paired with `disable` and stay for now — revisiting them belongs to 6b, which moves the version they are written against.
 # Requirements for Surya OCR loader
 # Direct imports only
 
-surya-ocr
+# The pin is load-bearing, and item 6a is what made it so. Until then this line was a bare
+# name held at 0.16.1 by accident: `ai/**` is globbed into the GLOBAL compile beside
+# transformers==4.53.3, and nothing above 0.16.1 admits that pin. 6a gave the Surya component
+# a scoped environment, which never sees it — so in that environment the bare name floated,
+# and it took two measured failures to find the bottom:
+#   - unbounded resolved 0.22.1 -> `No module named 'surya.foundation'`. 0.16.1 ships
+#     surya.foundation / .recognition / .detection, the three this loader imports; 0.22.1
+#     replaced foundation with `inference`.
+#   - `>=0.16,<0.17` resolved 0.16.7 -> transformers floated to 5.15.0 and Surya died on
+#     `'SuryaDecoderConfig' object has no attribute 'pad_token_id'`. The patch releases above
+#     0.16.1 dropped their transformers upper bound.
+# `==0.16.1` fixes both with one bound and adds no second one: that release declares
+# `transformers >=4.51.2,<4.54.0` itself, so upstream metadata does the pinning. It is also
+# exactly the version every environment already installs, which is what keeps 6a's "no
+# version moved" true — the accident is now written down, not changed. Lifting it to the
+# honest >=0.17,<0.18 is 6b, gated on the transformers move.
+surya-ocr==0.16.1
 Pillow

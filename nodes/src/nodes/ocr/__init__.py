@@ -21,22 +21,27 @@
 # SOFTWARE.
 # =============================================================================
 
-from .IGlobal import IGlobal
-from .IInstance import IInstance
+"""
+OCR node package for RocketRide Engine.
 
+This package no longer directly exports `IInstance` / `IGlobal` — each OCR
+component lives in its own sub-package and the engine loads it via the `path`
+field in the matching services file:
 
-# Allow direct access to the underlying reader
-def getReader():
-    """
-    Get the reader class for the OCR.
-    """
-    from .ocr import Reader
+- `nodes.ocr.standard` — `ocr` (EasyOCR + DocTR text, img2table tables)
+- `nodes.ocr.surya`    — `ocr_surya` (Surya text only, scoped environment)
 
-    return Reader
+**This file must import nothing, and that is load-bearing rather than tidy.**
+The AST walker harvests an ancestor package's requirement files but
+deliberately does not queue its `__init__.py`, while Python still *executes*
+it on `import nodes.ocr.surya`. A re-export here would therefore pull the
+standard component — and `img2table` with it — into the Surya component's
+scoped environment at startup, and the walk would not have warned, because an
+ancestor's requirements are never collected.
 
+There is no `requirements.txt` beside this file for the same reason: an
+ancestor's requirements *are* harvested, so one here would be inherited by
+both components and undo the isolation the split exists to buy.
+"""
 
-__all__ = [
-    'IGlobal',
-    'IInstance',
-    'getReader',
-]
+__all__: list[str] = []

@@ -140,7 +140,7 @@ def _scoped_stubs() -> Iterator[None]:
 # Load IGlobal.py under the scoped stubs
 # ---------------------------------------------------------------------------
 
-_iglobal_path = Path(__file__).parent.parent.parent / 'src' / 'nodes' / 'ocr' / 'IGlobal.py'
+_iglobal_path = Path(__file__).parent.parent.parent / 'src' / 'nodes' / 'ocr' / 'standard' / 'IGlobal.py'
 
 with _scoped_stubs():
     # ``importorskip`` honours the scoped numpy/cv2 cleanup — if img2table
@@ -426,3 +426,56 @@ def test_text_only_result_is_not_broken_by_the_diagnostic(adapter, monkeypatch) 
     assert captured == [], 'diagnostic raised and discarded a usable result'
     assert len(pages) == 1
     assert pages[0][0][1] == 'hello'
+
+
+# ---------------------------------------------------------------------------
+# `table_engine` migration surface (the OCR component split)
+# ---------------------------------------------------------------------------
+#
+# Both directions of the loud/silent asymmetry are asserted here, because each
+# is a deliberate choice that reads like a bug to the next person: the table
+# side is loud for EVERY unrecognised value, while the text side keeps a silent
+# EasyOCR fallback for `engine: trocr` (test_engine_migration.py).
+
+
+class TestTableEngineValidation:
+    """Construction-time, never the lazy `ocr` property — see ModelServerOCR.__init__."""
+
+    def test_surya_raises_and_names_the_component(self) -> None:
+        with pytest.raises(ValueError, match='ocr_surya://'):
+            ModelServerOCR(engine='surya')
+
+    def test_the_surya_message_says_the_component_has_no_tables(self) -> None:
+        """A table-only config never sees the engine-side error; this is its whole
+        migration story, so the message has to say tables are gone, not relocated.
+        """
+        with pytest.raises(ValueError, match='no table stack'):
+            ModelServerOCR(engine='surya')
+
+    def test_an_unknown_engine_also_raises_at_construction(self) -> None:
+        """The deliberate tightening: a typo used to run text-only with a buried
+        warning. Restoring that silence would be a regression, not a fix.
+        """
+        with pytest.raises(ValueError, match='Unknown OCR engine'):
+            ModelServerOCR(engine='nosuchengine')
+
+    def test_the_failure_is_not_deferred_to_the_ocr_property(self) -> None:
+        """`beginGlobal` has no try/except around construction; every path that
+        touches the property swallows. Asserting `raises` on the constructor is
+        what pins the difference.
+        """
+        called: list[str] = []
+
+        class _Probe(ModelServerOCR):
+            @property
+            def ocr(self):  # pragma: no cover — must never be reached
+                called.append('ocr')
+                return None
+
+        with pytest.raises(ValueError):
+            _Probe(engine='surya')
+        assert called == []
+
+    @pytest.mark.parametrize('engine', ['doctr', 'easyocr', 'DocTR'])
+    def test_the_supported_engines_still_construct(self, engine: str) -> None:
+        assert ModelServerOCR(engine=engine).engine == engine.lower()
