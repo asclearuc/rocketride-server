@@ -668,6 +668,15 @@ class _FileVisitor(ast.NodeVisitor):
 # --------------------------------------------------------------------------- #
 
 
+def _is_under(path: Path, parent: Path) -> bool:
+    """True when ``path`` is ``parent`` itself or lives somewhere beneath it."""
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
 def extract_component(tree: Tree, component_dir: Path) -> ComponentContract:
     """
     Build the auto-extracted contract for one component (= one directory of
@@ -682,15 +691,22 @@ def extract_component(tree: Tree, component_dir: Path) -> ComponentContract:
     """
     contract = ComponentContract(
         tree_name=tree.name,
-        component_name=component_dir.name,
+        component_name=component_id(tree, component_dir),
         component_dir=component_dir,
     )
+
+    # Directories that are components in their own right. Their .py files
+    # belong to them, not to this parent, or the same file would be
+    # contracted twice under two different ids.
+    nested = [c for c in iter_components(tree) if c != component_dir and _is_under(c, component_dir)]
 
     for py in sorted(component_dir.rglob('*.py')):
         # external_contracts.py is the manifest itself — its imports are
         # framework wiring, not runtime production code, so they must not
         # be auto-extracted into the contract.
         if py.name == 'external_contracts.py':
+            continue
+        if any(_is_under(py, n) for n in nested):
             continue
         try:
             source = py.read_text(encoding='utf-8')
@@ -816,10 +832,20 @@ def iter_components(tree: Tree) -> list[Path]:
     """
     Discover the component directories within a tree.
 
-    A component is a directory that either contains a ``requirements.txt``
-    (= proper per-component layout, as in ``nodes/``) or is the tree root
-    itself when no per-directory requirements are present (collapsed-tree
-    case, as in ``rocketlib/lib``).
+    A component is any directory *below* the tree root that contains a
+    ``requirements.txt``, at any depth — the same rule the install hook
+    already uses (``cli._install_all_requirements`` walks every
+    ``requirement*.txt`` recursively). Nesting is legal: a node may hold
+    several components, each with its own requirements file.
+
+    The tree root itself is never a component even when it carries a
+    ``requirements.txt``: ``nodes/`` and ``ai/`` both do, and there the file
+    is the baseline every descendant inherits through the AST walker's
+    ancestor rule, not a component boundary. Treating it as one would sweep
+    every unclaimed file in the tree into a single giant component.
+
+    Falls back to the tree root when no ``requirements.txt`` exists anywhere
+    below it (collapsed-tree case, as in ``rocketlib/lib``).
 
     Args:
         tree: Tree to inspect.
@@ -832,10 +858,11 @@ def iter_components(tree: Tree) -> list[Path]:
         return []
 
     per_component: list[Path] = []
-    for entry in sorted(tree.root.iterdir()):
+    for entry in sorted(tree.root.rglob('*')):
         if not entry.is_dir():
             continue
-        if entry.name.startswith(('.', '__')):
+        # Skip dot/dunder dirs anywhere on the path (``__pycache__`` etc.).
+        if any(part.startswith(('.', '__')) for part in entry.relative_to(tree.root).parts):
             continue
         if (entry / 'requirements.txt').exists():
             per_component.append(entry)
@@ -843,3 +870,25 @@ def iter_components(tree: Tree) -> list[Path]:
     if per_component:
         return per_component
     return [tree.root]
+
+
+def component_id(tree: Tree, component_dir: Path) -> str:
+    """
+    The component's identity within its tree: a tree-relative posix path.
+
+    ``component_dir.name`` alone stopped being unique once nesting became
+    legal (two nodes could each hold a ``standard/``), so the id carries the
+    whole relative path — ``ocr/standard``, not ``standard``. The
+    root-collapse fallback keeps its directory name so flat trees' report
+    rows are unchanged.
+
+    Args:
+        tree:          The tree the component belongs to.
+        component_dir: Directory returned by :func:`iter_components`.
+
+    Returns:
+        Tree-relative posix path, or the directory name for the root itself.
+    """
+    if component_dir == tree.root:
+        return component_dir.name
+    return component_dir.relative_to(tree.root).as_posix()
