@@ -71,10 +71,13 @@ class SuryaLoader(BaseLoader):
         """
         SuryaLoader._ensure_dependencies()
 
-        # These three are unverified by the contract framework: the engine resolves surya-ocr
-        # 0.16.1 while this loader targets the 0.17 API. Not an opencv conflict — 0.17 needs
-        # transformers>=4.56.1 against the tree's pinned 4.53.3. Revisiting belongs to the OCR
-        # node split, which is what moves the version (virtual-environments.md §7, item 6).
+        # These three are unverified by the contract framework, and the reason they still
+        # resolve is a pin rather than luck: `requirements_surya.txt` holds surya-ocr at
+        # ==0.16.1, which is where these module paths live. Measured, 0.22.1 replaced
+        # `foundation` with `inference` — item 6a found that by giving this loader a scoped
+        # environment, where the bare name it used to carry floated up and died here. Moving
+        # to the honest >=0.17,<0.18 is item 6b, gated on moving transformers==4.53.3 across
+        # the eight providers that pin it (virtual-environments.md §7); 6a moved no version.
         from surya.foundation import FoundationPredictor  # contract-check: ignore  see comment above
         from surya.recognition import RecognitionPredictor  # contract-check: ignore  see comment above
         from surya.detection import DetectionPredictor  # contract-check: ignore  see comment above

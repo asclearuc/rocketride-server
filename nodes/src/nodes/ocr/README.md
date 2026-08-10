@@ -1,16 +1,51 @@
 # ocr
 
-A RocketRide filter node that extracts machine-readable text and tables from images using optical character recognition.
+RocketRide filter nodes that extract machine-readable text — and, on the standard component, tables — from images using optical character recognition.
 
-## What it does
+## Two components
 
-Turns visual content (scanned documents, screenshots, photos) into structured text for downstream analysis. The node is GPU-capable and registered as a filter in the pipeline.
+Since the 2A-4 split this directory ships **two** providers out of one package. They share an icon and a docs page and nothing else: separate module paths, separate protocols, separate dependency sets.
 
-Four OCR engines are supported via the `ai.common.models` model-server wrappers: **EasyOCR** (multi-language, the default), **DocTR** (document-focused, language-agnostic), **Surya** (multi-language, 90+ languages), and **TrOCR** (transformer-based, Microsoft model). The wrappers auto-detect whether to call a remote model server or fall back to local inference. An unknown engine name falls back to EasyOCR silently.
+| Component    | Protocol       | Module path          | Engines        | Lanes out       |
+| ------------ | -------------- | -------------------- | -------------- | --------------- |
+| **standard** | `ocr://`       | `nodes.ocr.standard` | EasyOCR, DocTR | `text`, `table` |
+| **Surya**    | `ocr_surya://` | `nodes.ocr.surya`    | Surya          | `text`          |
 
-Table extraction uses **img2table** for OpenCV-based table structure detection, with OCR inference routed through the same model-server adapter (`ModelServerOCR`). Detected tables are emitted on the `table` lane as Markdown. Both img2table v1 and v2 plug-in APIs are supported: v2 reorganised the API and replaced the two-step `content`/`to_ocr_dataframe` contract with a single `of()` method returning `OCRData`; the node detects the installed version at import time via `_IMG2TABLE_V2`.
+The `ocr://` protocol is unchanged, so existing `.pipe` documents keep resolving — only the module path behind it moved down a level.
 
-Animated GIFs are handled frame by frame: each frame is OCR'd individually and the per-frame texts are joined with newlines before being written to the `text` lane. OCR reads are serialised with an internal threading lock so concurrent instances share one engine safely.
+The point of the split is the dependency set. Surya's stack (`surya-ocr`, and the `transformers` floor it carries) no longer has to coexist with EasyOCR, DocTR and img2table in one environment, so the Surya component can run inside a **Virtual Environment container** with an overlay that holds none of them. The package root deliberately carries no `requirements.txt` and its `__init__.py` imports nothing: an ancestor package's requirement files are inherited by every component beneath it, and an ancestor's `__init__.py` is *executed* at import while never being walked — either one would put the standard component's dependencies back into the Surya child.
+
+## What they do
+
+Both turn visual content (scanned documents, screenshots, photos) into text for downstream analysis. Both are GPU-capable and registered as filters. OCR reads are serialised with an internal threading lock so concurrent instances share one engine safely, and animated GIFs are handled frame by frame — each frame is OCR'd individually and the per-frame texts are joined with newlines.
+
+**standard** supports two OCR engines via the `ai.common.models` model-server wrappers: **EasyOCR** (multi-language, the default) and **DocTR** (document-focused, language-agnostic). The wrappers auto-detect whether to call a remote model server or fall back to local inference. An unknown engine name falls back to EasyOCR silently; `surya` is the one exception and raises, naming the component to point the pipeline at.
+
+Its table extraction uses **img2table** for OpenCV-based table structure detection, with OCR inference routed through the same model-server adapter (`ModelServerOCR`). Detected tables are emitted on the `table` lane as Markdown. Both img2table v1 and v2 plug-in APIs are supported.
+
+**Surya** supports one engine and has **no configuration at all** — no engine picker, no script family, no table settings. Surya recognition is multilingual and auto-detecting, so there is no language list to choose. It has no table stack either: its `image` lane produces `text` only.
+
+Its engine is held at `surya-ocr==0.16.1`, and the pin is load-bearing rather than cautious. Before the split that line was a bare name kept at 0.16.1 by an accident of the global compile — `ai/**` is resolved there beside `transformers==4.53.3`, which nothing newer admits. A scoped environment never sees that pin, so the bare name floated: unbounded it took 0.22.1, where the API this loader targets no longer exists, and `>=0.16,<0.17` took 0.16.7, whose looser bounds let `transformers` reach 5.x and break Surya from the other side. Pinning the exact release fixes both with one bound, because 0.16.1 declares `transformers >=4.51.2,<4.54.0` itself. Lifting it to `>=0.17,<0.18` needs the tree-wide `transformers` move.
+
+## Composition: text plus tables
+
+The two components compose rather than replace each other. Place the Surya component in a Virtual Environment container and the standard `ocr` node beside it in the main environment: Surya reads the text, standard reads the tables with DocTR or EasyOCR cells.
+
+What that combination cannot give you is **Surya-recognised table cells**. Surya cells in the table stack would mean importing Surya beside img2table, which is exactly the environment being separated. The `surya` profile that shipped both in one click (`engine: surya` *and* `table_engine: surya`) is gone, and there is no replacement for its table half.
+
+## Migrating a saved pipeline
+
+| Old config            | What happens now                                                          |
+| --------------------- | ------------------------------------------------------------------------- |
+| `engine: surya`       | **Raises** at reader construction, naming `ocr_surya://`                  |
+| `table_engine: surya` | **Raises** when `ModelServerOCR` is built, i.e. at node startup           |
+| `profile: surya`      | The profile is gone from the picker; set the two values above by hand     |
+| `engine: trocr`       | Still loads, still silently returns EasyOCR results                       |
+| `profile: trocr`      | Gone from the picker; the runtime fallback above keeps the pipeline alive |
+
+The asymmetry is deliberate. Surya has somewhere to go, so saying so is more useful than degrading; TrOCR was deleted from the tree in increment 2.5 and has nowhere to point, so its silent fallback stays and only the *offer* was retired.
+
+`table_engine` validation happens at construction, not on first use. Every path that reaches the table engine lazily swallows its errors — `content()` warns, `of()` returns `None`, and `IInstance.extract_tables_from_image` wraps the call a third time so a table failure cannot kill text OCR — so a deferred raise would mean "node starts, text works, tables silently produce nothing". One side effect is kept on purpose: **every** unrecognised `table_engine` now fails at startup, not just `surya`.
 
 ---
 
@@ -18,25 +53,36 @@ Animated GIFs are handled frame by frame: each frame is OCR'd individually and t
 
 ### Lanes
 
+**standard** (`ocr://`):
+
 | Lane in     | Lane out | Description                       |
 | ----------- | -------- | --------------------------------- |
 | `documents` | `text`   | Extract text from image documents |
 | `image`     | `text`   | Extract text from a raw image     |
 | `image`     | `table`  | Extract tables from a raw image   |
 
-On the `documents` lane, every incoming document must be of type `Image` (the node raises a `ValueError` otherwise). Each image document is OCR'd and re-emitted as a `Document`-type copy whose `page_content` is the extracted text. The original image documents are not forwarded: if a downstream node needs the images themselves, connect it to the source node directly.
+**Surya** (`ocr_surya://`):
+
+| Lane in     | Lane out | Description                       |
+| ----------- | -------- | --------------------------------- |
+| `documents` | `text`   | Extract text from image documents |
+| `image`     | `text`   | Extract text from a raw image     |
+
+On the `documents` lane, every incoming document must be of type `Image` (both components raise a `ValueError` otherwise). Each image document is OCR'd and re-emitted as a `Document`-type copy whose `page_content` is the extracted text. The original image documents are not forwarded: if a downstream node needs the images themselves, connect it to the source node directly.
 
 ### Fields
 
+**The Surya component has no configuration fields.** Everything below belongs to the standard component: each entry is an engine picker, an engine-specific option or a table setting, and none of them is read by a single-engine, table-free component. Surya is configured by *what it is placed beside*, not by settings of its own.
+
 | Field | Type | Description |
 |---|---|---|
-| `engine` | string | Default "easyocr". Select the OCR engine for text extraction. EasyOCR supports many languages with script families. DocTR is language-agnostic and good for documents. Surya supports multi-language. TrOCR uses transformer models. |
+| `engine` | string | Default "easyocr". Select the OCR engine for text extraction. EasyOCR supports many languages with script families. DocTR is language-agnostic and good for documents. Surya moved to its own component (`ocr_surya://`). |
 | `script_family` | string | Default "latin". Select the script family for OCR. This determines which languages are loaded for text recognition. Only applies to EasyOCR engine. |
 | `det_arch` | string | Default "db_resnet50". Choose the architecture used for table text detection.
  Documentation: https://mindee.github.io/doctr/latest/using_doctr/using_models.html |
 | `reco_arch` | string | Default "crnn_vgg16_bn". Choose the architecture used for table text recognition.
  Documentation: https://mindee.github.io/doctr/latest/using_doctr/using_models.html |
-| `table_engine` | string | Default "doctr". Select the OCR engine used for table text extraction. DocTR is optimized for document tables. EasyOCR and Surya are general-purpose alternatives. |
+| `table_engine` | string | Default "doctr". Select the OCR engine used for table text extraction. DocTR is optimized for document tables. EasyOCR is a general-purpose alternative. |
 | `profile` | string | Default "latin". Select a preconfigured OCR profile optimized for different languages and use cases. |
 
 The main settings panel exposes `ocr.profile`, `ocr.engine`, `ocr.script_family`, and `ocr.table_engine`. The DocTR architecture fields (`ocr.det_arch`, `ocr.reco_arch`) accept the architectures listed in the [DocTR model docs](https://mindee.github.io/doctr/latest/using_doctr/using_models.html).
@@ -45,13 +91,11 @@ Detection architectures: `linknet_resnet18`, `linknet_resnet34`, `linknet_resnet
 
 Recognition architectures: `crnn_vgg16_bn`, `crnn_mobilenet_v3_small`, `crnn_mobilenet_v3_large`, `sar_resnet31`, `master`, `vitstr_small`, `vitstr_base`, `parseq`.
 
-The TrOCR engine additionally reads an optional `trocr_model` config value selecting the Hugging Face model variant (default: `microsoft/trocr-base-printed`).
-
 ---
 
 ## Profiles
 
-Profiles are preconfigured combinations of engine, script family, and table engine. Selecting a profile sets all three at once. The default profile is `latin`.
+Profiles are preconfigured combinations of engine, script family, and table engine, and belong to the standard component. Selecting a profile sets all three at once. The default profile is `latin`.
 
 | Profile key            | Title                         | Engine  | Script family         | Table engine |
 | ---------------------- | ----------------------------- | ------- | --------------------- | ------------ |
@@ -65,14 +109,12 @@ Profiles are preconfigured combinations of engine, script family, and table engi
 | `japanese`             | Japanese                      | EasyOCR | `japanese`            | DocTR        |
 | `korean`               | Korean                        | EasyOCR | `korean`              | DocTR        |
 | `doctr`                | DocTR (Language-agnostic)     | DocTR   | `latin` (unused)      | DocTR        |
-| `surya`                | Surya (Multi-language)        | Surya   | `latin` (unused)      | Surya        |
-| `trocr`                | TrOCR (Transformer)           | TrOCR   | `latin` (unused)      | DocTR        |
 
 ---
 
 ## Script families
 
-Script families map to EasyOCR language code lists. Every family except plain `latin` also loads English as a fallback. The `script_family` setting has no effect when the selected engine is DocTR, Surya, or TrOCR.
+Script families map to EasyOCR language code lists. Every family except plain `latin` also loads English as a fallback. The `script_family` setting has no effect when the selected engine is DocTR. The Surya component has no such setting: its recognition is multilingual and auto-detecting.
 
 | Family                | Languages loaded                                                                                                                       |
 | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
@@ -96,24 +138,27 @@ The `bengali`, `thai`, `tamil`, and `telugu` families are selectable via `ocr.sc
 
 ## OpenCV
 
-The three OCR engines and img2table all reach `cv2`, and all four `opencv-*` PyPI distributions write that same import directory — only one can be active at a time, and the last one installed owns it. uv sees unrelated distributions and never reports a conflict between them.
+Both OCR engines and img2table reach `cv2`, and all four `opencv-*` PyPI distributions write that same import directory — only one can be active at a time, and the last one installed owns it. uv sees unrelated distributions and never reports a conflict between them.
 
 The node used to settle this itself, importing an `ai.common.opencv` shim that pinned all four distributions to `4.13.0.92`. That shim is gone: `cv2` is now owned by the engine's shared-namespace family mechanism (`lib/pkg_families/`, `virtual-environments.md` §4.16), which aligns every member an environment resolves onto one version, installs them subset-first so the widest build writes the directory last, and verifies the result by importing `cv2` inside the finished environment. Nothing in this node pins OpenCV, and nothing should.
 
-Upstream requirements, at the versions the engine currently resolves:
+Upstream requirements in the **standard** component's environment, at the versions the engine currently resolves:
 
 | Consumer  | PyPI package         | Upstream OpenCV requirement          | Resolved here |
 | --------- | -------------------- | ------------------------------------ | ------------- |
-| EasyOCR   | `easyocr` 1.7.2      | `opencv-python-headless` (unpinned)  | 4.13.0.92     |
-| DocTR     | `python-doctr` 1.0.1 | `opencv-python <5.0.0, >=4.5.0`      | 4.13.0.92     |
-| Surya     | `surya-ocr` 0.16.1   | `opencv-python-headless` (unpinned)  | 4.13.0.92     |
-| img2table | `img2table` 2.0.0    | `opencv-contrib-python`              | 4.13.0.92     |
+| EasyOCR   | `easyocr` 1.7.2      | `opencv-python-headless` (unpinned)  | 4.14.0.94     |
+| DocTR     | `python-doctr` 1.0.1 | `opencv-python <5.0.0, >=4.5.0`      | 4.14.0.94     |
+| img2table | `img2table` 2.0.0    | `opencv-contrib-python`              | 4.14.0.94     |
 
 img2table is why "widest build last" matters here: it calls `cv2.ximgproc.niBlackThreshold`, which only the `contrib` builds carry, and the family's probe asserts `cv2.ximgproc` in exactly the environments that installed one. That is a property of the resolution, not of an import order — `IGlobal.py` imports img2table like any other module, and the ordering that used to be bought by importing a shim first is now bought by the install itself.
+
+The **Surya** component is the contrast, and it is the clearest thing the split does to this problem: its environment resolves **one** family member — `opencv-python-headless`, which `surya-ocr` 0.16.1 requests as `>=4.11.0.86,<5.0.0.0` and which lands on the same 4.14.0.94. There is nothing to align against, no subset-first ordering to impose, and no `ximgproc` for the probe to assert; the probe still fires and still proves the import. Measured on a live scoped run: a four-way same-directory contest became a three-way one plus a singleton.
 
 ---
 
 ## img2table version compatibility
+
+This applies to the standard component only; the Surya component has no table stack.
 
 img2table 2.0 (released 2026-05-10) reorganised the OCR plug-in API. The node supports both v1 and v2:
 
@@ -123,7 +168,7 @@ img2table 2.0 (released 2026-05-10) reorganised the OCR plug-in API. The node su
 | Result type returned by `of()`     | `OCRDataframe` (`img2table.ocr.data`) | `OCRData` (`img2table.ocr._types`) |
 | Plug-in contract                   | `content()` + `to_ocr_dataframe()` | single `of()` override |
 
-The `_IMG2TABLE_V2` flag is set at import time and gates each code path. `external_contracts.py` declares version-tagged import requirements so the `check-externals` CI framework can validate the correct symbols on whichever version is installed.
+The `_IMG2TABLE_V2` flag is set at import time and gates each code path. `standard/external_contracts.py` declares version-tagged import requirements so the `check-externals` CI framework can validate the correct symbols on whichever version is installed — it sits inside `standard/` because that directory, not the package root, is the contract-check component.
 
 ---
 

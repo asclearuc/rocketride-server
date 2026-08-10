@@ -29,6 +29,7 @@ Usage:
 """
 
 import pytest
+import ast
 import sys
 import json
 import re
@@ -621,6 +622,53 @@ class TestNodeContracts:
 
         # Must have __init__.py to be a loadable Python module
         assert (node_path / '__init__.py').exists(), f'{service.test_id}: Missing __init__.py'
+
+    @pytest.mark.parametrize('service', get_python_services(), ids=lambda s: s.test_id)
+    def test_no_preconfig_means_no_get_node_config(self, service: ServiceConfig):
+        """A service that declares no `preconfig` must not call `Config.getNodeConfig`.
+
+        The helper raises `The service <x> does not have a preconfig section` for exactly
+        that case, and it raises inside `beginGlobal` — so the node dies at startup, in a
+        live run, with nothing static having complained.
+
+        Measured, the tree already pairs the two: 24 of 172 services files omit `preconfig`
+        and not one of their components calls the helper. Written down because nothing
+        enforced it, and a component split is precisely where the pair comes apart — the
+        2A-4 OCR split dropped the section while keeping the call, and only a scoped
+        engine run said so.
+
+        `glob`, not `rglob`: every one of the 141 call sites in the tree sits directly in
+        a node or component directory, and recursing would blame a parent for a nested
+        component's own (legitimately preconfig-backed) call.
+
+        Parsed, not grepped: a substring match blames the comment explaining why the call
+        is absent, which is the first thing this test did.
+        """
+        if 'preconfig' in service.raw_data:
+            return
+
+        module = service.raw_data.get('path') or f'nodes.{service.node_name}'
+        component_dir = NODES_SRC.joinpath(*module.split('.')[1:])
+        if not component_dir.is_dir():
+            pytest.skip(f'{service.test_id}: `path` {module} is not a directory')
+
+        def calls_it(py: Path) -> bool:
+            try:
+                tree = ast.parse(py.read_text(encoding='utf-8', errors='replace'))
+            except (OSError, SyntaxError, ValueError):
+                return False
+            return any(
+                isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == 'getNodeConfig'
+                for n in ast.walk(tree)
+            )
+
+        offenders = [py.name for py in sorted(component_dir.glob('*.py')) if calls_it(py)]
+        assert not offenders, (
+            f'{service.test_id}: {", ".join(offenders)} call Config.getNodeConfig, but '
+            f'{service.file_path.name} declares no `preconfig` section — the helper raises '
+            'on that combination and the node fails at startup. Either add the section or '
+            'pass `self.glb.connConfig` through unmerged.'
+        )
 
 
 def lane_test_id(param):

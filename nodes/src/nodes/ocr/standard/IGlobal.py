@@ -60,15 +60,48 @@ class ModelServerOCR(OCRInstance):
     offloading the heavy OCR inference to the model server (or local fallback).
     """
 
+    # Engines that left this node. Named separately from the unknown-value
+    # case so the message can point somewhere instead of just refusing.
+    _MOVED_TABLE_ENGINES = {
+        'surya': 'the Surya OCR component (protocol `ocr_surya://`), which has no table stack',
+    }
+
+    _TABLE_ENGINES = ('doctr', 'easyocr')
+
     def __init__(self, engine: str = 'doctr', languages: List[str] = None):
         """
         Initialize the adapter with a model server OCR engine.
 
+        Validation happens **here**, not in the lazy `ocr` property below,
+        and that placement is the whole point. Every path that touches the
+        property swallows: `content()` warns and returns partial results,
+        `of()` returns None, and `IInstance.extract_tables_from_image` wraps
+        the call a third time so a table failure cannot kill text OCR. A raise
+        down there means "node starts, text works, tables silently produce
+        nothing" — exactly the degradation this check exists to prevent.
+        `beginGlobal` constructs this object with no try/except around it, so
+        a bad value fails the node at startup instead.
+
         Args:
-            engine: OCR engine to use - 'doctr', 'easyocr', or 'surya'
+            engine: OCR engine to use - 'doctr' or 'easyocr'
             languages: List of language codes (e.g., ['en', 'fr'])
+
+        Raises:
+            ValueError: for a moved engine (message names the component) or
+                any other unrecognised value.
         """
-        self.engine = engine.lower()
+        engine = engine.lower()
+
+        if engine in self._MOVED_TABLE_ENGINES:
+            raise ValueError(
+                f"table_engine '{engine}' is no longer available on this node; it moved to "
+                f'{self._MOVED_TABLE_ENGINES[engine]}. Use one of {self._TABLE_ENGINES} for tables.'
+            )
+
+        if engine not in self._TABLE_ENGINES:
+            raise ValueError(f'Unknown OCR engine: {engine}. Expected one of {self._TABLE_ENGINES}.')
+
+        self.engine = engine
         self.languages = languages or ['en']
         self._ocr = None
 
@@ -84,11 +117,10 @@ class ModelServerOCR(OCRInstance):
                 from ai.common.models.ocr.easyocr import EasyOCR
 
                 self._ocr = EasyOCR(languages=self.languages)
-            elif self.engine == 'surya':
-                from ai.common.models.ocr.surya import Surya
-
-                self._ocr = Surya()
             else:
+                # Unreachable: __init__ rejects anything outside _TABLE_ENGINES.
+                # Kept so a future engine added to the tuple but not here fails
+                # loudly rather than returning None.
                 raise ValueError(f'Unknown OCR engine: {self.engine}')
             debug(f'ModelServerOCR: Initialized {self.engine} engine')
         return self._ocr
