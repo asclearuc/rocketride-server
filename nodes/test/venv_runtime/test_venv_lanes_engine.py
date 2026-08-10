@@ -29,7 +29,7 @@ import pytest
 pytest.importorskip('rocketlib', reason='engine-interpreter only (rocketlib pulls engLib)')
 pytest.importorskip('ai.common.schema', reason='engine-interpreter only')
 
-from rocketlib import IJson  # noqa: E402
+from rocketlib import AVI_ACTION, IJson  # noqa: E402
 from ai.common.schema import Answer, Doc, Question  # noqa: E402
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -107,18 +107,36 @@ def test_documents_lane_real_doc():
     assert [d.toDict() for d in reconstructed] == payload
 
 
-def test_scalar_and_av_and_classification_lanes():
-    # No engine types, but confirm they behave under the real module too.
+def test_scalar_and_classification_lanes():
     assert _roundtrip('text', 'hi')[2] == ('writeText', ('hi',))
     assert _roundtrip('table', 'a|b')[2] == ('writeTable', ('a|b',))
-    assert _roundtrip('image', 3, 'image/png', b'bytes')[2] == ('writeImage', (3, 'image/png', b'bytes'))
-    assert _roundtrip('audio', 1, 'audio/wav')[2] == ('writeAudio', (1, 'audio/wav'))  # BEGIN: no buffer
     _, ctx_payload, ctx_call = _roundtrip('classificationContext', {'c': 1})
     _assert_wire_json_safe(ctx_payload)
     assert ctx_call == ('writeClassificationContext', ({'c': 1},))
     _, cls_payload, cls_call = _roundtrip('classifications', {'c': 1}, {'p': 2}, {'r': 3})
     _assert_wire_json_safe(cls_payload)
     assert cls_call[0] == 'writeClassifications'
+
+
+@pytest.mark.parametrize('lane,method', [('audio', 'writeAudio'), ('video', 'writeVideo'), ('image', 'writeImage')])
+def test_av_lanes_carry_the_real_action_enum(lane, method):
+    """The AV lanes DO have an engine type, and missing that is what broke them.
+
+    `AVI_ACTION`'s members are pybind values: not JSON-serializable, not ints, and not
+    equal to their own int. So the header must survive `json.dumps` and the decoded
+    argument must come back as the MEMBER -- node code branches on
+    `action == AVI_ACTION.END`, which an int never satisfies. Both halves are asserted
+    here rather than in the stubbed tier, because only this one holds the real type.
+    """
+    header, _payload, (called, args) = _roundtrip(lane, AVI_ACTION.WRITE, 'image/png', b'bytes')
+    _assert_wire_json_safe(header)
+    assert called == method
+    assert args == (AVI_ACTION.WRITE, 'image/png', b'bytes')
+
+    # BEGIN carries no buffer -> the 2-arg form
+    header, _payload, (called, args) = _roundtrip(lane, AVI_ACTION.BEGIN, 'audio/wav')
+    _assert_wire_json_safe(header)
+    assert args == (AVI_ACTION.BEGIN, 'audio/wav')
 
 
 def test_words_still_not_bridgeable_under_real_types():
