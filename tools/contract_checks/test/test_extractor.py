@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from contract_checks.extractor import extract_component
+from contract_checks.extractor import component_id, extract_component, iter_components
 from contract_checks.trees import Tree
 
 
@@ -576,3 +576,92 @@ def test_internal_package_does_not_leak_into_heavy_class_detection(tmp_path: Pat
     assert contract.imports == []
     # And critically: no heavy_class was emitted for the internal package.
     assert not any(hc.qualname.startswith('rocketlib') for hc in contract.heavy_classes), contract.heavy_classes
+
+
+# --------------------------------------------------------------------------- #
+# Component discovery
+#
+# `iter_components` is what decides *what* gets contracted at all, so a rule
+# that quietly stops finding a directory removes coverage without turning any
+# lane red — the report simply gets shorter. These pin the rule itself.
+# --------------------------------------------------------------------------- #
+
+
+def _mkreq(d: Path, body: str = 'requests\n') -> Path:
+    """Create ``d`` and give it a ``requirements.txt``, making it a component."""
+    d.mkdir(parents=True, exist_ok=True)
+    (d / 'requirements.txt').write_text(body, encoding='utf-8')
+    return d
+
+
+def test_a_nested_requirements_file_yields_a_nested_component(tmp_path: Path):
+    """A component may sit inside another directory, not only at depth 1."""
+    _mkreq(tmp_path / 'ocr' / 'standard')
+    tree = _make_tree(tmp_path)
+    found = {component_id(tree, c) for c in iter_components(tree)}
+    assert found == {'ocr/standard'}
+
+
+def test_a_nested_component_is_identified_by_its_tree_relative_path(tmp_path: Path):
+    """
+    The id is the whole relative path, not the directory name: once nesting is
+    legal two nodes can each hold a ``standard/``, and the id feeds
+    ``triple_id`` in every report line and every ``--pattern`` match.
+    """
+    _mkreq(tmp_path / 'ocr' / 'standard')
+    _mkreq(tmp_path / 'pdf' / 'standard')
+    tree = _make_tree(tmp_path)
+    found = {component_id(tree, c) for c in iter_components(tree)}
+    assert found == {'ocr/standard', 'pdf/standard'}
+
+
+def test_a_parents_file_set_excludes_a_nested_components_subtree(tmp_path: Path):
+    """
+    No .py file may be contracted twice under two ids. The child's files
+    belong to the child; the parent keeps only what no child claims.
+    """
+    parent = _mkreq(tmp_path / 'account')
+    child = _mkreq(tmp_path / 'account' / 'oss')
+    _write(parent, 'parent_only.py', 'import requests\n')
+    _write(child, 'child_only.py', 'import boto3\n')
+
+    tree = _make_tree(tmp_path)
+    by_id = {component_id(tree, c): extract_component(tree, c) for c in iter_components(tree)}
+    assert set(by_id) == {'account', 'account/oss'}
+    assert {r.module for r in by_id['account'].imports} == {'requests'}
+    assert {r.module for r in by_id['account/oss'].imports} == {'boto3'}
+
+
+def test_a_tree_root_carrying_requirements_is_not_itself_a_component(tmp_path: Path):
+    """
+    Both the ``nodes`` and ``ai`` roots carry a ``requirements.txt``: it is the
+    baseline every descendant harvests through the AST walker's ancestor rule,
+    not a component boundary. Treating it as one would sweep every unclaimed
+    file in the tree into one giant component.
+    """
+    _mkreq(tmp_path)  # root's own requirements.txt — the baseline
+    _mkreq(tmp_path / 'ocr')
+    _write(tmp_path, 'stray.py', 'import requests\n')
+
+    tree = _make_tree(tmp_path)
+    found = {component_id(tree, c) for c in iter_components(tree)}
+    assert found == {'ocr'}
+
+
+def test_a_tree_with_no_requirements_anywhere_collapses_to_its_root(tmp_path: Path):
+    """
+    The measured state of both ``rocketlib/lib`` and
+    ``client-python/src/rocketride``: no ``requirement*.txt`` at any depth, so
+    the whole tree is one component keyed by the root's directory name. This
+    is the regression that would be easiest to cause while adding nesting.
+    """
+    (tmp_path / 'sub').mkdir()
+    _write(tmp_path, 'a.py', 'import requests\n')
+    _write(tmp_path / 'sub', 'b.py', 'import boto3\n')
+
+    tree = _make_tree(tmp_path)
+    components = iter_components(tree)
+    assert components == [tmp_path]
+    assert component_id(tree, components[0]) == tmp_path.name
+    contract = extract_component(tree, components[0])
+    assert {r.module for r in contract.imports} == {'requests', 'boto3'}

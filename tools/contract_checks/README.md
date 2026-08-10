@@ -18,6 +18,32 @@ For every `.py` file in `nodes/`, `packages/ai/`, `packages/client-python/`, and
 
 It never calls real APIs. It only loads modules and reads attributes.
 
+### What counts as a component
+
+A **component** is any directory *below* a tree root that contains a `requirements.txt` — at any
+depth. That is the same rule the install hook already uses: `cli._install_all_requirements` walks
+every `requirement*.txt` under each tree recursively. Nesting is legal, so one node may hold several
+components (`nodes/ocr/standard`, `nodes/ocr/surya`), and a component's file set is its own `.py`
+files **minus** any nested component's subtree — no file is contracted twice under two ids.
+
+A component's id is its **tree-relative path**, which is the middle segment of
+`<tree>/<component>/<package>`: `ocr/standard`, not `standard`. Directory names stopped being unique
+once nesting became legal.
+
+Two boundaries are deliberate:
+
+- **The tree root is never a component**, even though `nodes/` and `ai/` both carry a
+  `requirements.txt`. There, that file is the baseline every descendant inherits through the AST
+  walker's ancestor rule, not a component boundary; treating it as one would sweep every file no
+  component claims into a single giant component.
+- **A tree with no `requirements.txt` anywhere collapses to its root** and is scanned as one
+  component keyed by the root's directory name. That is how `rocketlib/lib` and
+  `client-python/src/rocketride` are handled.
+
+The practical consequence worth knowing: **moving or deleting a `requirements.txt` moves or deletes
+contract coverage**, and it does so silently — a lost component makes the report *shorter*, never
+redder.
+
 ## Run it locally
 
 ```sh
@@ -27,7 +53,7 @@ It never calls real APIs. It only loads modules and reads attributes.
 # Force a fresh constraint resolution (deletes the engine's constraints cache)
 ./builder.cmd check-externals:run --rebuild-cache
 
-# Filter to one package / one node (substring match on `<tree>/<component>/<package>`)
+# Filter to one package / one component (substring match on `<tree>/<component>/<package>`)
 ./builder.cmd check-externals:run --pattern=twelvelabs
 
 # Unit tests for the framework itself (fast — only builds the engine)
@@ -115,7 +141,7 @@ For most new nodes you don't have to add anything. Just write code; the framewor
 
 ## When you **do** need a manifest
 
-A manifest is a small Python file at `<your-node>/external_contracts.py`. Add one when:
+A manifest is a small Python file at `<your-component>/external_contracts.py`. Add one when:
 
 1. **An upstream symbol is version-gated**: e.g., a module that was renamed or removed across major versions. Use `applies_when='<2.0'` (see [Version-gated entry](#version-gated-entry-applies_when) below) so the framework skips the check on installed versions that don't apply, instead of failing.
 2. **You want a heavy-class chain to be a hard requirement, not best-effort.** Auto-extracted heavy classes are best-effort: if construction with dummy args can't succeed, the check is silently demoted to SKIP (see [Auto-extracted vs manifest: the trust gradient](#auto-extracted-vs-manifest-the-trust-gradient) below). Declaring the heavy class in a manifest with a safer `construct` expression turns the chain check into a hard FAIL on breakage, a real CI assertion instead of a best-effort one.

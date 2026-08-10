@@ -506,7 +506,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                     continue
                 if allowed_modules is not None and package not in allowed_modules:
                     continue
-                triple_id = f'{tree.name}/{component_dir.name}/{package}'
+                # Consume the contract's own id rather than rebuilding it:
+                # nesting made `component_dir.name` ambiguous, and a second
+                # construction here is the one that ships in every report
+                # while no test covers it.
+                triple_id = f'{tree.name}/{contract.component_name}/{package}'
                 if pattern_filter is not None and not any(p in triple_id for p in pattern_filter):
                     continue
 
