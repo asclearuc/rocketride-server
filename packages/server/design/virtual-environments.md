@@ -1249,6 +1249,15 @@ change safe. (b) A **real conflict inside base's `ai/**` union blocks a shipped 
 the shrink from cleanup into a fix. Absent both, the residual stays shut: base being over-specified
 costs footprint, not correctness.
 
+*Trigger (b) is more detectable than the rest of this section assumes, and it is worth saying where
+a reader is deciding whether to reopen.* The saas repository ships `builder modelserver:test` and
+`modelserver:test-full`, which **run** the model loaders rather than only resolving them. Everywhere
+else in this document the saas model server appears as the obstacle — the base process that drags
+the whole stack in — and it is also the one instrument that can answer "does base's union still
+work" by execution instead of by argument. It does not change the shrink's ordering (the model
+server still needs an environment first), but it means findings 2–5 below can be re-verified rather
+than re-reasoned.
+
 Two shrinks are possible and they cost very different things:
 
 - **Half shrink — rejected.** Drop the pins from the startup compile while base is still allowed to
@@ -1673,6 +1682,12 @@ missing `project_id`/`env_id` and falls back to a **default env** (or base). Con
   Its own requirements never enter the startup compile (`REQUIREMENTS_GLOBS` has no `extension/**`
   entry); saas installs them with explicit `depends()` calls. Giving it an environment is the
   prerequisite for base becoming runtime-only.
+  *It is also the only entry point with a suite that runs models rather than resolving them* —
+  `builder modelserver:test` / `modelserver:test-full` in the saas repo — which is what makes a
+  base-side dependency move checkable at all. `engtest` cannot guard scoping (its fixture carries no
+  pipeline), `nodes:test` never loads a model family, so without this the answer to "did the base
+  union survive?" is an argument. Named here because this bullet is where a reader looks for what
+  each non-pipeline entry point can and cannot prove.
 
 ### 4.15 Compatibility & the venv master switch (`ROCKETRIDE_SERVER_USE_VENV`)
 The whole feature (venv runtime **and** per-environment scoping) is gated by one environment variable,
@@ -2275,6 +2290,36 @@ other end. Hence `surya-ocr==0.16.1` today. **The lesson generalises past this f
 in §4.9, under the per-env constraints strategy:** the global compile is an anchor for every unpinned
 name, and a scoped environment removes it.
 
+**Read off 0.17.1's own metadata, and it makes item 6b two version moves rather than one.** The
+sentence above — "item 6 is not 'move Surya' but 'move `transformers`'" — was true of what the
+compile printed and incomplete about what the target release asks for:
+
+| | 0.16.1 (installed today) | 0.17.1 (6b's target) |
+| --- | --- | --- |
+| `transformers` | `>=4.51.2,<4.54.0` | **`>=4.56.1`** — no upper bound |
+| `opencv-python-headless` | `>=4.11.0.86,<5.0.0.0` | **`==4.11.0.86`** — an exact pin |
+| `torch` | `>=2.7.0,<3.0.0` | unchanged |
+| `pillow` | `>=10.2.0,<11.0.0` | unchanged |
+
+So 6b moves `transformers` across eight providers **and** takes the whole `cv2` family with it:
+`align()` takes the minimum over the members an environment resolves, and an exact pin from a
+consumer becomes that minimum. Base would go from `4.14.0.94` cold / `4.13.0.92` warm to
+**`4.11.0.86`** for easyocr, doctr and img2table alike. Checked: all three distributions exist at
+that version, so this is a move rather than a wall — but it is a move the probe has never proved,
+and `img2table`'s `ximgproc` assertion would be running against a contrib build three minors back.
+
+*And the missing upper bound is this section's own corollary arriving a second time.* Nothing caps
+`transformers` above `4.56.1` for 0.17.1, so a scoped Surya environment — which has no union to
+supply one — would float to 5.x, exactly as 0.16.7 did before the exact pin went in. 6b almost
+certainly owes a ceiling as well as a floor.
+
+*One thing 6b does **not** owe, measured rather than assumed:* `surya.foundation`,
+`surya.recognition` and `surya.detection` are all present in 0.17.1 and all three symbols the loader
+imports are exported — the package's top level is the same fourteen entries as 0.16.1. The break is
+between 0.17 and 0.22 (`foundation` became `inference`), which is what 6a's unbounded resolve fell
+into. **6b is a version move, not a loader rewrite**, and the three `# contract-check: ignore`
+markers can genuinely lift with the version.
+
 *Recorded here rather than in item 6 because the next person to see `0.16.1` in a resolution will
 come looking for the opencv reason.* And never hand-run `uv pip compile` to re-ask: it does not
 reproduce the build's index configuration (an earlier attempt died on an unrelated `certifi` against
@@ -2645,11 +2690,30 @@ not held hostage if 6b turns out expensive.
      `writeImage`, since node code branches on `action == AVI_ACTION.END`, which no int satisfies.
      The stub is now pybind-shaped (not an int, not JSON-serializable, not equal to its own
      int), which is what makes the guard mean anything.
-   **6b — the honest `surya-ocr>=0.17,<0.18` range** and the `transformers` move it forces —
-   **open**. Its gate is a measured resolve across the eight providers that carry
-   `transformers==4.53.3` through `requirements_vision.txt` and `requirements_transformers.txt`
-   (§4.16). The three `# contract-check: ignore` markers on `ai/common/models/ocr/surya.py`'s
-   `surya.*` imports lift here, with the version.
+   **6b — the honest `surya-ocr>=0.17,<0.18` range** and the moves it forces — **open**. §4.16
+   prices it off 0.17.1's own metadata and the answer is **two** version moves, not one:
+   `transformers` `>=4.56.1` across the eight providers that carry the pin through
+   `requirements_vision.txt` and `requirements_transformers.txt`, **and** the whole `cv2` family down
+   to `4.11.0.86`, because 0.17.1 pins `opencv-python-headless` exactly and `align()` takes the
+   minimum. Probably a `transformers` **ceiling** too, since 0.17.1 declares none. The loader needs
+   no rewrite — measured, 0.17.1 still exports all three symbols — so the three
+   `# contract-check: ignore` markers on `ai/common/models/ocr/surya.py` lift here with the version.
+
+   **The gate is three checks, and only the first was in the original plan.**
+   1. *The resolve*, engine-side and cheap: does the union compile with both moves? Take it
+      **cold** (`--rebuild-cache`) — the warm one prefers what `constraints.txt` already holds and
+      will answer about the past. If it fails, nothing downstream matters.
+   2. *The models*, in saas — **and this is the gate the plan did not know it had.** Every other
+      mention of the saas model server in this document treats it as the process that loads the
+      whole stack into base, i.e. as the obstacle to §4.9's shrink. It is also the only place in
+      either repository where those eight providers' loaders actually **run**: `builder
+      modelserver:test` and `modelserver:test-full` (the latter needs an env var to stop skipping
+      the heavy models). Note `extension/scripts/tasks.js` splits `test-local` (in-process
+      inference) from `test-server` (a separate process, tests as WebSocket clients) — they
+      exercise different branches of `base.py`'s facade, so pick before running.
+   3. *The opencv half*, which **saas cannot see**: `img2table` is a node's table stack, not a
+      model, and `cv2.ximgproc` is never loaded by the model server. That move needs the family
+      probe in a base build plus the OCR node's table path.
 
 **A new numbered step, because half of it is out of this repository:** *remove TrOCR from the saas
 side, first* — **done, ahead of the deletion here, so no stub was needed.** `rocketride-saas`
@@ -2667,6 +2731,46 @@ same explicit instruction that governs this repo. It is not made on `develop` di
 half-landed cross-repo pair is already the hazard this step exists to sequence, and putting one
 half loose on the mainline is how the two get separated. Each increment that touches saas records
 its sites here, in this section, so the pairing is readable from the side that drives it.
+
+**The checkout shape, because item 6b is the first increment that has to run things on the saas
+side and the shape has a failure mode.** The saas working copy is a **worktree** of the saas
+repository, mirroring what the engine side already does, so its commits live in the saas repo's own
+`.git` and not in a second clone that can drift. Inside it the engine arrives as a **submodule** —
+which means **the engine tree now exists twice on the same branch, as two independent
+repositories**. A commit in one is invisible to the other until it is carried across, and nothing
+warns you. That is the whole hazard, and it needs a rule rather than care:
+
+- **There is exactly one working copy of the engine tree, and from 6b onward it is the submodule
+  inside the saas worktree.** Not "whichever suits the increment" — that phrasing was tried for
+  about an hour and is the drift this paragraph exists to prevent, since a change verified in one
+  checkout and committed in the other is invisible from both. The saas side wins because the model
+  suites are there and nothing else can run them; increments that need only `builder test` pay a
+  full engine build in that checkout rather than splitting the tree.
+- **The engine worktree is retained as a backup and as the place a branch lands from**, and is
+  therefore refreshed, never edited. Those are two different jobs and only the second needs it to be
+  current: `develop` is reached from the engine repository, so a branch worked in saas must be
+  carried home before it is a candidate — and until it is, the backup is behind by exactly the
+  commits that have not been carried.
+- **Carrying commits back is the same mechanism in reverse** — a bundle from the working copy,
+  fetched into the other. Landing on the engine's `develop` still happens from the engine
+  repository, so an increment worked in saas must be bundled home before it is a candidate.
+- **saas's own commits are made in the saas worktree**, and never carry engine changes: those are
+  the submodule's, and the superproject only records a gitlink.
+- **A cost to plan for, not discover:** `builder test` needs a built engine, and a fresh submodule
+  checkout has no `dist/`. Whichever copy is live for an increment pays for a full build once.
+
+**The branch reaches the submodule by `git bundle`, and that is a requirement rather than a
+convenience.** The submodule's `origin` is the public engine repository; a feature branch that must
+not exist there is one `git push` away from existing there the moment it has an upstream. So it is
+imported from a bundle and **no upstream is configured** — the branch is present, buildable, and
+unpushable by accident. An incremental bundle (`origin/develop..<branch>`) is small; measured on
+6a's three commits it was 580 KB against a 226 MB repository, so this is cheap enough to repeat on
+every refresh.
+
+*One thing does not travel with the branch and will be missed:* the `NEXT-STEP-*` and
+`INVESTIGATE-*` notes under this directory are deliberately untracked, so a fresh submodule checkout
+has none of them. They must be copied by hand. Two copies then exist — treat the one in the checkout
+where the increment is being done as authoritative, and copy it back when the increment closes.
 
 The name sweep alone could not prove the set was complete, because it cannot see a `ModelType(value)`
 built from a request string. Checked separately: there is exactly one such site, and it already
