@@ -74,6 +74,32 @@ class _MockAnswer(_MockPydantic):
     pass
 
 
+class _MockAviAction:
+    """Stand-in for one ``AVI_ACTION`` member.
+
+    Deliberately faithful to the pybind original in the three ways that bite: it is not
+    an ``int``, it is not JSON-serializable, and it does not compare equal to its own
+    int. The earlier version of these tests passed a bare ``7`` instead, which is why
+    the bridge shipped an unserializable header for every AV frame.
+    """
+
+    def __init__(self, value, name):
+        self.value = value
+        self.name = name
+
+    def __int__(self):
+        return self.value
+
+    def __repr__(self):
+        return f'<AVI_ACTION.{self.name}: {self.value}>'
+
+
+class _MockAVIACTION:
+    BEGIN = _MockAviAction(0, 'BEGIN')
+    WRITE = _MockAviAction(1, 'WRITE')
+    END = _MockAviAction(2, 'END')
+
+
 class _MockIJson:
     def __init__(self, data):
         self.data = data
@@ -89,6 +115,7 @@ _STUBBED_MODULES = ('rocketlib', 'ai', 'ai.common', 'ai.common.schema')
 def _install_stubs():
     rocketlib = MagicMock()
     rocketlib.IJson = _MockIJson
+    rocketlib.AVI_ACTION = _MockAVIACTION
     sys.modules['rocketlib'] = rocketlib
 
     schema = MagicMock()
@@ -223,23 +250,57 @@ def test_json_lane():
     assert args[0].data == {'k': 'v'}
 
 
-@pytest.mark.parametrize('lane,method', [('audio', 'writeAudio'), ('video', 'writeVideo'), ('image', 'writeImage')])
+_AV_LANES = [('audio', 'writeAudio'), ('video', 'writeVideo'), ('image', 'writeImage')]
+
+
+@pytest.mark.parametrize('lane,method', _AV_LANES)
 def test_av_write_frame(lane, method):
-    header, payload, (called, args) = _roundtrip(lane, 7, 'image/png', b'buf')
-    assert header == {'action': 7, 'mime': 'image/png'}
+    header, payload, (called, args) = _roundtrip(lane, _MockAVIACTION.WRITE, 'image/png', b'buf')
+    assert header == {'action': 1, 'mime': 'image/png'}
     assert payload == b'buf'
     assert called == method
-    assert args == (7, 'image/png', b'buf')
+    # The action arrives as the MEMBER, not the int: node code branches on
+    # `action == AVI_ACTION.WRITE`, which an int never satisfies.
+    assert args == (_MockAVIACTION.WRITE, 'image/png', b'buf')
 
 
-@pytest.mark.parametrize('lane,method', [('audio', 'writeAudio'), ('video', 'writeVideo'), ('image', 'writeImage')])
+@pytest.mark.parametrize('lane,method', _AV_LANES)
 def test_av_begin_end_frame_has_no_buffer(lane, method):
     # BEGIN/END carry action+mime but no buffer -> decode must call the 2-arg form.
-    header, payload, (called, args) = _roundtrip(lane, 1, 'audio/wav')
-    assert header == {'action': 1, 'mime': 'audio/wav'}
+    header, payload, (called, args) = _roundtrip(lane, _MockAVIACTION.BEGIN, 'audio/wav')
+    assert header == {'action': 0, 'mime': 'audio/wav'}
     assert payload is None
     assert called == method
-    assert args == (1, 'audio/wav')  # no buffer argument at all
+    assert args == (_MockAVIACTION.BEGIN, 'audio/wav')  # no buffer argument at all
+
+
+@pytest.mark.parametrize('lane,method', _AV_LANES)
+@pytest.mark.parametrize('action', [_MockAVIACTION.BEGIN, _MockAVIACTION.WRITE, _MockAVIACTION.END])
+def test_av_header_is_json_serializable(lane, method, action):
+    """The defect the OCR split found: the header went to `json.dumps` with the enum
+    still in it, so EVERY audio/video/image frame died at the venv boundary. No driver
+    had ever sent an AV lane across one, and these tests passed a bare int.
+    """
+    header, _payload = lanes.encode(lane, action, 'image/png', b'buf')
+    assert json.loads(json.dumps(header)) == header
+
+
+@pytest.mark.parametrize('lane,method', _AV_LANES)
+def test_av_decode_rejects_an_unknown_action(lane, method):
+    inst = _Capture()
+    with pytest.raises(ValueError, match='unknown AVI action'):
+        lanes.decode(inst, lane, b'buf', {'action': 99, 'mime': 'image/png'})
+    assert inst.calls == []
+
+
+@pytest.mark.parametrize('lane,method', _AV_LANES)
+def test_av_accepts_a_plain_int_action(lane, method):
+    """`int()` on encode rather than a lookup, so a caller already holding the int
+    is unaffected -- and it still arrives decoded as the member.
+    """
+    header, payload, (called, args) = _roundtrip(lane, 2, 'image/png')
+    assert header == {'action': 2, 'mime': 'image/png'}
+    assert args == (_MockAVIACTION.END, 'image/png')
 
 
 def test_questions_lane():

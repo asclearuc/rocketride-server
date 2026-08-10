@@ -54,7 +54,15 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Tuple
 
 from ai.common.schema import Answer, Doc, Question
-from rocketlib import IJson
+from rocketlib import AVI_ACTION, IJson
+
+# `AVI_ACTION`'s members are pybind values, and all three properties that matter here
+# are surprises: they are not JSON-serializable, they are not ints, and they do not
+# compare equal to their own int (`0 == AVI_ACTION.BEGIN` is False). So the wire carries
+# the int and the decoder maps it back -- handing a raw int to `writeImage` would match
+# no branch and silently drop every frame. Built as a table because `AVI_ACTION(0)` is
+# not available: the class takes no arguments.
+_AVI_ACTIONS = {int(value): value for value in (AVI_ACTION.BEGIN, AVI_ACTION.WRITE, AVI_ACTION.END)}
 
 
 class LaneNotBridgeable(Exception):
@@ -137,12 +145,15 @@ def _make_av_encode():
     (no base64). ``buffer`` is optional -- BEGIN/END frames carry no bytes, only WRITE
     does -- so a missing buffer becomes a ``None`` payload (wire type ``none``).
 
+    ``action`` is normalised to its int for the wire; see ``_AVI_ACTIONS``. ``int()``
+    rather than a lookup, so a caller that already holds the int is unaffected.
+
     NOTE (step 7): a >~1 MB AV buffer exceeds the WebSocket ``max_size`` and is not yet
     chunked -- raising the AV ceiling is part of the live-transport work in step 7.
     """
 
     def _encode(action, mimeType, buffer=None):
-        return {'action': action, 'mime': mimeType}, buffer
+        return {'action': int(action), 'mime': mimeType}, buffer
 
     return _encode
 
@@ -152,11 +163,17 @@ def _make_av_decode(method_name):
 
     Omits the buffer argument entirely when there is none (BEGIN/END), matching how
     the engine is actually driven, rather than passing an explicit ``None``.
+
+    Rebuilds the ``AVI_ACTION`` member from the wire's int: node code branches on
+    ``action == AVI_ACTION.END``, which an int never satisfies.
     """
 
     def _decode(instance, payload, header):
         method = getattr(instance, method_name)
-        action, mime = header['action'], header['mime']
+        raw = header['action']
+        if raw not in _AVI_ACTIONS:
+            raise ValueError(f'unknown AVI action {raw!r} on the {method_name} lane')
+        action, mime = _AVI_ACTIONS[raw], header['mime']
         if payload is None:
             method(action, mime)
         else:
