@@ -95,4 +95,28 @@
 	//		which this single-engine, table-free component reads.
 	//
 	"fields": {}
+	//
+	// Deliberately ABSENT: `test` and `fulltest`.
+	//		Written here because an absent key explains nothing on its own,
+	//		and the reason is not obvious: discovery would find such a block
+	//		and run it, so the omission looks like a coverage gap rather than
+	//		a decision.
+	//
+	//		It is a decision. `nodes:test` builds a pipeline with no Virtual
+	//		Environment container, so the case would run in the SHARED
+	//		environment - and running it makes depends() install this
+	//		component's dependencies there, which is exactly what the split
+	//		exists to prevent. Measured: adding a `test` block here does
+	//		discover, parametrize and group correctly, then dies on
+	//		`No module named 'PIL'`, because this dist carries no ML stack at
+	//		all. The design working, not failing.
+	//
+	//		`test_services_declarations.py` asserts both keys stay absent, so
+	//		adding one turns that test red rather than silently changing where
+	//		these packages land. Automating this component would need the node
+	//		test framework to declare a VE container first - PipelineBuilder
+	//		emits none. Until then the only real execution is the manual
+	//		`venv_live.py ocr_split` / `ocr_surya_only` driver.
+	//		See virtual-environments.md 8.4.
+	//
 }

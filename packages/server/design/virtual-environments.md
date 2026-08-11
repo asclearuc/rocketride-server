@@ -3,7 +3,9 @@
 **Status:** Living document — largely implemented. Phase 2A (per-environment scoping) and Phase 2B
 (the venv runtime, steps 4–8.7) are shipped and live-verified; what remains open is named where it
 lives — §4.9's base shrink, §4.10's second-run-collision question, the client half of `rrext_venv`
-(§7), Phase 2C, and 2A-4 (§4.16, in progress). Each increment's record sits with its section, so
+(§7), and Phase 2C. **2A-4 closed with 6b** (§4.16), which ended in a measurement rather than the
+version move it was scoped as; the one thing it carries forward is the barrel import named at the
+end of its §7 entry. Each increment's record sits with its section, so
 "is this built?" is answered locally rather than here. *This field read "Draft (design round — no
 implementation yet)" through the whole of 2A and 2B; a status nobody updates is worse than none,
 which is why it now points at the sections that carry the truth instead of restating it.*
@@ -1215,11 +1217,29 @@ biggest lever venvs pull is *not sharing one constraint resolution*.
   carried a bare `surya-ocr`, held at `0.16.1` in every environment only because `ai/**` resolves
   beside `transformers==4.53.3`; scoped, it took `0.22.1`, whose API the loader does not target,
   and a `>=0.16,<0.17` cap then took `0.16.7`, whose looser bounds let `transformers` reach `5.x`
-  and broke it from the other side. Two failures, one cause. *The question every scoping increment
+  and broke it from the other side. Two failures, one cause. **Item 6b sharpened the second one by
+  reading the release metadata directly (§4.16):** the ceiling did not loosen gradually across the
+  patch line — `0.16.2` through `0.16.5` still carry `transformers<4.54.0`, and it was **`0.16.6`**
+  that dropped the bound outright. So the `<0.17` cap was not merely imprecise; it reached exactly
+  the two releases where the anchor had been removed upstream, which is why the float went all the
+  way to `5.15.0` rather than somewhere survivable. *The question every scoping increment
   now inherits:* for each name this environment newly resolves alone — **what was its upper bound,
   and was the global compile supplying it?** The cheap answer is an exact pin where the tree already
   installs exactly one version, which is a *declaration* of the status quo rather than a version
   move; the expensive answer is the honest range, which is a resolve to measure.
+- **The corollary has a base-compile twin, and 6b tripped over it by accident.** The rule above says
+  the global compile *is* the anchor a scoped environment loses. But a name that **nothing** in the
+  tree bounds has no anchor even in base: the union can only intersect what it is given. 6b's
+  verification cold resolve (`--rebuild-cache`, both roots, versions otherwise unchanged) moved five
+  names against a baseline taken from a warm cache days earlier — and the interesting one is
+  `mistralai`, declared as a bare name in `llm_mistral` and `llm_vision_mistral`, which went
+  **`1.12.4` → `2.9.2`**: a silent major bump, dragging `jsonpath-python` in and dropping `invoke`
+  with it. Nothing was wrong with the resolve; it did exactly what an unbounded requirement asks for.
+  *The point for this section:* a warm `constraints.txt` is the only thing holding such a name still,
+  so **every cold rebuild is a potential major-version change for the unpinned set**, in base as much
+  as in an overlay — and it will land in whatever increment happens to run `--rebuild-cache` next,
+  attributed to that increment by anyone reading the diff. The same question applies: what was its
+  upper bound, and was anything supplying one?
 - **Why `ai` makes this essential:** `ai/**` modules carry their own pins (`torch/requirements.txt` →
   `torch==2.10.0+cu128`, `requirements_detection.txt` → `rfdetr`, …). Under one global compile every pin
   meets every other; per-env, only the pins of the `ai` modules an env's nodes actually reach (via the
@@ -1249,9 +1269,25 @@ change safe. (b) A **real conflict inside base's `ai/**` union blocks a shipped 
 the shrink from cleanup into a fix. Absent both, the residual stays shut: base being over-specified
 costs footprint, not correctness.
 
+**That last clause no longer holds for one package, and item 6b is where it broke.** 6b measured all
+sixteen published `surya-ocr` releases (§4.16) and found that every one from 0.16.2 onward pins
+`opencv-python-headless` exactly, so no upgrade can be taken while `ai/**` sits in the base compile —
+the pin would drag the whole base `cv2` family down with it. For `surya-ocr`, being over-specified
+therefore costs **every future release of the package, permanently**, including bug and security
+fixes. That is not footprint.
+
+Whether it satisfies (b) as written is deliberately left to whoever owns this residual: read
+literally, nothing is blocked *today* — 0.16.1 and base `cv2` at 4.14.0.94 coexist — and what the
+measurement establishes is a permanently blocked *upgrade path* rather than a broken shipped pair.
+6b does not claim the trigger; it records the counter-example to the sentence holding the residual
+shut, and leaves the reopening decision with the evidence attached. Trigger (a) remains unmet and
+still gates the work, and the ordering constraint below is untouched.
+
 *Trigger (b) is more detectable than the rest of this section assumes, and it is worth saying where
-a reader is deciding whether to reopen.* The saas repository ships `builder modelserver:test` and
-`modelserver:test-full`, which **run** the model loaders rather than only resolving them. Everywhere
+a reader is deciding whether to reopen.* The saas repository ships `builder model_server:test` and
+`model_server:test-full` (the namespace takes an underscore; `modelserver` is only the
+`--modelserver=<addr>` CLI flag, and §8.4 records why the two get confused), which **run** the model
+loaders rather than only resolving them. Everywhere
 else in this document the saas model server appears as the obstacle — the base process that drags
 the whole stack in — and it is also the one instrument that can answer "does base's union still
 work" by execution instead of by argument. It does not change the shrink's ordering (the model
@@ -1683,7 +1719,7 @@ missing `project_id`/`env_id` and falls back to a **default env** (or base). Con
   entry); saas installs them with explicit `depends()` calls. Giving it an environment is the
   prerequisite for base becoming runtime-only.
   *It is also the only entry point with a suite that runs models rather than resolving them* —
-  `builder modelserver:test` / `modelserver:test-full` in the saas repo — which is what makes a
+  `builder model_server:test` / `model_server:test-full` in the saas repo — which is what makes a
   base-side dependency move checkable at all. `engtest` cannot guard scoping (its fixture carries no
   pipeline), `nodes:test` never loads a model family, so without this the answer to "did the base
   union survive?" is an argument. Named here because this bullet is where a reader looks for what
@@ -2290,35 +2326,83 @@ other end. Hence `surya-ocr==0.16.1` today. **The lesson generalises past this f
 in §4.9, under the per-env constraints strategy:** the global compile is an anchor for every unpinned
 name, and a scoped environment removes it.
 
-**Read off 0.17.1's own metadata, and it makes item 6b two version moves rather than one.** The
-sentence above — "item 6 is not 'move Surya' but 'move `transformers`'" — was true of what the
-compile printed and incomplete about what the target release asks for:
+**Priced off one release, item 6b looked like two version moves. Priced off all sixteen, it is not
+available at all — and `0.16.1` stops being an accident.** The reading below replaces an earlier one
+that took 0.17.1's metadata as the item's price; that was true of 0.17.1 and wrong about the item,
+because the constraint that decides it appears two releases *earlier* and never goes away.
 
-| | 0.16.1 (installed today) | 0.17.1 (6b's target) |
-| --- | --- | --- |
-| `transformers` | `>=4.51.2,<4.54.0` | **`>=4.56.1`** — no upper bound |
-| `opencv-python-headless` | `>=4.11.0.86,<5.0.0.0` | **`==4.11.0.86`** — an exact pin |
-| `torch` | `>=2.7.0,<3.0.0` | unchanged |
-| `pillow` | `>=10.2.0,<11.0.0` | unchanged |
+| version | date | `transformers` | `opencv-python-headless` |
+| --- | --- | --- | --- |
+| 0.16.0 | 2025-08-29 | `>=4.51.2,<4.54.0` | **`>=4.11.0.86,<5.0.0.0`** |
+| **0.16.1** *(installed)* | 2025-09-02 | `>=4.51.2,<4.54.0` | **`>=4.11.0.86,<5.0.0.0`** |
+| 0.16.2 – 0.16.5 | 2025-09-05…08 | `>=4.51.2,<4.54.0` | `==4.11.0.86` |
+| 0.16.6 – 0.16.7 | 2025-09-08 | `>=4.56.1` | `==4.11.0.86` |
+| 0.17.0 / 0.17.1 | 2025-09-23 / 2026-01-30 | `>=4.56.1` | `==4.11.0.86` |
+| 0.20.0 | 2026-05-27 | `>=4.56.1` | `==4.11.0.86` |
+| 0.21.0 – 0.22.1 | 2026-07-08…20 | `>=5.12.1` | `==4.11.0.86` |
 
-So 6b moves `transformers` across eight providers **and** takes the whole `cv2` family with it:
-`align()` takes the minimum over the members an environment resolves, and an exact pin from a
-consumer becomes that minimum. Base would go from `4.14.0.94` cold / `4.13.0.92` warm to
-**`4.11.0.86`** for easyocr, doctr and img2table alike. Checked: all three distributions exist at
-that version, so this is a move rather than a wall — but it is a move the probe has never proved,
-and `img2table`'s `ximgproc` assertion would be running against a contrib build three minors back.
+`torch` is `>=2.7.0,<3` throughout, and there are no 0.18.x or 0.19.x releases — the line jumps
+0.17.1 → 0.20.0. Three conclusions, in order of how much they change the item:
 
-*And the missing upper bound is this section's own corollary arriving a second time.* Nothing caps
-`transformers` above `4.56.1` for 0.17.1, so a scoped Surya environment — which has no union to
-supply one — would float to 5.x, exactly as 0.16.7 did before the exact pin went in. 6b almost
-certainly owes a ceiling as well as a floor.
+1. **No newer Surya avoids the downgrade.** The exact `==4.11.0.86` pin is in *every* release from
+   0.16.2 to the current 0.22.1; the loose range exists in exactly two, 0.16.0 and 0.16.1, and the
+   tree is on the later of them. Since `align()` takes the minimum over the members an environment
+   resolves, an exact pin from a consumer becomes that minimum: base would go from `4.14.0.94` cold
+   / `4.13.0.92` warm to `4.11.0.86` for easyocr, doctr, img2table, mediapipe and rtmlib alike, with
+   `img2table`'s `ximgproc` assertion running against a contrib build three minors back. **There is
+   no upgrade target that leaves the base `cv2` family where it is.**
 
-*One thing 6b does **not** owe, measured rather than assumed:* `surya.foundation`,
+   *The downgrade is a move, not a wall, and the distinction is measured rather than assumed:* **all
+   four** family members — `opencv-python`, `opencv-contrib-python`, `opencv-python-headless`,
+   `opencv-contrib-python-headless` — publish `4.11.0.86` (7 files each on PyPI), so the aligned
+   compile would resolve. What stops it is the direction, not the availability, which is why this is
+   a decision about where packages may land and not a resolver failure. *Counted as four, because an
+   earlier draft of this paragraph said "three": that counted the members this tree happens to
+   consume rather than the family `align()` operates over, and the alignment minimum is taken across
+   the family.* Checking that kind of claim has one non-obvious step: **`uv pip download` does not
+   exist**. Use `<dist>/Scripts/uv.exe pip install --target <tmp> --no-deps --dry-run <spec>`, which
+   plans the install without performing it.
+
+   *Three versions circulate in this story and they are easy to conflate.* `4.13.0.92` is the pin of
+   the **deleted** `ai.common.opencv` shim, still visible in `nodes/src/nodes/constraints.lock`,
+   which is a separate resolution of the nodes tree and not the base compile. `4.14.0.94` is what
+   base resolves **today** (`nodes/src/nodes/ocr/README.md`'s "Resolved here" column agrees).
+   `4.11.0.86` is what an upgraded Surya **would force** — installed nowhere, the hypothetical the
+   measurement priced.
+2. **The two moves are inseparable, and not because of 0.17.** `ai/**` is in the base compile in
+   both modes, and 0.16.1 declares `transformers<4.54.0` — so raising the base to `>=4.56.1` makes
+   the installed pin unsatisfiable, while every release that *does* admit `>=4.56.1` is `>=0.16.6`,
+   each carrying the exact opencv pin. "Move `transformers` only, leave Surya alone" is the reading
+   most likely to be tried next, and it is not available.
+3. **The `transformers` floor moved at 0.16.6, and the patch releases below it did not.** This
+   section used to say "the patch releases above 0.16.1 dropped their upper bound" — true of 0.16.6
+   and 0.16.7, but not of 0.16.2 – 0.16.5, which kept `<4.54.0` and changed only the opencv line.
+   The precision matters twice: it is what makes the measured 0.16.7 failure legible (a
+   `>=0.16,<0.17` cap reached 0.16.7, whose unbounded floor let `transformers` reach 5.15.0), and it
+   shows the two upstream changes were independent — opencv tightened at 0.16.2, `transformers`
+   opened at 0.16.6.
+
+**So `0.16.1` is load-bearing in a stronger sense than 6a could see.** Not merely "what the global
+compile happens to admit", but the **last release whose opencv requirement is a range** — hence the
+only version above 0.16.0 that lets the base `cv2` family sit anywhere other than 4.11.0.86.
+`nodes/src/nodes/ocr/README.md` already depended on this without naming it, recording that the
+scoped Surya environment lands on 4.14.0.94 precisely because 0.16.1 asks for a range; that sentence
+stays true exactly as long as the pin does.
+
+*One thing the item does **not** owe, measured rather than assumed:* `surya.foundation`,
 `surya.recognition` and `surya.detection` are all present in 0.17.1 and all three symbols the loader
 imports are exported — the package's top level is the same fourteen entries as 0.16.1. The break is
 between 0.17 and 0.22 (`foundation` became `inference`), which is what 6a's unbounded resolve fell
-into. **6b is a version move, not a loader rewrite**, and the three `# contract-check: ignore`
-markers can genuinely lift with the version.
+into. So this was never a loader rewrite — but since the version does not move either, the three
+`# contract-check: ignore` markers stay where they are.
+
+*Two stale statements in the tree were left standing, deliberately, and are recorded here instead.*
+`surya.py`'s `load()` docstring introduces the predictor classes as "Surya 0.17.0+", and the first
+line of `requirements_surya.txt` still prices this item as costing "a transformers move" — both
+written before the measurement above. Neither is worth a comment-only commit on its own, and both
+are superseded by this section; anyone reading either one should come here for the version story.
+The docstring's claim is wrong in a narrow way worth naming: those three classes are present at the
+pinned `0.16.1`, so nothing about the loader depends on 0.17.
 
 *Recorded here rather than in item 6 because the next person to see `0.16.1` in a resolution will
 come looking for the opencv reason.* And never hand-run `uv pip compile` to re-ask: it does not
@@ -2480,7 +2564,10 @@ reproduce the build's index configuration (an earlier attempt died on an unrelat
    venv *runtime* is primarily for **internal / no-model-server mode**, where conflicting nodes share one
    in-process interpreter. This sharpens sequencing: ship 2A broadly, prioritize 2B for internal-mode
    users.
-**2A-4 — shared-namespace package families, environment facts and probes (IN PROGRESS).** Not "OCR
+**2A-4 — shared-namespace package families, environment facts and probes (CLOSED).** Items 1-5 and
+6a landed; 6b ended in a measurement that removed it rather than a version move (below). One thing
+is carried forward deliberately and named at the end of this entry: the all-or-nothing barrel
+import, which the next loader deletion meets again. Not "OCR
 opencv de-conflict" any more: the OCR split is the framework's *first consumer*, not its subject.
 The mechanism is §4.16, and so is the fact base the investigation produced — the craft/Surya
 collision, why uv reports no conflict between two distributions sharing `cv2`, the three endings
@@ -2609,7 +2696,9 @@ not held hostage if 6b turns out expensive.
    `gliner` alone and needs nothing; checked rather than assumed, since the obvious expectation is
    that the two node files behave alike.
 6. **The OCR node split and the honest Surya range** — split into 6a and 6b once measurement showed
-   the two are independent. 6a is below and has landed; 6b is at the end of this entry and is open.
+   the two are independent. 6a is below and has landed; 6b is at the end of this entry and closed as
+   **measured, not available as specified** — the range costs a base-wide `cv2` downgrade, not the
+   `transformers` move it was priced as.
 
    **6a — the component split** (Layout S, granularity M) *(landed)* — **no version moved**, which is
    what makes it verifiable on its own. `nodes/ocr/` became a package root holding two components:
@@ -2690,14 +2779,33 @@ not held hostage if 6b turns out expensive.
      `writeImage`, since node code branches on `action == AVI_ACTION.END`, which no int satisfies.
      The stub is now pybind-shaped (not an int, not JSON-serializable, not equal to its own
      int), which is what makes the guard mean anything.
-   **6b — the honest `surya-ocr>=0.17,<0.18` range** and the moves it forces — **open**. §4.16
-   prices it off 0.17.1's own metadata and the answer is **two** version moves, not one:
-   `transformers` `>=4.56.1` across the eight providers that carry the pin through
-   `requirements_vision.txt` and `requirements_transformers.txt`, **and** the whole `cv2` family down
-   to `4.11.0.86`, because 0.17.1 pins `opencv-python-headless` exactly and `align()` takes the
-   minimum. Probably a `transformers` **ceiling** too, since 0.17.1 declares none. The loader needs
-   no rewrite — measured, 0.17.1 still exports all three symbols — so the three
-   `# contract-check: ignore` markers on `ai/common/models/ocr/surya.py` lift here with the version.
+   **6b — the honest `surya-ocr>=0.17,<0.18` range — MEASURED, and not available as specified.**
+   The pricing above read one release; §4.16 now reads all sixteen, and the item changes shape. The
+   blocker is not the `transformers` move: `opencv-python-headless` is an **exact** pin in every
+   release from **0.16.2** onward, so any upgrade drags the whole base `cv2` family down. `0.16.1`
+   is the last release declaring it as a range — which makes today's pin the only version above
+   0.16.0 that lets the base family sit anywhere else, rather than the accident 6a wrote down. Nor
+   can the moves be separated: 0.16.1 caps `transformers<4.54.0`, so raising the base makes the pin
+   unsatisfiable, and every release admitting `>=4.56.1` is `>=0.16.6` — each carrying the exact
+   opencv pin. Direction taken: **never drag the base down, so the pin stays.** The three
+   `# contract-check: ignore` markers on `ai/common/models/ocr/surya.py` therefore stay too; they
+   were to lift with the version, and the version does not move.
+
+   **What would make it available is not in this item's gift.** It is `ai/**` leaving the base
+   compile — §4.9's deferred *"base is not yet runtime-only"* residual. 6b's contribution there is
+   evidence, not a decision: that residual stays shut on the stated ground that over-specifying base
+   *"costs footprint, not correctness"*, and for `surya-ocr` that is now false — the cost is every
+   future release of the package, permanently. Whether that meets reopening trigger (b) is the
+   residual owner's call; §4.9 records the finding.
+
+   **6b also tested the boundary around this component's node coverage, and reverted the test.**
+   Nothing in either repository executes `SuryaLoader`, so a `test` key was added to
+   `services.surya.json` to close what looked like a gap. It is not a gap:
+   `test_services_declarations.py::TestSuryaKeySet` pins the key set and asserts `test`/`fulltest`
+   absent, because `nodes:test` runs in the shared environment while this component's engine lives
+   in a scoped overlay by design. The run confirmed the reason empirically — see §8.4, which records
+   both the mechanism (it discovers and groups correctly) and the objection (it would install this
+   component's dependencies into the shared runtime).
 
    **The gate is three checks, and only the first was in the original plan.**
    1. *The resolve*, engine-side and cheap: does the union compile with both moves? Take it
@@ -2707,10 +2815,13 @@ not held hostage if 6b turns out expensive.
       mention of the saas model server in this document treats it as the process that loads the
       whole stack into base, i.e. as the obstacle to §4.9's shrink. It is also the only place in
       either repository where those eight providers' loaders actually **run**: `builder
-      modelserver:test` and `modelserver:test-full` (the latter needs an env var to stop skipping
-      the heavy models). Note `extension/scripts/tasks.js` splits `test-local` (in-process
-      inference) from `test-server` (a separate process, tests as WebSocket clients) — they
-      exercise different branches of `base.py`'s facade, so pick before running.
+      model_server:test` and `model_server:test-full`. **Not via an env var** — that was the
+      original guess and it is wrong: the heavy models are gated by pytest *markers*, and both
+      halves of `test-full` append `-m 'not slow'`, so its 21 `slow` tests are skipped there too.
+      Reaching them needs an explicit `--pytest="-m slow"` (§8.4). Note
+      `extension/scripts/tasks.js` splits `test-local` (in-process inference) from `test-server`
+      (a separate process, tests as WebSocket clients) — they exercise different branches of
+      `base.py`'s facade, so pick before running.
    3. *The opencv half*, which **saas cannot see**: `img2table` is a node's table stack, not a
       model, and `cv2.ximgproc` is never loaded by the model server. That move needs the family
       probe in a base build plus the OCR node's table path.
@@ -3818,6 +3929,128 @@ measured).
 - **`--target` does not treat base as satisfying — VERIFIED** and now pinned by a test (see the
   pin-beats-base entry above): `uv pip install --target <empty dir> requests==2.32.3` plans the full
   tree although base holds 2.34.2. [2A]
+
+### 8.4 Test matrix for venv increments
+
+**Which command, from which root, with which knob — because two of the three answers change with the
+root and the third is inert in the lane people reach for.** Written down at 6b, which is the first
+increment that had to run things on both sides.
+
+| command | run from | env / parallelism |
+| --- | --- | --- |
+| `builder test` | saas root **and** submodule | two roots, two dists, two caches — **and two different module sets** |
+| `builder nodes:test` | saas root **and** submodule | **needs `ROCKETRIDE_INCLUDE_SKIP`**; xdist defaults to `min(cpus, 8)`, tune with `--pytest-parallel=N` |
+| `builder model_server:test` / `:test-full` | saas root only (not discoverable from the submodule) | **no env var, no `--pytest-parallel`** — neither reaches this lane; it runs single-process |
+
+**The namespace is `model_server:`, with an underscore.** No `modelserver:` task is registered
+anywhere; lookup is `registry.getAction(command)` and an unregistered name exits with `Error:
+Unknown action` (`build.js:450-452`). `--modelserver=<addr>` is a CLI flag only (`build.js:160-165`),
+which is where the confusion comes from — including in this document, which carried the wrong form
+until 6b corrected it.
+
+**`builder test` is not a task, it is a global command.** `expandGlobalCommands` (`build.js:195-213`)
+turns a bare `test` into `<module>:test` for every registered module whose action carries a
+*description* — its test for "public". The registry differs by root: from the submodule it holds the
+engine modules; from the saas root `registry.discover(overlayRoot)` (`build.js:367-368`) adds the
+overlay's — `extension`, `model_server`, `saas`, `alb`, `redis`, `stripe`. Two consequences:
+
+- **`builder test` at the saas root already runs `model_server:test`**, whose action returns
+  `{ description: 'Testing model_server', steps }`. Running `builder test`, then
+  `builder model_server:test`, then `builder model_server:test-full` executes it three times — once
+  expanded, once explicitly, once nested. Not a correctness problem; a budgeting one.
+- **It is therefore an engine run**, since `model_server:test` brackets `start-server` →
+  `test-server` → `stop-server`. The submodule-root run is not. Do not assume a command called
+  `test` is inert.
+
+**`--overlay-root` rewrites `paths.DIST_ROOT`** (`build.js:124-128`), and the saas `builder` appends
+its own after the submodule's, so the last one wins. From the saas root the build and cache are
+`<saas>/dist`; from the submodule, `<submodule>/dist`. Their `requirements.hash` files differ in
+format (saas `<md5>:<16hex>`, submodule `<md5>`) and **invalidate independently** — a cold resolve on
+one side says nothing about the other.
+
+**Two heavy-model gates, each inert in the other's lane.** `ROCKETRIDE_INCLUDE_SKIP` is a
+comma-separated list of **node directory names**, read only in the `node_test_config` branch
+(`nodes/test/conftest.py:327`, list at 299-326) — i.e. by `test_dynamic.py`, which is `nodes:test`.
+`model_server:test` / `:test-full` neither need it nor respond to it: they run
+`extension/test/model_server` (its own conftest) and `nodes/test/test_dynamic_full.py`, and the
+latter goes through `node_fulltest_config`, which applies **no** skip filter at all
+(`conftest.py:332-337`). `model_server:*` gates instead on pytest **markers** — `-m 'not slow'`
+(test-local), `-m 'not slow and not local_torch'` (test-server) — appended only when no explicit
+`-m`/`-k` arrives via `--pytest="args"` (equals sign required, `build.js:83`).
+
+**A skip-listed node is dropped before parametrization, not emitted as a skip.**
+`_build_parametrize_list` `continue`s over it (`conftest.py:261-263`); only a missing `requiresLibs`
+produces an emitted-but-skipped item. So the variable does not change a lane's skip count, it
+changes how many items exist at all — which is what makes lane arithmetic predictable across a
+version-moving increment. A second silent drop lives beside it: an unsatisfied `requires` entry also
+`continue`s, with **no warning at all** (`has_required_env_vars()`, `discovery.py:113-118`).
+
+**`model_server:test-full` does not run the model-server suite's heavy tests.** `test-full` is
+`model_server:test` + `model_server:nodes-test-full` (`extension/scripts/tasks.js:551-556`), and the
+first half is the same `-m 'not slow'` invocation as plain `model_server:test` — so the 21
+`@pytest.mark.slow` tests are skipped there too, and reaching them needs an explicit
+`--pytest="-m slow"`. What `test-full` *does* load heavily is its second half:
+`model_server:warmup-models` pre-downloads weights for whatever the nodes' `fulltest` profiles
+declare, and `run-fulltest` runs `test_dynamic_full.py` with neither a marker nor a skip filter
+(`tasks.js:313-335`). Heavy models therefore run through the nodes-fulltest path, not through the
+model-server suite — a distinction that decides what a green run proves.
+
+**Parallelism belongs to one lane only.** `--pytest-parallel=N|auto|off` is consumed in exactly one
+place, `nodes/scripts/tasks.js:218`, so it applies to `nodes:test`, where it defaults to
+`min(cpus, 8)`. Both model-server pytest invocations build their argument list with no `-n` at all
+(`extension/scripts/tasks.js:195` and `:323`) and already run single-process; the flag is silently
+ignored there. The OOM risk it exists for is handled in `nodes:test` without intervention: heavy
+configs are marked `xdist_group('gpu')` whenever `'gpu' in capabilities` (`conftest.py:236-243`,
+applied at 271-272) and the task pushes `--dist loadgroup` unless the caller overrode `--dist`
+(`nodes/scripts/tasks.js:228-230`), so model loads serialize onto one worker.
+
+**Coverage this matrix does not give you, recorded so a green run is not over-read.** `model_server:*`
+has no Surya test at all; `ner`/GLiNER is absent from `test_models.py`, living only in
+`test_chaos.py` and `stress.py` — reached by `model_server:test-chaos` / `:test-fixed`, neither of
+which is part of `test` or `test-full`.
+
+**The Surya component's absence from `nodes:test` is a designed boundary, and 6b measured what
+enforces it.** `test_services_declarations.py::TestSuryaKeySet` pins the file's key set exactly and
+separately asserts `test`/`fulltest` are absent, giving the reason: *"`nodes:test` runs in the shared
+environment and this component's engine lives in a scoped overlay by design."* 6b added a `test`
+block anyway, to learn what the boundary was made of, and reverted it. Two things came back:
+
+- The mechanism is sound end to end. The config discovers, parametrizes and groups exactly as
+  intended — `ocr:services.surya@gpu`, one param, `outputs: ["text"]`, the `gpu` capability pulling
+  in `xdist_group`. Nothing about the plumbing objects to a Surya test.
+- The objection is the *environment*, and it is the split's whole point. The run died on
+  `RuntimeError: No module named 'PIL'`, and the reason is broader than Surya: **this `dist` carries
+  no ML stack at all** — no torch, transformers, surya, easyocr, doctr or cv2 under
+  `dist/server/lib/site-packages`, only numpy. Running the case would make `depends()` install this
+  component's dependencies **into the shared runtime**, which is precisely what the 6a split exists
+  to prevent.
+
+*Two things this does not mean, stated because the short version invites both.* It is **not** the
+`contract-check: skip-install` marker doing the blocking — that marker is read only by
+`tools/contract_checks/`, never by the engine's runtime `depends()`. And it is **not** impossible in
+principle: `depends()` installs on demand, so the case could be made to run by letting it populate
+base. The boundary is a decision about where those packages are allowed to land, not a limitation.
+
+So the coverage position is: the only execution that carries meaning is the scoped one, and it stays
+manual under `e:\tmp\venv-drivers\venv_live.py ocr_split` / `ocr_surya_only`. Automating it needs the
+node-test framework to declare a VE container — `PipelineBuilder` emits none today (no `venv` or
+`container` reference anywhere in `nodes/test/framework/`) — and that, not a `test` key, is the
+prerequisite. [2A]
+
+**Two mechanics the full run needs, recorded because both cost time to rediscover.** A full
+`builder test` needs the **#1879 port bypass** — `basePort: 30000` → `31000` in
+`packages/client-typescript/scripts/tasks.js` — reverted with `git checkout --` *before* committing,
+since that file must never appear in a diff. And on Windows the C++ test target needs the MSVC
+environment **in the same shell as the build**: `server:setup-tools` detects Visual Studio and
+records state, but the child `ninja` invokes `cl` by bare name and inherits nothing, so a run from a
+plain shell dies with `CreateProcess failed: The system cannot find the file specified` while
+building `aptest`. Apply `vcvars64.bat` in the shell that runs the build.
+
+For an increment that moves the OCR/vision versions, the value covering the affected nodes is:
+
+```text
+ROCKETRIDE_INCLUDE_SKIP=ocr,ner,detect,detect_segment,caption,background_removal,depth_estimate,embedding_image,embedding_video,embedding_transformer
+```
 
 ## 9. Critical files (for implementation)
 - **Reuse foundation:** `nodes/src/nodes/remote/client/prepare_pipeline.py` (transform → share/generalize);
