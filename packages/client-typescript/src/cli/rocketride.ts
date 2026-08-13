@@ -48,6 +48,12 @@
  * which `rocketride init` writes.
  */
 
+// `process` is the Node process object, imported as a default and never `import * as`:
+// the namespace form compiles to `__importStar(require('process'))`, which copies only
+// OWN enumerable properties — so `exit`, `argv` and `env` survive but `on`, which lives
+// on EventEmitter.prototype, does not. That made `setupSignalHandlers` throw
+// `process.on is not a function` in the constructor, i.e. before any command ran, and
+// the whole CLI exited on `--help`.
 import process from 'node:process';
 
 import { Command } from 'commander';
