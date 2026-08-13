@@ -40,6 +40,15 @@ const README_DEST = path.join(APP_ROOT, 'README.md');
 
 // State keys for source fingerprints (webview bundles shared via Canvas)
 const SRC_HASH_KEY = 'vscode.srcHash';
+// The extension-host TYPE CHECK's own fingerprint. It used to share
+// SRC_HASH_KEY with build-webview, which runs before it in vscode:compile and
+// saves that key on success — so compile-typescript found the hash already
+// current and skipped, every time, for any change confined to apps/vscode/src.
+// Its `tsc -p ./` therefore ran only where build/vscode/out was missing (a
+// fresh clone, or after vscode:clean), which is why CI still caught drift and
+// local runs silently did not. Same reasoning as BUNDLE_SHARED_UI_HASH_KEY
+// below: a step that gates on a key must be the only step that saves it.
+const TSC_HASH_KEY = 'vscode.tscHash';
 const BUNDLE_HASH_KEY = 'vscode.bundleHash';
 const SHARED_UI_HASH_KEY = 'vscode.sharedUiHash';
 // The extension-host bundle's OWN shared fingerprint — esbuild inlines
@@ -107,7 +116,7 @@ function makeCompileTypescriptAction() {
 	return {
 		run: async (ctx, task) => {
 			// Check if source changed
-			const { changed, hash } = await hasSourceChanged(SRC_DIR, SRC_HASH_KEY);
+			const { changed, hash } = await hasSourceChanged(SRC_DIR, TSC_HASH_KEY);
 			// Output goes to build/vscode/out per tsconfig.json
 			const outputExists = await exists(path.join(BUILD_DIR, 'out'));
 
@@ -120,7 +129,7 @@ function makeCompileTypescriptAction() {
 			await execCommand('npx', ['tsc', '-p', './', '--outDir', outDir], { task, cwd: APP_ROOT });
 
 			// Save hash after successful compile
-			await saveSourceHash(SRC_HASH_KEY, hash);
+			await saveSourceHash(TSC_HASH_KEY, hash);
 		},
 	};
 }
