@@ -217,6 +217,84 @@ def _flatten_members(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return flat
 
 
+def _prune_unreachable(components: List[Dict[str, Any]], source: Optional[str]) -> List[Dict[str, Any]]:
+    """Drop everything the run's source cannot reach, the way the engine already does.
+
+    **This exists to fix an ordering problem, not to add a rule.** The engine builds its
+    pipe stack by walking forward from the source and simply never loads what it does not
+    reach -- ``IServiceEndpoint::generatePipelineStack`` (``store/stack.cpp``) walks data
+    edges in ``walkComponents`` and invoke edges in ``walkControl``, and
+    ``buildConnections`` skips a component with the comment *"we were not included, nobody
+    referenced us"*. A dead branch is therefore free in an ordinary pipeline.
+
+    The cut, though, runs **before** any engine sees the document: it splits one pipeline
+    into one document per environment, and each engine only prunes what it is handed. So
+    without this step the boundary analysis reasons about branches the engine would have
+    discarded -- and a virtual environment on such a branch produced
+    *"produces output but nothing is routed into it"*, a refusal the same graph never
+    earns outside a container. Pruning first makes the container path agree with the
+    plain one instead of being stricter than it.
+
+    **Both edge kinds, or the two implementations diverge in silence.** A node reached
+    only by an invoke edge (an agent's tool, which commonly has no data input at all) is
+    kept by ``walkControl``. Walking data edges alone would prune it here, delete the
+    environment holding it, and leave the agent toolless with nothing on screen to say so.
+
+    :param components: The document's components, containers still nested.
+    :param source: The run's source component id. Falsy disables pruning entirely --
+        without a root there is nothing to be reachable *from*, and dropping the whole
+        document would be a spectacular way to be wrong.
+    :returns: ``components`` filtered to the source plus everything it reaches, with the
+        original nesting preserved; a container emptied by the walk is dropped with it.
+    """
+    if not source:
+        return components
+
+    leaves = _flatten_members(components)
+    by_id = {leaf.get('id'): leaf for leaf in leaves}
+    if source not in by_id:
+        # The source is not a leaf of this document (an unknown id, or it sits in a
+        # container). Both are somebody else's rejection -- _validate_source_placement
+        # and the engine's own source check -- and pruning against a root we cannot see
+        # would turn their named error into a silently empty pipeline.
+        return components
+
+    # Forward adjacency over BOTH edge kinds: producer -> consumers.
+    consumers: Dict[str, List[str]] = {}
+    for leaf in leaves:
+        consumer = leaf.get('id')
+        for edge in (leaf.get('input') or []) + (leaf.get('control') or []):
+            producer = edge.get('from')
+            if producer:
+                consumers.setdefault(producer, []).append(consumer)
+
+    reached = {source}
+    pending = [source]
+    while pending:
+        for consumer in consumers.get(pending.pop(), []):
+            if consumer not in reached:
+                reached.add(consumer)
+                pending.append(consumer)
+
+    def keep(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        surviving = []
+        for component in items:
+            if not is_container(component):
+                if component.get('id') in reached:
+                    surviving.append(component)
+                continue
+            members = keep(_members(component))
+            if not members:
+                # Nothing live left inside. An empty container has no runtime behaviour,
+                # and _assemble_documents already declines to emit a document for one.
+                continue
+            component['config']['pipeline']['components'] = members
+            surviving.append(component)
+        return surviving
+
+    return keep(components)
+
+
 def _sanitize_id_part(text: Any) -> str:
     """Reduce an id fragment to a component-id-safe token (no ``->``/``/``/``:``)."""
     return re.sub(r'[^0-9A-Za-z_]', '_', str(text))
@@ -715,6 +793,12 @@ def _cut_pipeline(pipeline: Dict[str, Any], source: Optional[str]) -> PartitionR
     _validate_containers(pipeline, source)
 
     work = copy.deepcopy(pipeline)
+
+    # Before anything reasons about environments: drop what the source cannot reach, so
+    # the cut sees the graph the engine would actually have loaded. Every step below --
+    # bucketing, boundary channels, cycle checks -- then works on the live document only.
+    work['components'] = _prune_unreachable(work.get('components', []), source or work.get('source'))
+
     components = work.get('components', [])
     env_of = _env_of(components)
 

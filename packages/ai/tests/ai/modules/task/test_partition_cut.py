@@ -535,9 +535,15 @@ def test_a_user_cycle_without_a_bridge_is_left_to_the_engine():
     assert 'v1' in result.environments
 
 
-def test_venv_that_only_emits_is_rejected():
-    # Nothing dials the child, so its egress would have no socket to ship the return on. This
-    # is also what keeps the forward-source lookup from dying on a KeyError instead.
+def test_venv_that_only_emits_is_dropped_not_rejected():
+    """Was ``..._is_rejected``, asserting "produces output but nothing is routed into it".
+
+    That refusal is gone. Nothing dials this child, so nothing in it is reachable from the
+    source -- and the engine never loads what it cannot reach, which is why the same graph
+    outside a container has always been fine. The cut now prunes first and the boundary
+    question is never asked. What the old error protected against (a return channel with
+    no forward channel to ride) cannot arise once the unreachable half is gone.
+    """
     pipeline = {
         'source': 'seed',
         'components': [
@@ -547,8 +553,11 @@ def test_venv_that_only_emits_is_rejected():
         ],
     }
 
-    with pytest.raises(ValueError, match='nothing is routed into it'):
-        partition_pipeline(pipeline, scoped=True)
+    result = partition_pipeline(pipeline, source='seed', scoped=True)
+
+    assert set(result.environments) == {'main'}
+    assert _ids(result.environments['main']) == ['seed']
+    assert result.routing == []
 
 
 # ---------------------------------------------------------------------------
@@ -668,36 +677,54 @@ def test_empty_venv_gets_no_environment_entry():
     assert list(result.environments) == ['main']
 
 
-def test_channel_less_venv_still_gets_an_entry():
+def test_an_island_venv_is_dropped():
+    """Was ``test_channel_less_venv_still_gets_an_entry``, and its premise no longer exists.
+
+    A venv with no boundary channel is exactly a venv nothing routes into, i.e. one the
+    source cannot reach -- the two are the same shape seen from two directions. Since the
+    cut prunes what the source cannot reach, a channel-less venv can no longer survive to
+    be given a document. It is dropped whole, as the engine would have dropped it.
+    """
     pipeline = {
         'source': 'a',
         'components': [_node('a'), _venv('island', [_node('x'), _node('y', input=[{'lane': 'text', 'from': 'x'}])])],
     }
 
-    result = partition_pipeline(pipeline, scoped=True)
+    result = partition_pipeline(pipeline, source='a', scoped=True)
 
-    assert 'island' in result.environments
+    assert set(result.environments) == {'main'}
     assert result.routing == []
 
 
-def test_unknown_from_reference_is_left_untouched():
+def test_unknown_from_reference_is_dropped_not_rewritten():
+    """Was ``..._is_left_untouched``, which asserted the dangling edge survived into a child.
+
+    A component whose only producer does not exist is unreachable from the source, so it
+    is pruned along with the environment holding it -- and the engine agrees: its walk
+    only ever adds a component reached from the source, and ``buildConnections`` skips a
+    ``from`` it cannot resolve. What the old test guarded still holds and is what matters:
+    a dangling reference is never *rewritten* into a bridge node, and never crashes the cut.
+    """
     detect = _node('detect', input=[{'lane': 'image', 'from': 'ghost'}])
     pipeline = {'source': 'parse', 'components': [_node('parse'), _venv('vision', [detect])]}
 
-    result = partition_pipeline(pipeline, scoped=True)
+    result = partition_pipeline(pipeline, source='parse', scoped=True)
 
     assert result.routing == []
-    child = result.environments['vision']
-    detect_out = next(c for c in child['components'] if c['id'] == 'detect')
-    assert detect_out['input'] == [{'lane': 'image', 'from': 'ghost'}]
+    assert set(result.environments) == {'main'}
+    assert _ids(result.environments['main']) == ['parse']
 
 
 def test_synthesized_id_collision_is_suffixed():
     collide = 'venv_ingress--main--vision'
     detect = _node('detect', input=[{'lane': 'image', 'from': 'parse'}])
-    pipeline = {'source': 'parse', 'components': [_node('parse'), _venv('vision', [detect, _node(collide)])]}
+    # The colliding node reads from detect so the source can reach it. Input-less, it would
+    # now be pruned before the id was ever minted, and this test would pass while checking
+    # nothing -- the mechanism it guards is real and unrelated to reachability.
+    clash = _node(collide, input=[{'lane': 'text', 'from': 'detect'}])
+    pipeline = {'source': 'parse', 'components': [_node('parse'), _venv('vision', [detect, clash])]}
 
-    result = partition_pipeline(pipeline, scoped=True)
+    result = partition_pipeline(pipeline, source='parse', scoped=True)
 
     assert result.routing[0]['ingressNode'] == collide + '-2'
 
@@ -801,3 +828,107 @@ def test_golden_linear_round_trip():
     assert work_out['input'] == [{'lane': 'text', 'from': fwd['ingressNode']}]
     egress = next(c for c in v1['components'] if c['id'] == ret['egressNode'])
     assert egress['input'] == [{'lane': 'text', 'from': 'work'}]
+
+
+# ---------------------------------------------------------------------------
+# Reachability pruning (the cut runs before any engine prunes for itself)
+# ---------------------------------------------------------------------------
+
+
+def test_a_venv_the_source_cannot_reach_is_dropped_instead_of_refused():
+    """The regression this pruning exists for.
+
+    ``work`` produces into main but nothing routes into its environment, because ``feed``
+    lost its edge from the source. That earned "produces output but nothing is routed into
+    it" -- a refusal the SAME graph never earns outside a container, since the engine walks
+    forward from the source and never loads what it does not reach.
+    """
+    seed = _node('seed')
+    feed = _node('feed')  # the missing edge: nothing connects it to seed
+    work = _node('work', input=[{'lane': 'text', 'from': 'feed'}])
+    out = _node('out', input=[{'lane': 'text', 'from': 'work'}])
+    pipeline = {'source': 'seed', 'components': [seed, _venv('w', [feed, work]), out]}
+
+    result = partition_pipeline(copy.deepcopy(pipeline), source='seed', scoped=True)
+
+    # The dead branch is gone, environment and all -- not reported, just not run.
+    assert set(result.environments) == {'main'}
+    assert _ids(result.environments['main']) == ['seed']
+    assert result.routing == []
+
+
+def test_the_same_dead_branch_flattened_behaves_identically():
+    """The asymmetry, pinned from both sides: container or not, the outcome matches."""
+    seed = _node('seed')
+    feed = _node('feed')
+    work = _node('work', input=[{'lane': 'text', 'from': 'feed'}])
+    out = _node('out', input=[{'lane': 'text', 'from': 'work'}])
+
+    contained = {'source': 'seed', 'components': [seed, _venv('w', [feed, work]), out]}
+    flattened = {'source': 'seed', 'components': [seed, feed, work, out]}
+
+    inside = partition_pipeline(copy.deepcopy(contained), source='seed', scoped=True)
+    outside = partition_pipeline(copy.deepcopy(flattened), source='seed', scoped=True)
+
+    assert _ids(inside.environments['main']) == _ids(outside.environments['main'])
+
+
+def test_a_partly_dead_environment_keeps_its_live_half():
+    """Pruning is per component, not per environment."""
+    seed = _node('seed')
+    live = _node('live', input=[{'lane': 'text', 'from': 'seed'}])
+    dead = _node('dead')  # no path from seed
+    out = _node('out', input=[{'lane': 'text', 'from': 'live'}])
+    pipeline = {'source': 'seed', 'components': [seed, _venv('w', [live, dead]), out]}
+
+    result = partition_pipeline(copy.deepcopy(pipeline), source='seed', scoped=True)
+
+    assert set(result.environments) == {'main', 'w'}
+    assert 'live' in _ids(result.environments['w'])
+    assert 'dead' not in _ids(result.environments['w'])
+
+
+def test_a_node_reached_only_by_an_invoke_edge_survives():
+    """Invoke edges count, or this diverges from the engine in silence.
+
+    A tool commonly has NO data input and is reached only by its agent's control edge;
+    ``walkControl`` keeps it. Walking data edges alone would prune it here, delete the
+    environment holding it, and leave the agent toolless with nothing on screen to say so.
+    """
+    seed = _node('seed')
+    agent = _node('agent', input=[{'lane': 'text', 'from': 'seed'}])
+    tool = _node('tool', control=[{'classType': 'tool', 'from': 'agent'}])
+    # Agent and tool share the environment: an invoke edge across a venv boundary is
+    # rejected outright by _validate_containers, so that shape is not a legal document.
+    pipeline = {'source': 'seed', 'components': [seed, _venv('w', [agent, tool])]}
+
+    result = partition_pipeline(copy.deepcopy(pipeline), source='seed', scoped=True)
+
+    assert set(result.environments) == {'main', 'w'}
+    assert 'tool' in _ids(result.environments['w'])
+
+
+def test_a_fully_live_document_is_untouched_by_pruning():
+    """Nothing changes for a document that was already whole."""
+    seed = _node('seed')
+    work = _node('work', input=[{'lane': 'text', 'from': 'seed'}])
+    out = _node('out', input=[{'lane': 'text', 'from': 'work'}])
+    pipeline = {'source': 'seed', 'components': [seed, _venv('w', [work]), out]}
+
+    with_source = partition_pipeline(copy.deepcopy(pipeline), source='seed', scoped=True)
+    baseline = partition_pipeline(copy.deepcopy(pipeline), scoped=True)
+
+    assert _ids(with_source.environments['main']) == _ids(baseline.environments['main'])
+    assert _ids(with_source.environments['w']) == _ids(baseline.environments['w'])
+    assert _routes(with_source).keys() == _routes(baseline).keys()
+
+
+def test_without_a_source_nothing_is_pruned():
+    """No root means nothing to be reachable from -- pruning must stay out of it."""
+    orphan = _node('orphan')
+    work = _node('work', input=[{'lane': 'text', 'from': 'orphan'}])
+    pipeline = {'components': [orphan, _venv('w', [work])]}
+
+    result = partition_pipeline(copy.deepcopy(pipeline), source=None, scoped=True)
+
+    assert set(result.environments) == {'main', 'w'}

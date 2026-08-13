@@ -404,10 +404,24 @@ and `groups` (each venv's `config.environment` block, for step-7/8 logging). The
   conflict fires first — so a cycle fixture must use distinct lanes per direction.
 - **Extra scoped rejections:** a boundary edge on the non-bridgeable `words` lane; an implied
   (`Source`-mode) source or the document `source` field inside a venv; a base environment left with no
-  components while a venv exists; a group whose id is literally `main`; an environment that emits across
-  its boundary but is fed by nothing (nothing dials it, so its egress would have no socket). The
+  components while a venv exists; a group whose id is literally `main`. ~~an environment that emits
+  across its boundary but is fed by nothing~~ — **withdrawn in 2B, and it was the cut being stricter
+  than the engine.** The engine loads only what it reaches walking forward from the source
+  (`generatePipelineStack` → `walkComponents` for data edges, `walkControl` for invoke;
+  `buildConnections` then skips a component with the comment *"we were not included, nobody
+  referenced us"*), so a dead branch costs nothing in an ordinary pipeline. But the cut runs
+  **before** any engine sees the document — it splits one pipeline into one document per
+  environment, and each engine prunes only what it is handed — so boundary analysis reasoned about
+  branches the engine would have discarded, and a venv on such a branch was refused for a shape the
+  same graph never earns outside a container. `_cut_pipeline` now prunes by reachability from the
+  source first, over **both** edge kinds (invoke-only nodes — an agent's tool typically has no data
+  input at all — are kept, as `walkControl` keeps them; walking data edges alone would delete such a
+  tool's environment and leave the agent toolless in silence). A venv nothing routes into is then
+  simply not in the graph. The
   `scoped=False` path and the 19 increment-1 tests are unchanged; the cut adds `test_partition_cut.py`
-  (39 tests after step 8.3). Deferred: §4.13's
+  (45 tests after 2B: 39 from step 8.3, plus six pinning the prune — including that a fully live
+  document is untouched, and that no source at all disables pruning rather than emptying the
+  document). Deferred: §4.13's
   "all nodes in ONE venv → collapse" (a runnable all-in-one-venv doc cannot exist while source-in-venv is
   rejected, and honoring it only when scoped would make `=1` accept what `=0` rejects). The bridge nodes'
   live child URL/token are written at spawn (step 7).
@@ -3598,21 +3612,29 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
      `IServiceCapabilities.Internal`**: the two sibling services are hidden because they declare
      `classType: []`, not because they are `internal`. The canvas-side blindness to that flag is
      still there; this node simply no longer reaches the canvas.
-  2. **Every scoped structural rejection below is invisible until Run.** The list further up this
-     section is introduced as "structural errors **the editor should have prevented**" — and the
-     editor prevents none of them, because `rrext_validate` (`cmd_misc.py:159`) validates through
-     rocketlib's `validatePipeline` and **never calls the partitioner**. `partition_pipeline` is
-     reached from one place only, `task_engine.py:2599`, on the execute path. So a document that
-     validates green on the canvas can still be structurally impossible, and the user learns it
-     from a run failure. Observed as *"Virtual environment "venv_3" produces output but nothing is
-     routed into it"* on a document whose container had a consumer in main and no producer feeding
-     it — one missing edge on a copied branch. Container-in-container is the single case the canvas
-     does guard (`FlowGraphContext.tsx:561`, on drag), which shows the guard rail is possible.
-     **There is nowhere to hang the fix today:** the canvas's only validate call
+  2. **Every scoped structural rejection below is invisible until Run** — and the one that
+     triggered this finding turned out not to belong on the list at all. The list further up this
+     section is introduced as "structural errors **the editor should have prevented**", and the
+     editor prevents none of them: `rrext_validate` (`cmd_misc.py:159`) validates through
+     rocketlib's `validatePipeline` and **never calls the partitioner**, which is reached from one
+     place only — `task_engine.py:2599`, on the execute path. Container-in-container is the single
+     case the canvas guards (`FlowGraphContext.tsx:561`, on drag).
+     **The reported symptom is fixed at the root instead**, and the fix is better than surfacing
+     the error earlier: *"Virtual environment "venv_3" produces output but nothing is routed into
+     it"* came from the cut being **stricter than the engine**, not from a real defect in the
+     document. The engine loads only what the source reaches; the cut ran before any engine could
+     prune, so it judged boundaries over branches that would have been discarded. `_cut_pipeline`
+     now prunes by reachability first (see the withdrawn rejection above), so that error class no
+     longer exists — a venv nothing routes into is dropped exactly as it is outside a container.
+     **What remains open is the general shape**, and it is narrower than it looked: the *other*
+     rejections in that list still fire only at Run. Making them visible earlier needs a whole-graph
+     validation call, which does not exist — the canvas's only validate call
      (`NodeConfigPanel.tsx:443`) sends a *single component*, never the graph, so teaching
-     `rrext_validate` to partition would change nothing on screen — nobody asks it the graph-shaped
-     question. The missing piece is a whole-graph validation call, and with it a decision about
-     when it fires (per edit is wrong for a partition; on save or on arming Run are defensible).
+     `rrext_validate` to partition would change nothing on screen until someone asks it the
+     graph-shaped question. With that call comes a decision about when it fires (per edit is wrong
+     for a partition; on save or on arming Run are defensible). Worth weighing against the lesson
+     here first: at least one entry on that list was not a rule worth surfacing but a divergence
+     worth deleting, and the others deserve the same question before they get a UI.
 
 **Phase 2C — Polish & scale.** Multi-process debug/observability across the cut; deploy-time pre-warm;
 the local-IPC transport seam (UDS/named-pipe/shared-mem, §4.5); the **bridge-base + `write_lane`
