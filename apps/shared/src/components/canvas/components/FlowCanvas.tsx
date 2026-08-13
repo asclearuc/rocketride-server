@@ -60,6 +60,8 @@ import { useToolbarOrientation } from './toolbar';
 import CreateNodePanel from './panels/create-node/CreateNodePanel';
 import EmptyCanvasPrompt from './EmptyCanvasPrompt';
 import NodeConfigPanel from './panels/node-config';
+import VenvDeleteDialog from './VenvDeleteDialog';
+import VenvPurgeDialog from './VenvPurgeDialog';
 import FitIcon from '../../../assets/icons/FitIcon';
 import LockIcon from '../../../assets/icons/LockIcon';
 import UnlockIcon from '../../../assets/icons/UnlockIcon';
@@ -129,6 +131,8 @@ const BX_REDO = 'M9 18h3v-2H9c-1.654 0-3-1.346-3-3s1.346-3 3-3h6v3l5-4-5-4v3H9c-
 const BX_POINTER = 'M20.978 13.21a1 1 0 0 0-.396-1.024l-14-10a.999.999 0 0 0-1.575.931l2 17a1 1 0 0 0 1.767.516l3.612-4.416 3.377 5.46 1.701-1.052-3.357-5.428 6.089-1.218a.995.995 0 0 0 .782-.769zm-8.674.31a1 1 0 0 0-.578.347l-3.008 3.677L7.257 5.127l10.283 7.345-5.236 1.048z';
 const BX_SAVE = 'M17 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z';
 const BX_EXPORT = 'M11 16h2V7h3l-4-5-4 5h3z M5 22h14c1.103 0 2-.897 2-2v-9c0-1.103-.897-2-2-2h-4v2h4v9H5v-9h4V9H5c-1.103 0-2 .897-2 2v9c0 1.103.897 2 2 2z';
+// A titled container: header bar over a body, which is what the node looks like.
+const BX_CONTAINER = 'M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm0 2v3h14V5H5zm0 5v9h14v-9H5z';
 
 const HandIcon = ({ size = 16, color = 'currentColor' }: { size?: number; color?: string }) => (
 	<svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -203,7 +207,7 @@ const ToolbarDivider = () => {
  */
 export default function Canvas(): ReactElement {
 	// --- Graph state from context ------------------------------------------
-	const { canvasRef, nodes, edges, nodeMap, setNodes, onNodesChange, onEdgesChange, onEdgeConnect, onNodesDelete, onDragOver, onDrop, onNodeDragStop, isValidConnection, editingNodeId, setEditingNodeId, addNode, onContentUpdated, isFlowReady, configSnackbar, setConfigSnackbar } = useFlowGraph();
+	const { canvasRef, nodes, edges, nodeMap, setNodes, onNodesChange, onEdgesChange, onEdgeConnect, onNodesDelete, onBeforeDelete, venvDeleteRequest, resolveVenvDelete, venvPurgeNodeId, onDragOver, onDrop, onNodeDragStop, isValidConnection, editingNodeId, setEditingNodeId, addNode, onContentUpdated, isFlowReady, configSnackbar, setConfigSnackbar } = useFlowGraph();
 
 	// --- Canvas state from context -----------------------------------------
 	const { navigationMode, setNavigationMode, isReadonly, isLocked, toggleLock, projectLayout } = useFlowPreferences();
@@ -320,6 +324,34 @@ export default function Canvas(): ReactElement {
 		);
 	}, [addNode]);
 
+	// --- Virtual environment container -------------------------------------
+
+	/**
+	 * Drops an empty virtual-environment container on the canvas; members are
+	 * added by dragging existing nodes into it.
+	 *
+	 * `provider: 'venv'` is what names the node `venv_1`, `venv_2`, … — and the
+	 * node id IS the `envId` the engine addresses on disk, so this is the one
+	 * place the on-disk name is decided. The catalog service of the same key is
+	 * flagged `internal` and never reaches the canvas, so nothing resolves
+	 * against it; the explicit name wins over a catalog title regardless.
+	 *
+	 * The explicit size is not decoration: without it ReactFlow measures the
+	 * container to its content and it collapses to header height.
+	 */
+	const addVirtualEnv = useCallback(() => {
+		addNode(
+			{
+				provider: 'venv',
+				name: 'Virtual Environment',
+				config: { environment: { name: 'Virtual Environment', isolated: true } },
+			},
+			undefined, // centres in viewport
+			INodeType.VirtualEnv,
+			{ width: 420, height: 260 }
+		);
+	}, [addNode]);
+
 	// --- Panel state -------------------------------------------------------
 	const [showCreatePanel, setShowCreatePanel] = useState(false);
 
@@ -367,6 +399,11 @@ export default function Canvas(): ReactElement {
 			{!isLocked && (
 				<ToolbarButton title="Add annotation" onClick={addAnnotation}>
 					<NoteIcon color="currentColor" size={18} />
+				</ToolbarButton>
+			)}
+			{!isLocked && (
+				<ToolbarButton title="Add virtual environment" onClick={addVirtualEnv}>
+					<BxIcon d={BX_CONTAINER} size={16} />
 				</ToolbarButton>
 			)}
 			{!isLocked && <ToolbarDivider />}
@@ -433,6 +470,9 @@ export default function Canvas(): ReactElement {
 			<FloatingToolbar position={toolbarPosition} onPositionChange={handleToolbarPositionChange}>
 				{canvasToolbar}
 			</FloatingToolbar>
+			{/* onBeforeDelete covers every delete route, not just the keyboard one
+			    deleteKeyCode opens: deleteElements consults the hook out of the
+			    store, so the overflow menu's Delete asks the same questions. */}
 			<ReactFlow
 				id={rfInstanceId}
 				nodes={nodes}
@@ -444,6 +484,7 @@ export default function Canvas(): ReactElement {
 				onConnect={onEdgeConnect}
 				isValidConnection={isValidConnection}
 				onNodesDelete={onNodesDelete}
+				onBeforeDelete={onBeforeDelete}
 				deleteKeyCode={DELETE_KEY_CODES}
 				onDragOver={onDragOver}
 				onDrop={onDrop}
@@ -481,6 +522,10 @@ export default function Canvas(): ReactElement {
 
 			{/* Node config panel — slides in from the right */}
 			{showConfigPanel && editingNode && <NodeConfigPanel node={editingNode} onClose={() => setEditingNodeId(undefined)} />}
+			{/* Virtual-environment container delete — awaited by onBeforeDelete */}
+			{venvDeleteRequest && <VenvDeleteDialog request={venvDeleteRequest} onResolve={resolveVenvDelete} />}
+			{/* Virtual-environment purge — opened from the container's menu */}
+			{venvPurgeNodeId && <VenvPurgeDialog />}
 			{/* Configuration reminder after template instantiation */}
 			{configSnackbar !== null && (
 				<div

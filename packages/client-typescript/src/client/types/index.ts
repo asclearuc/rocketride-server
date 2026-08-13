@@ -40,3 +40,4 @@ export * from './events.js';
 export * from './pipeline.js';
 export * from './service.js';
 export * from './task.js';
+export * from './venv.js';

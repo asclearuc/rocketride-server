@@ -639,6 +639,33 @@ export class ProjectProvider implements vscode.CustomTextEditorProvider {
 					break;
 				}
 
+				case 'project:venv': {
+					// Reclaims a virtual environment's packages on the SERVER's
+					// disk — the user's own machine against a local engine, and
+					// emphatically not against a remote one. No teamId travels:
+					// an overlay is machine-local state that no team owns.
+					const what = `${data.projectId}/${data.envId}`;
+					this.logger.output(`${icons.pipeline} ${data.operation === 'purge' ? 'Purging' : 'Deleting'} environment ${what}...`);
+					try {
+						const client = this.connectionManager.getClient();
+						if (!client) throw new Error('Not connected to server');
+						// Both ids travel raw: the engine resolves them literal-first
+						// and otherwise shortens them itself, as it did when the
+						// overlay was created.
+						const result = data.operation === 'purge' ? await client.venv.purge(data.projectId, data.envId) : await client.venv.deleteEnv(data.projectId, data.envId);
+						// False is not a failure — the overlay simply was not there.
+						this.logger.output(result ? `${icons.success} Environment ${what} reclaimed` : `${icons.success} Environment ${what} had no overlay`);
+						webview.postMessage({ type: 'project:venvResponse', requestId: data.requestId, result });
+					} catch (error) {
+						const msg = error instanceof Error ? error.message : String(error);
+						// The engine's refusal names its cause (an active run, a
+						// file still held open). Pass it through unreworded.
+						this.logger.output(`${icons.error} Environment ${what}: ${msg}`);
+						webview.postMessage({ type: 'project:venvResponse', requestId: data.requestId, error: msg });
+					}
+					break;
+				}
+
 				case 'project:getNodeSchema': {
 					// The bulk services payload is summary-only; the canvas requests
 					// one provider's FULL definition (config schema) on demand and

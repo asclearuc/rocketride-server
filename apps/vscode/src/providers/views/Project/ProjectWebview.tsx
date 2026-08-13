@@ -14,7 +14,7 @@
  *   ProjectHost (Node.js) ↔ postMessage ↔ ProjectWebview (browser) → ProjectView (pure UI)
  */
 
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
 
 import { applyTheme } from 'shell';
 import type { IProject, ThemeTokens } from 'shell';
@@ -25,7 +25,7 @@ import { ProjectView, parseServerEvent, isDevLiveEvent, isTeamLiveEvent } from '
 import { registerServiceIcons } from 'shared/components/canvas/util/Icon';
 import { foldProjectDeployRuns } from 'shared/modules/sidebar/taskFold';
 import type { TaskLifecycleEvent } from 'shared/modules/sidebar/taskFold';
-import type { TaskEventMessage, TaskEventSession, TaskStatus, TaskTimeline, ViewState } from 'shared/modules/project';
+import type { IVenvOps, TaskEventMessage, TaskEventSession, TaskStatus, TaskTimeline, ViewState } from 'shared/modules/project';
 import { CheckoutModal } from 'shell';
 import type { CheckoutPlan, PlanAction } from 'shell';
 import { DeploymentRecordPanel, TeamDeploymentRecordPanel } from 'shared/components/deploy-panel';
@@ -56,6 +56,16 @@ const DEPLOY_REQUEST_TIMEOUT_MS = 30000;
 
 /** Coalescing window for push-triggered deployment re-fetches (ms). */
 const DEPLOYMENT_REFETCH_COALESCE_MS = 400;
+
+/**
+ * Safety timeout for a virtual-environment overlay operation (ms).
+ *
+ * Far longer than the deploy round-trip above, and deliberately: wiping a
+ * populated `site-packages` is thousands of file deletes, and reporting a slow
+ * purge as "nothing to reclaim" is the one lie this bridge must not tell. The
+ * bound exists only so a lost reply cannot hang forever.
+ */
+const VENV_OP_TIMEOUT_MS = 120000;
 
 // =============================================================================
 // COMPONENT
@@ -152,6 +162,10 @@ const ProjectWebview: React.FC = () => {
 	const pendingNodeSchemas = useRef<Map<number, { resolve: (v: Record<string, any> | undefined) => void; reject: (e: Error) => void }>>(new Map());
 	const nodeSchemaCounter = useRef(0);
 
+	// Pending virtual-environment operations (request-ID → Promise resolver)
+	const pendingVenvOps = useRef<Map<number, { resolve: (v: boolean) => void; reject: (e: Error) => void }>>(new Map());
+	const venvCounter = useRef(0);
+
 	// --- Messaging ------------------------------------------------------------
 
 	const sendMessageRef = useRef<(msg: ProjectWebviewToHost) => void>(() => {});
@@ -220,6 +234,17 @@ const ProjectWebview: React.FC = () => {
 					pendingNodeSchemas.current.delete(msg.requestId);
 					if (msg.error) pending.reject(new Error(msg.error));
 					else pending.resolve(msg.service);
+				}
+				break;
+			}
+			case 'project:venvResponse': {
+				const pending = pendingVenvOps.current.get(msg.requestId);
+				if (pending) {
+					pendingVenvOps.current.delete(msg.requestId);
+					// An error is a refusal; the boolean is the outcome, where
+					// false means "there was no overlay" — still a success.
+					if (msg.error) pending.reject(new Error(msg.error));
+					else pending.resolve(msg.result === true);
 				}
 				break;
 			}
@@ -502,6 +527,49 @@ const ProjectWebview: React.FC = () => {
 			});
 		},
 		[sendMessage]
+	);
+
+	/**
+	 * Sends one virtual-environment overlay operation to the extension host and
+	 * waits for its answer.
+	 *
+	 * Deliberately unlike {@link handleValidate}'s timeout, twice over. It does
+	 * not resolve a success-shaped fallback: a purge that is merely slow — and
+	 * wiping a populated `site-packages` is thousands of file deletes — would
+	 * be reported as `false`, i.e. "nothing to reclaim", while it was still
+	 * running. And the bound is long, because there is no work to abandon here,
+	 * only a promise to keep honest.
+	 */
+	const requestVenvOp = useCallback(
+		async (operation: 'purge' | 'deleteEnv', targetProjectId: string, envId: string): Promise<boolean> => {
+			return new Promise((resolve, reject) => {
+				const requestId = ++venvCounter.current;
+				pendingVenvOps.current.set(requestId, { resolve, reject });
+				sendMessage({ type: 'project:venv', requestId, operation, projectId: targetProjectId, envId });
+				setTimeout(() => {
+					if (pendingVenvOps.current.has(requestId)) {
+						pendingVenvOps.current.delete(requestId);
+						reject(new Error(`The server did not answer — ${envId} may still be being reclaimed`));
+					}
+				}, VENV_OP_TIMEOUT_MS);
+			});
+		},
+		[sendMessage]
+	);
+
+	/**
+	 * Overlay operations handed to the canvas containers.
+	 *
+	 * `useMemo` with a single stable dependency: the object joins the canvas
+	 * context's dependency list, so a literal rebuilt each render would
+	 * invalidate that context on every live event this webview receives.
+	 */
+	const venvOps = useMemo<IVenvOps>(
+		() => ({
+			purge: (targetProjectId: string, envId: string) => requestVenvOp('purge', targetProjectId, envId),
+			deleteEnv: (targetProjectId: string, envId: string) => requestVenvOp('deleteEnv', targetProjectId, envId),
+		}),
+		[requestVenvOp]
 	);
 
 	const handlePipelineAction = useCallback(
@@ -808,6 +876,7 @@ const ProjectWebview: React.FC = () => {
 				liveLogEvents={liveLogEvents}
 				onContentChanged={handleContentChanged}
 				onValidate={handleValidate}
+				venvOps={venvOps}
 				getNodeSchema={handleGetNodeSchema}
 				onPipelineAction={handlePipelineAction}
 				onViewStateChange={handleViewStateChange}

@@ -34,6 +34,7 @@ import { BillingApi } from './billing.js';
 import { DatabaseApi } from './database.js';
 import { DeployApi } from './deploy.js';
 import { LogApi } from './log.js';
+import { VenvApi } from './venv.js';
 import { AuthenticationException, ConnectionException, DAPException, LoginAttemptCancelledError, type LoginAttemptCancellationReason, PipeException } from './exceptions/index.js';
 
 // Global counter for generating unique client IDs
@@ -407,6 +408,9 @@ export class RocketRideClient extends DAPClient {
 
 	/** Lazily-created run-log API namespace. */
 	private _log?: LogApi;
+
+	/** Lazily-created virtual-environment API namespace. */
+	private _venv?: VenvApi;
 
 	/** Optional trace callback for observing all call() traffic. */
 	private _onTrace?: (traceType: TraceType, message: DAPMessage) => void;
@@ -3332,6 +3336,27 @@ export class RocketRideClient extends DAPClient {
 			this._log = new LogApi(this);
 		}
 		return this._log;
+	}
+
+	/**
+	 * Lazily-initialised virtual-environment API namespace.
+	 *
+	 * Enumerates and reclaims the per-environment `site-packages` overlays on
+	 * the **server's** disk. Overlays are a rebuildable cache — the requirements
+	 * live in the pipeline document — so reclaiming one costs the next run's
+	 * install time and nothing else.
+	 *
+	 * @example
+	 * ```typescript
+	 * const overlays = await client.venv.list({ projectId: 'proj-1' });
+	 * await client.venv.purge('proj-1', 'group_1');
+	 * ```
+	 */
+	get venv(): VenvApi {
+		if (!this._venv) {
+			this._venv = new VenvApi(this);
+		}
+		return this._venv;
 	}
 
 	// ============================================================================

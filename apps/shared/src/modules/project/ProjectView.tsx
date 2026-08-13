@@ -30,6 +30,7 @@ import { ContentHeader } from 'shell';
 import { TabControl } from 'shell';
 import type { ViewMenu } from 'shell';
 import CanvasPanel from '../../components/canvas';
+import type { IVenvOps } from '../../components/canvas';
 import { PrefsProvider, type IPrefsApi } from 'shell';
 import { commonStyles } from 'shell';
 import { OAUTH_ROOT_URL } from 'shell';
@@ -96,6 +97,14 @@ export interface IProjectViewProps {
 	onContentChanged?: (project: any) => void;
 	/** Called to validate a pipeline. Host returns validation result as a Promise. */
 	onValidate?: (pipeline: any) => Promise<any>;
+	/**
+	 * Reclaims a virtual-environment container's packages on the SERVER the
+	 * host is connected to. Omitted, the container's Purge item is not shown
+	 * and its delete never asks about the disk — the canvas half of the delete
+	 * still works, since that needs no server. Give the object a stable
+	 * identity: it feeds the canvas context's memo.
+	 */
+	venvOps?: IVenvOps;
 	/**
 	 * Fetches the FULL definition (config schema) for one service provider.
 	 * The bulk `servicesJson` payload is summary-only, so the canvas requests
@@ -297,7 +306,7 @@ function migrateViewMode(mode: string | undefined): ProjectViewMode {
 // COMPONENT
 // =============================================================================
 
-const ProjectView: React.FC<IProjectViewProps> = ({ project, documentTitle, servicesJson, isConnected, isSubscribed = true, statusMap, serverHost = '', isDirty = false, isNew = false, initialViewState, initialPrefs, onContentChanged, onValidate, getNodeSchema, onPipelineAction, onViewStateChange, onPrefsChange, onOpenLink, oauth2RootUrl = OAUTH_ROOT_URL, oauthReturnUrl, onOpenExternal, pendingOAuthTokens, clearPendingOAuthTokens, onSave, onExport, isReadonly = false, envKeys, onMissingEnvVars, liveLogEvents = [], openEventStream, fetchTimeline, fetchDeployLifecycle, teamDeployments = [], deployTeams = [], onDeployPublish, onDeployVersion, onOpenDeployment, onDeploySetDisabled, onDeployRemove, onDeploySetSchedule, onDeploySetSchedulePaused, onDeployPreviewSchedule, fetchDeployArtifact, onSaveDocument }) => {
+const ProjectView: React.FC<IProjectViewProps> = ({ project, documentTitle, servicesJson, isConnected, isSubscribed = true, statusMap, serverHost = '', isDirty = false, isNew = false, initialViewState, initialPrefs, onContentChanged, onValidate, venvOps, getNodeSchema, onPipelineAction, onViewStateChange, onPrefsChange, onOpenLink, oauth2RootUrl = OAUTH_ROOT_URL, oauthReturnUrl, onOpenExternal, pendingOAuthTokens, clearPendingOAuthTokens, onSave, onExport, isReadonly = false, envKeys, onMissingEnvVars, liveLogEvents = [], openEventStream, fetchTimeline, fetchDeployLifecycle, teamDeployments = [], deployTeams = [], onDeployPublish, onDeployVersion, onOpenDeployment, onDeploySetDisabled, onDeployRemove, onDeploySetSchedule, onDeploySetSchedulePaused, onDeployPreviewSchedule, fetchDeployArtifact, onSaveDocument }) => {
 	// --- Local view state (initialized from props, managed locally) -----------
 
 	const [viewState, setViewState] = useState<ViewState>(() => ({
@@ -604,7 +613,7 @@ const ProjectView: React.FC<IProjectViewProps> = ({ project, documentTitle, serv
 			content: (
 				<div style={styles.canvasPadding}>
 					<PrefsProvider value={prefsApi}>
-						{project && <CanvasPanel oauth2RootUrl={oauth2RootUrl} oauthReturnUrl={oauthReturnUrl} onOpenExternal={onOpenExternal} pendingOAuthTokens={pendingOAuthTokens} clearPendingOAuthTokens={clearPendingOAuthTokens} project={project} servicesJson={servicesJson} getNodeSchema={getNodeSchema ? handleGetNodeSchema : undefined} taskStatuses={statusMap} handleValidatePipeline={handleValidate} onContentChanged={isReadonly ? undefined : handleContentChanged} onViewportChange={handleViewportChange} onRunPipeline={isReadonly ? undefined : handleRunPipeline} onStopPipeline={isReadonly ? undefined : handleStopPipeline} onOpenLink={handleOpenLink} serverHost={serverHost} isConnected={isConnected} isSubscribed={isSubscribed} initialViewport={viewState.viewport} isDirty={isReadonly ? false : isDirty} isNew={isReadonly ? false : isNew} onSave={isReadonly ? undefined : handleSave} onExport={isReadonly ? undefined : onExport} isReadonly={isReadonly} envKeys={envKeys} />}
+						{project && <CanvasPanel oauth2RootUrl={oauth2RootUrl} oauthReturnUrl={oauthReturnUrl} onOpenExternal={onOpenExternal} pendingOAuthTokens={pendingOAuthTokens} clearPendingOAuthTokens={clearPendingOAuthTokens} project={project} servicesJson={servicesJson} getNodeSchema={getNodeSchema ? handleGetNodeSchema : undefined} taskStatuses={statusMap} handleValidatePipeline={handleValidate} venvOps={isReadonly ? undefined : venvOps} onContentChanged={isReadonly ? undefined : handleContentChanged} onViewportChange={handleViewportChange} onRunPipeline={isReadonly ? undefined : handleRunPipeline} onStopPipeline={isReadonly ? undefined : handleStopPipeline} onOpenLink={handleOpenLink} serverHost={serverHost} isConnected={isConnected} isSubscribed={isSubscribed} initialViewport={viewState.viewport} isDirty={isReadonly ? false : isDirty} isNew={isReadonly ? false : isNew} onSave={isReadonly ? undefined : handleSave} onExport={isReadonly ? undefined : onExport} isReadonly={isReadonly} envKeys={envKeys} />}
 					</PrefsProvider>
 				</div>
 			),

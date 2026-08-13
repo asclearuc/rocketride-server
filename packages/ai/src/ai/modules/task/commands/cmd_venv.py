@@ -30,8 +30,12 @@ Dispatches ``rrext_venv`` on ``arguments.subcommand``:
 - ``delete_env``     — remove one environment overlay (``task.control``)
 - ``delete_project`` — remove a project's whole ``venvs/`` subtree (``task.control``)
 
-Scope: this is the **engine-side protocol command only**. §4.10's canvas operations A/B/C
-are the UI actions that will call it; no SDK method and no canvas wiring ship here.
+Callers: both SDKs wrap this as ``client.venv`` (``purge`` / ``delete_env`` / ``delete_project``
+keep their wire names, ``list`` its own), both CLIs expose it as ``rocketride venv ...``, and
+the canvas puts §4.10's operations A/B/C on the virtual-environment container itself — purge
+from its menu, the disk half of a container delete, and a best-effort subtree reclaim when a
+pipeline is deleted. This handler is still the only thing that touches the tree; everything
+above it is a wrapper.
 
 Every path hangs off one input: ``exe_dir = os.path.dirname(sys.executable)``. This handler
 runs in the **server** process, which is itself ``dist/server/engine.exe``, so it resolves to

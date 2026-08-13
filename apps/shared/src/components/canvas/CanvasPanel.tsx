@@ -40,7 +40,7 @@ import { useMemo, useState, useEffect } from 'react';
 
 import FlowContainer from './components/FlowContainer';
 import FlowCanvas from './components/FlowCanvas';
-import { IProject, IValidatePipelinePayload, IValidateResponse, ITaskStatus } from './types';
+import { IProject, IValidatePipelinePayload, IValidateResponse, ITaskStatus, IVenvOps } from './types';
 import { getMuiTheme } from 'shared/themes-mui/getMuiTheme';
 import { buildInventory } from './util/helpers';
 import { IServiceCatalog } from './types';
@@ -77,6 +77,13 @@ export interface ICanvasPanelProps {
 
 	/** Validates a full pipeline or a single component server-side. */
 	handleValidatePipeline: (pipeline: IValidatePipelinePayload) => Promise<IValidateResponse>;
+
+	/**
+	 * Reclaims a virtual-environment container's packages on the SERVER's disk.
+	 * Omit it (as the read-only deploy-panel canvases do) and the container's
+	 * Purge item disappears while its Delete keeps working.
+	 */
+	venvOps?: IVenvOps;
 
 	/** OAuth broker return URL for hosts that intercept a deep link (e.g. VS Code). */
 	oauthReturnUrl?: string;
@@ -148,7 +155,7 @@ export interface ICanvasPanelProps {
 // Component
 // =============================================================================
 
-export default function CanvasPanel({ oauth2RootUrl, oauthReturnUrl, onOpenExternal, pendingOAuthTokens, clearPendingOAuthTokens, project, servicesJson, getNodeSchema, taskStatuses, componentPipeCounts, totalPipes, handleValidatePipeline, onOpenLink, onContentChanged, onViewportChange, onUndo, onRedo, onRunPipeline, onStopPipeline, onOpenStatus, serverHost, isConnected, isSubscribed, initialViewport, isDirty, isNew, onSave, onExport, isReadonly = false, envKeys }: ICanvasPanelProps) {
+export default function CanvasPanel({ oauth2RootUrl, oauthReturnUrl, onOpenExternal, pendingOAuthTokens, clearPendingOAuthTokens, project, servicesJson, getNodeSchema, taskStatuses, componentPipeCounts, totalPipes, handleValidatePipeline, venvOps, onOpenLink, onContentChanged, onViewportChange, onUndo, onRedo, onRunPipeline, onStopPipeline, onOpenStatus, serverHost, isConnected, isSubscribed, initialViewport, isDirty, isNew, onSave, onExport, isReadonly = false, envKeys }: ICanvasPanelProps) {
 	// --- Build inventory from service catalog --------------------------------
 	const inventory = buildInventory(servicesJson);
 
@@ -207,7 +214,7 @@ export default function CanvasPanel({ oauth2RootUrl, oauthReturnUrl, onOpenExter
 					overflow: 'hidden',
 				}}
 			>
-				<FlowContainer oauth2RootUrl={oauth2RootUrl} oauthReturnUrl={oauthReturnUrl} onOpenExternal={onOpenExternal} pendingOAuthTokens={pendingOAuthTokens} clearPendingOAuthTokens={clearPendingOAuthTokens} project={project} servicesJson={servicesJson} getNodeSchema={getNodeSchema} inventory={inventory} taskStatuses={taskStatuses} componentPipeCounts={componentPipeCounts} totalPipes={totalPipes} handleValidatePipeline={handleValidatePipeline} onOpenLink={onOpenLink} onContentChanged={onContentChanged} onViewportChange={onViewportChange} onUndo={onUndo} onRedo={onRedo} onRunPipeline={onRunPipeline} onStopPipeline={onStopPipeline} onOpenStatus={onOpenStatus} serverHost={serverHost} isConnected={isConnected} isSubscribed={isSubscribed} initialViewport={initialViewport} isDirty={isDirty} isNew={isNew} onSave={onSave} onExport={onExport} isReadonly={isReadonly} envKeys={envKeys}>
+				<FlowContainer oauth2RootUrl={oauth2RootUrl} oauthReturnUrl={oauthReturnUrl} onOpenExternal={onOpenExternal} pendingOAuthTokens={pendingOAuthTokens} clearPendingOAuthTokens={clearPendingOAuthTokens} project={project} servicesJson={servicesJson} getNodeSchema={getNodeSchema} inventory={inventory} taskStatuses={taskStatuses} componentPipeCounts={componentPipeCounts} totalPipes={totalPipes} handleValidatePipeline={handleValidatePipeline} venvOps={venvOps} onOpenLink={onOpenLink} onContentChanged={onContentChanged} onViewportChange={onViewportChange} onUndo={onUndo} onRedo={onRedo} onRunPipeline={onRunPipeline} onStopPipeline={onStopPipeline} onOpenStatus={onOpenStatus} serverHost={serverHost} isConnected={isConnected} isSubscribed={isSubscribed} initialViewport={initialViewport} isDirty={isDirty} isNew={isNew} onSave={onSave} onExport={onExport} isReadonly={isReadonly} envKeys={envKeys}>
 					<FlowCanvas />
 				</FlowContainer>
 			</div>

@@ -41,7 +41,7 @@
 
 import { createContext, ReactElement, ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 
-import { IProject, IToolchainState, IValidatePipelinePayload, IValidateResponse, IServiceCatalog, ITaskStatus, ITaskState, DEFAULT_TOOLCHAIN_STATE } from '../types';
+import { IProject, IToolchainState, IValidatePipelinePayload, IValidateResponse, IServiceCatalog, ITaskStatus, ITaskState, IVenvOps, DEFAULT_TOOLCHAIN_STATE } from '../types';
 
 // =============================================================================
 // Context shape
@@ -112,6 +112,14 @@ export interface IFlowProjectContext {
 
 	/** Validates a full pipeline or a single component and returns errors/warnings. */
 	handleValidatePipeline?: (pipeline: IValidatePipelinePayload) => Promise<IValidateResponse>;
+
+	/**
+	 * Reclaims a virtual environment's packages on the SERVER's disk. Absent
+	 * for hosts that wire no server (and for the read-only canvases), which
+	 * hides Purge and never asks the "also remove the environment" question —
+	 * deleting a container from the canvas keeps working regardless.
+	 */
+	venvOps?: IVenvOps;
 
 	/** Notifies the host that the project content has changed (for dirty tracking). */
 	onContentChanged?: (project: IProject) => void;
@@ -236,6 +244,13 @@ export interface IFlowProjectProviderProps {
 
 	// --- Host callbacks ----------------------------------------------------
 	handleValidatePipeline?: (pipeline: IValidatePipelinePayload) => Promise<IValidateResponse>;
+	/**
+	 * Virtual-environment overlay operations. Give the object a stable
+	 * identity (one `useMemo` in the host): it joins the context value's
+	 * dependency list, so a literal rebuilt each render would invalidate the
+	 * whole canvas context on every live event the host streams.
+	 */
+	venvOps?: IVenvOps;
 	onContentChanged?: (project: IProject) => void;
 	onViewportChange?: (viewport: { x: number; y: number; zoom: number }) => void;
 	onUndo?: () => void;
@@ -280,7 +295,7 @@ export interface IFlowProjectProviderProps {
  * The host application passes props that are tunneled through this context
  * so deeply nested components can access them without prop drilling.
  */
-export function FlowProjectProvider({ children, project: currentProject, isReadonly = false, taskStatuses, componentPipeCounts, totalPipes, servicesJson: rawServicesJson, servicesJsonError, getNodeSchema, inventory, inventoryConnectorTitleMap, handleValidatePipeline, onContentChanged, onViewportChange, onUndo, onRedo, oauth2RootUrl, oauthReturnUrl, onOpenExternal, pendingOAuthTokens, clearPendingOAuthTokens, onOpenLink, googlePickerDeveloperKey, googlePickerClientId, onRunPipeline, onStopPipeline, onOpenStatus, serverHost, isConnected, isSubscribed, initialViewport, isDirty, isNew, onSave, onExport, envKeys }: IFlowProjectProviderProps): ReactElement {
+export function FlowProjectProvider({ children, project: currentProject, isReadonly = false, taskStatuses, componentPipeCounts, totalPipes, servicesJson: rawServicesJson, servicesJsonError, getNodeSchema, inventory, inventoryConnectorTitleMap, handleValidatePipeline, venvOps, onContentChanged, onViewportChange, onUndo, onRedo, oauth2RootUrl, oauthReturnUrl, onOpenExternal, pendingOAuthTokens, clearPendingOAuthTokens, onOpenLink, googlePickerDeveloperKey, googlePickerClientId, onRunPipeline, onStopPipeline, onOpenStatus, serverHost, isConnected, isSubscribed, initialViewport, isDirty, isNew, onSave, onExport, envKeys }: IFlowProjectProviderProps): ReactElement {
 	// --- Toolchain state ---------------------------------------------------
 
 	const [toolchainState, setToolchainState] = useState<IToolchainState>(DEFAULT_TOOLCHAIN_STATE);
@@ -372,6 +387,7 @@ export function FlowProjectProvider({ children, project: currentProject, isReado
 		inventory,
 		inventoryConnectorTitleMap,
 		handleValidatePipeline,
+		venvOps,
 		onContentChanged,
 		onViewportChange,
 		onUndo,
@@ -400,7 +416,7 @@ export function FlowProjectProvider({ children, project: currentProject, isReado
 		currentProject, toolchainState, patchToolchainState, toggleDevMode,
 		isPipelineRunning, isReadonly, taskStatuses, componentPipeCounts, totalPipes,
 		servicesJson, servicesJsonError, requestNodeSchema, inventory, inventoryConnectorTitleMap,
-		handleValidatePipeline, onContentChanged, onViewportChange, onUndo, onRedo,
+		handleValidatePipeline, venvOps, onContentChanged, onViewportChange, onUndo, onRedo,
 		oauth2RootUrl, oauthReturnUrl, onOpenExternal, pendingOAuthTokens, clearPendingOAuthTokens,
 		onOpenLink, googlePickerDeveloperKey, googlePickerClientId,
 		onRunPipeline, onStopPipeline, onOpenStatus, serverHost, isConnected,

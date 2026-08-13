@@ -35,7 +35,7 @@
 import { ReactElement, ReactNode } from 'react';
 import { ReactFlowProvider } from '@xyflow/react';
 
-import { IProject, IValidatePipelinePayload, IValidateResponse, ITaskStatus } from '../types';
+import { IProject, IValidatePipelinePayload, IValidateResponse, ITaskStatus, IVenvOps } from '../types';
 
 import { FlowProvider } from '../context/FlowProvider';
 
@@ -79,6 +79,9 @@ export interface IFlowContainerProps {
 
 	/** Validates a full pipeline or a single component. */
 	handleValidatePipeline?: (pipeline: IValidatePipelinePayload) => Promise<IValidateResponse>;
+
+	/** Reclaims a virtual environment's packages on the server's disk. */
+	venvOps?: IVenvOps;
 
 	/** Called when pipeline content changes (dirty tracking). */
 	onContentChanged?: (project: IProject) => void;
@@ -163,7 +166,7 @@ export interface IFlowContainerProps {
  * Uses `key` on the outer Box to force a clean re-mount when the project
  * ID changes, ensuring no stale graph state leaks between projects.
  */
-export default function FlowContainer({ project, oauth2RootUrl, oauthReturnUrl, onOpenExternal, pendingOAuthTokens, clearPendingOAuthTokens, isReadonly, taskStatuses, componentPipeCounts, totalPipes, servicesJson, servicesJsonError, getNodeSchema, inventory, inventoryConnectorTitleMap, handleValidatePipeline, onContentChanged, onViewportChange, onUndo, onRedo, onOpenLink, googlePickerDeveloperKey, googlePickerClientId, onRunPipeline, onStopPipeline, onOpenStatus, serverHost, isConnected, isSubscribed, initialViewport, isDirty, isNew, onSave, onExport, envKeys, children }: IFlowContainerProps): ReactElement {
+export default function FlowContainer({ project, oauth2RootUrl, oauthReturnUrl, onOpenExternal, pendingOAuthTokens, clearPendingOAuthTokens, isReadonly, taskStatuses, componentPipeCounts, totalPipes, servicesJson, servicesJsonError, getNodeSchema, inventory, inventoryConnectorTitleMap, handleValidatePipeline, venvOps, onContentChanged, onViewportChange, onUndo, onRedo, onOpenLink, googlePickerDeveloperKey, googlePickerClientId, onRunPipeline, onStopPipeline, onOpenStatus, serverHost, isConnected, isSubscribed, initialViewport, isDirty, isNew, onSave, onExport, envKeys, children }: IFlowContainerProps): ReactElement {
 	return (
 		<ReactFlowProvider>
 			{/* Re-key on project ID to force clean re-mount between projects */}
@@ -181,6 +184,7 @@ export default function FlowContainer({ project, oauth2RootUrl, oauthReturnUrl, 
 					inventory={inventory}
 					inventoryConnectorTitleMap={inventoryConnectorTitleMap}
 					handleValidatePipeline={handleValidatePipeline}
+					venvOps={venvOps}
 					onContentChanged={onContentChanged}
 					onViewportChange={onViewportChange}
 					onUndo={onUndo}

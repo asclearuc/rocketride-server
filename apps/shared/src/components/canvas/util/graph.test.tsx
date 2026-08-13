@@ -15,7 +15,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { getNodesFromProject, getProjectComponents } from './graph';
+import { getNodesFromProject, getProjectComponents, generateNodeId } from './graph';
 import { INodeType, isContainerType } from '../types';
 import type { INode, IProject } from '../types';
 
@@ -152,6 +152,45 @@ describe('container dimensions', () => {
 		const [reloaded] = getNodesFromProject({ components: getProjectComponents(nodes) } as unknown as IProject);
 
 		assert.deepEqual([reloaded.width, reloaded.height], [373, 269]);
+	});
+});
+
+describe('a freshly created container', () => {
+	/**
+	 * The shape the toolbar's "Add virtual environment" button produces. Pinned
+	 * here because the button itself renders, and the `shared:test` runner stubs
+	 * the platform barrels it needs — but what it BUILDS is plain data, and that
+	 * is the half a serializer change can break.
+	 */
+	const created = (id: string) =>
+		node(id, INodeType.VirtualEnv, {
+			width: 420,
+			height: 260,
+			data: { provider: 'venv', name: 'Virtual Environment', config: { environment: { name: 'Virtual Environment', isolated: true } } },
+		});
+
+	it('names itself venv_N, which is the envId the engine addresses on disk', () => {
+		assert.equal(generateNodeId([], 'venv'), 'venv_1');
+		assert.equal(generateNodeId([{ id: 'venv_1' }], 'venv'), 'venv_2');
+	});
+
+	it('keeps its size through a save/load round trip', () => {
+		// Without explicit dimensions ReactFlow measures a container to its
+		// content, and an empty one reloads collapsed to header height.
+		const [reloaded] = getNodesFromProject({ components: getProjectComponents([created('venv_1')]) } as unknown as IProject);
+
+		assert.equal(reloaded.type, INodeType.VirtualEnv);
+		assert.equal(reloaded.width, 420);
+		assert.equal(reloaded.height, 260);
+	});
+
+	it('adopts nodes dragged into it', () => {
+		const nodes = [created('venv_1'), node('llm_1', INodeType.Default, { parentId: 'venv_1' })];
+
+		const reloaded = getNodesFromProject({ components: getProjectComponents(nodes) } as unknown as IProject);
+
+		assert.equal(reloaded.length, 2);
+		assert.equal(reloaded[1]!.parentId, 'venv_1');
 	});
 });
 

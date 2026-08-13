@@ -31,6 +31,13 @@ export type ProjectHostToWebview =
 	| { type: 'project:services'; services: Record<string, any>; icons?: Record<string, string> }
 	| { type: 'project:validateResponse'; requestId: number; result: any; error?: string }
 	| { type: 'project:nodeSchemaResponse'; requestId: number; service?: Record<string, any>; error?: string }
+	/**
+	 * Reply to {@link ProjectWebviewToHost} `project:venv`. `result` is the
+	 * engine's boolean and is NOT pass/fail — false means there was no overlay,
+	 * which is idempotent success. A refusal arrives as `error`, carrying the
+	 * engine's own message (a live run, files held open) verbatim.
+	 */
+	| { type: 'project:venvResponse'; requestId: number; result?: boolean; error?: string }
 	| { type: 'project:dirtyState'; isDirty: boolean; isNew: boolean }
 	| { type: 'project:initialState'; state: ViewState }
 	| { type: 'project:initialPrefs'; prefs: Record<string, unknown> }
@@ -52,6 +59,14 @@ export type ProjectWebviewToHost =
 	| { type: 'project:contentChanged'; project: any }
 	| { type: 'project:validate'; requestId: number; pipeline: any }
 	| { type: 'project:getNodeSchema'; requestId: number; provider: string }
+	/**
+	 * Virtual-environment overlay operation for a canvas container. One pair
+	 * rather than two, discriminated by `operation` the way the DAP command
+	 * itself is discriminated by its subcommand: both operations take the same
+	 * two ids and answer with the same boolean, so two pairs would be two of
+	 * everything — maps, counters, handlers — to say one thing.
+	 */
+	| { type: 'project:venv'; requestId: number; operation: 'purge' | 'deleteEnv'; projectId: string; envId: string }
 	| { type: 'project:requestSave' }
 	| { type: 'project:viewStateChange'; viewState: ViewState }
 	| { type: 'project:prefsChange'; prefs: Record<string, unknown> }

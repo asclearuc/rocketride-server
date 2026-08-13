@@ -21,7 +21,13 @@ import { NodeResizer, useStore, useNodeId } from '@xyflow/react';
 
 import { INodeData } from '../../../types';
 import type { IEnvironment } from '../../../types';
+import type { Option } from '../../../../../types/ui';
 import NodeHeader from '../node-component/header';
+import { useFlowGraph } from '../../../context/FlowGraphContext';
+import { useFlowProject } from '../../../context/FlowProjectContext';
+import { useFlowPreferences } from '../../../context/FlowPreferencesContext';
+import { useNodeActionLabels } from '../../../hooks';
+import { isProjectRunning } from '../../../util/venvOps';
 
 // =============================================================================
 // Types
@@ -50,6 +56,36 @@ function NodeVirtualEnv({ id, data, type, parentId }: INodeVirtualEnvProps): Rea
 	const selected = useStore((s) => s.nodeLookup?.get(nodeId ?? '')?.selected ?? false);
 	const environment = data.config?.environment as IEnvironment | undefined;
 
+	// --- Operation A: purge the installed packages --------------------------
+
+	const { setVenvPurgeNodeId } = useFlowGraph();
+	const { venvOps, currentProject, taskStatuses } = useFlowProject();
+	const { isLocked } = useFlowPreferences();
+	const { purgeEnv } = useNodeActionLabels();
+
+	const projectId = currentProject?.project_id ?? '';
+	// The engine refuses purge per PROJECT, not per environment — a run on any
+	// branch of this pipeline holds every overlay of it open.
+	const runInProgress = isProjectRunning(taskStatuses);
+
+	// A disabled MoreMenu item has neither tooltip nor title attribute, so the
+	// reason has to ride in the label or the item greys out explaining nothing.
+	const purgeBlockedBy = runInProgress ? ' — run in progress' : !projectId ? ' — save the pipeline first' : '';
+
+	// Built inline, as NodeHeader builds its own options: no host operations
+	// means no item at all, and Delete keeps working either way — removing the
+	// container from the canvas needs no server.
+	const extraOptions: Option[] | undefined = venvOps
+		? [
+				{
+					...purgeEnv,
+					label: `${purgeEnv.label}${purgeBlockedBy}`,
+					handleClick: () => setVenvPurgeNodeId(id),
+					disabled: isLocked || !!purgeBlockedBy,
+				},
+			]
+		: undefined;
+
 	return (
 		<div style={styles.root}>
 			<NodeResizer minWidth={240} minHeight={140} isVisible={selected} lineStyle={{ borderWidth: 1, borderColor: 'var(--rr-accent)' }} color="var(--rr-accent)" />
@@ -58,7 +94,7 @@ function NodeVirtualEnv({ id, data, type, parentId }: INodeVirtualEnvProps): Rea
 			<div className="rr-corner-cap-top" />
 
 			{/* Header — icon, title, gear, overflow menu */}
-			<NodeHeader id={id} title={environment?.name || data.name || 'Virtual Environment'} nodeType={type} hideEdit={false} formDataValid={data.formDataValid} description={data.description} parentId={parentId} />
+			<NodeHeader id={id} title={environment?.name || data.name || 'Virtual Environment'} nodeType={type} hideEdit={false} formDataValid={data.formDataValid} description={data.description} parentId={parentId} extraOptions={extraOptions} />
 
 			{/* Drop area for member nodes. The badge is only drawn once the body has room
 			    for it — at header height it would sit on top of the title. */}

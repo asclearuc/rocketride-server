@@ -56,6 +56,7 @@ import { INode, INodeData, IProject, IProjectLayout, INodeType, isContainerType,
 export type FlowNode = Node<INodeData>;
 
 import { getNodesFromProject, getEdgesFromNodes, getProjectComponents, generateNodeId, DEFAULT_EDGE } from '../util/graph';
+import { applyVenvDeleteAnswer, findVenvContainerIds, isProjectRunning, promoteContainerMembers } from '../util/venvOps';
 import { useFlowPreferences } from './FlowPreferencesContext';
 import { useFlowProject } from './FlowProjectContext';
 import { hasConfigurableSchema, resolveDefaultFormData } from '../util/helpers';
@@ -81,6 +82,45 @@ export interface IQuickAddState {
 	mode: 'lane' | 'invoke';
 	/** For invoke-source clicks: the channel key (e.g. "llm"). Undefined for invoke-target or lane mode. */
 	invokeKey?: string;
+}
+
+// =============================================================================
+// Virtual-environment container deletion
+// =============================================================================
+
+/**
+ * An open "delete this container?" question, awaiting the user.
+ *
+ * It lives on the context rather than in the node because ReactFlow invokes
+ * `onBeforeDelete`, not a component: the overflow menu, the Delete key and a
+ * region select all arrive through the same hook, and all of them must get the
+ * same dialog.
+ */
+export interface IVenvDeleteRequest {
+	/** Container node ids in the pending deletion — also their `envId`s on disk. */
+	containerIds: string[];
+	/** Their display names, for the dialog copy. */
+	containerNames: string[];
+	/**
+	 * Whether the disk question can be asked at all: a host wired `venvOps`
+	 * and the document has been saved (an unsaved pipeline has no project id,
+	 * and the engine refuses every destructive subcommand without one).
+	 */
+	canRemoveOverlay: boolean;
+	/**
+	 * Whether the disk question is currently refused because a run of this
+	 * project still holds the overlay's files. Only the checkbox is blocked —
+	 * deleting the nodes stays available, being a graph edit.
+	 */
+	overlayBlockedByRun: boolean;
+}
+
+/** The user's answer to {@link IVenvDeleteRequest}. */
+export interface IVenvDeleteAnswer {
+	/** Delete the container's members too; false ungroups and keeps them. */
+	deleteMembers: boolean;
+	/** Also remove the environment from the server's disk. */
+	deleteOverlay: boolean;
 }
 
 // =============================================================================
@@ -138,11 +178,14 @@ export interface IFlowGraphContext {
 	/**
 	 * Creates a new node from service data and appends it to the canvas.
 	 *
-	 * @param data     - Node data including at minimum a `provider` key.
-	 * @param position - Optional canvas position. Defaults to center of viewport.
-	 * @param type     - Node type (default: Default).
+	 * @param data       - Node data including at minimum a `provider` key.
+	 * @param position   - Optional canvas position. Defaults to center of viewport.
+	 * @param type       - Node type (default: Default).
+	 * @param dimensions - Explicit size. Required for containers, which collapse to
+	 *                     header height without it; omit for ordinary nodes, which
+	 *                     ReactFlow measures.
 	 */
-	addNode: (data: INodeData, position?: { x: number; y: number }, type?: INodeType) => string;
+	addNode: (data: INodeData, position?: { x: number; y: number }, type?: INodeType, dimensions?: { width: number; height: number }) => string;
 
 	/**
 	 * Updates a node's data by merging the provided fields.
@@ -163,6 +206,36 @@ export interface IFlowGraphContext {
 
 	/** Callback after nodes are deleted (cleanup edges, close panels). */
 	onNodesDelete: (deletedNodes: FlowNode[]) => void;
+
+	/**
+	 * Last word before ReactFlow removes anything — handed to `<ReactFlow>`.
+	 *
+	 * Every delete route passes through here, the Delete key included, so this
+	 * is where a virtual-environment container asks its two questions. Returns
+	 * `false` to drop the deletion, or the narrowed set to let it proceed with
+	 * exactly what the user confirmed; an ordinary delete is waved through
+	 * without cost.
+	 */
+	onBeforeDelete: (pending: { nodes: FlowNode[]; edges: Edge[] }) => Promise<boolean | { nodes: FlowNode[]; edges: Edge[] }>;
+
+	/** The open container-delete question, or null when none is pending. */
+	venvDeleteRequest: IVenvDeleteRequest | null;
+
+	/** Answers the open container-delete question. Pass null to cancel. */
+	resolveVenvDelete: (answer: IVenvDeleteAnswer | null) => void;
+
+	/**
+	 * Container whose purge confirmation is open (undefined = closed).
+	 *
+	 * Held here, and the dialog rendered by FlowCanvas, for the same reason
+	 * {@link editingNodeId} is: a node sits inside ReactFlow's transformed
+	 * viewport, and a `position: fixed` dialog rendered there would inherit
+	 * the canvas pan and zoom.
+	 */
+	venvPurgeNodeId: string | undefined;
+
+	/** Opens or closes the purge confirmation for a container. */
+	setVenvPurgeNodeId: (nodeId: string | undefined) => void;
 
 	// --- Drag state --------------------------------------------------------
 
@@ -299,7 +372,7 @@ function projectContentSig(project?: { components?: unknown } | null): string {
  */
 export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactElement {
 	const { isLocked, projectLayout, updateProjectLayout } = useFlowPreferences();
-	const { currentProject, initialViewport, servicesJson, requestNodeSchema, onContentChanged, patchToolchainState } = useFlowProject();
+	const { currentProject, initialViewport, servicesJson, requestNodeSchema, onContentChanged, patchToolchainState, taskStatuses, venvOps } = useFlowProject();
 
 	// --- ReactFlow hooks ---------------------------------------------------
 
@@ -711,7 +784,7 @@ export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactE
 	);
 
 	const addNode = useCallback(
-		(data: INodeData, position?: { x: number; y: number }, type: INodeType = INodeType.Default): string => {
+		(data: INodeData, position?: { x: number; y: number }, type: INodeType = INodeType.Default, dimensions?: { width: number; height: number }): string => {
 			if (isLocked) return '';
 			const id = generateNodeId(nodes, data.provider);
 
@@ -798,6 +871,11 @@ export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactE
 				},
 				deletable: true,
 				selectable: true,
+				// Containers must carry explicit dimensions or ReactFlow sizes them to
+				// their content and they collapse to header height with their members
+				// outside the bounds (see INode.width). Ordinary nodes pass none and
+				// keep being measured.
+				...(dimensions ? { width: dimensions.width, height: dimensions.height } : {}),
 			};
 
 			// Append node — ReactFlow owns nodes and edges; no edge rebuild needed
@@ -832,27 +910,20 @@ export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactE
 			if (isLocked) return;
 			const ids = new Set(nodeIds);
 			const nodesToRemove = nodes.filter((n: FlowNode) => ids.has(n.id));
-			const parentMap = Object.fromEntries(nodesToRemove.map((n) => [n.id, n]));
+
+			// A virtual environment's delete is answered by onBeforeDelete, which
+			// owns the promotion for every route — including the cancel, where
+			// nothing may move. Promoting here would ungroup a container that then
+			// survives the dialog. Plain groups keep the old behaviour: their
+			// delete asks nothing, so there is no answer to wait for.
+			const promotableIds = nodesToRemove.filter((n: FlowNode) => n.type !== INodeType.VirtualEnv).map((n) => n.id);
+			const promotableSet = new Set(promotableIds);
 
 			// Identify child nodes that would be orphaned
-			const childNodeIds = new Set(nodes.filter((n: FlowNode) => n.parentId != null && ids.has(n.parentId)).map((n) => n.id));
+			const childNodeIds = new Set(nodes.filter((n: FlowNode) => n.parentId != null && promotableSet.has(n.parentId)).map((n) => n.id));
 
 			// Promote children to top-level before deleting parents
-			setNodes((nds: FlowNode[]) =>
-				nds.map((n: FlowNode) => {
-					if (!childNodeIds.has(n.id)) return n;
-					const parent = parentMap[n.parentId!];
-					return {
-						...n,
-						position: {
-							x: (parent?.position.x ?? 0) + n.position.x,
-							y: (parent?.position.y ?? 0) + n.position.y,
-						},
-						parentId: undefined,
-						extent: undefined,
-					};
-				})
-			);
+			setNodes((nds: FlowNode[]) => promoteContainerMembers(nds, promotableIds));
 
 			// Build the final list of nodes to delete
 			let toDelete = nodesToRemove;
@@ -863,7 +934,7 @@ export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactE
 
 			deleteElements({ nodes: toDelete });
 		},
-		[nodes, setNodes, deleteElements]
+		[isLocked, nodes, setNodes, deleteElements]
 	);
 
 	const onNodesDelete = useCallback(
@@ -879,6 +950,88 @@ export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactE
 			}
 		},
 		[edges, setEdges, onContentUpdated]
+	);
+
+	// =====================================================================
+	// Virtual-environment container deletion
+	// =====================================================================
+
+	const [venvDeleteRequest, setVenvDeleteRequest] = useState<IVenvDeleteRequest | null>(null);
+	const [venvPurgeNodeId, setVenvPurgeNodeId] = useState<string | undefined>(undefined);
+
+	/** Resolver of the promise `onBeforeDelete` is parked on while the dialog is open. */
+	const venvDeleteResolverRef = useRef<((answer: IVenvDeleteAnswer | null) => void) | null>(null);
+
+	const resolveVenvDelete = useCallback((answer: IVenvDeleteAnswer | null) => {
+		const resolve = venvDeleteResolverRef.current;
+		venvDeleteResolverRef.current = null;
+		setVenvDeleteRequest(null);
+		resolve?.(answer);
+	}, []);
+
+	/**
+	 * Asks the container's two questions before ReactFlow removes anything.
+	 *
+	 * ReactFlow hands over the set it is about to remove with the containers'
+	 * members already cascaded in, and accepts a narrowed set back — so one
+	 * dialog can answer for a whole region select without partial deletes or
+	 * two undo steps for one gesture.
+	 */
+	const onBeforeDelete = useCallback(
+		async ({ nodes: pendingNodes, edges: pendingEdges }: { nodes: FlowNode[]; edges: Edge[] }): Promise<boolean | { nodes: FlowNode[]; edges: Edge[] }> => {
+			// ReactFlow knows nothing about the canvas lock: on a locked canvas
+			// its remove-changes die downstream in onNodesChange's guard. Refusing
+			// here is what stops the disk half from running for real against a
+			// graph half that is about to be silently dropped.
+			if (isLocked) return false;
+
+			const containerIds = findVenvContainerIds(pendingNodes);
+			// Economy: this fires for every deletion on the canvas, edge-only ones
+			// included. Ordinary deletes must not pay for the container's questions.
+			if (containerIds.length === 0) return true;
+
+			const projectId = currentProject?.project_id ?? '';
+			const answer = await new Promise<IVenvDeleteAnswer | null>((resolve) => {
+				venvDeleteResolverRef.current = resolve;
+				setVenvDeleteRequest({
+					containerIds,
+					containerNames: containerIds.map((id) => {
+						const container = pendingNodes.find((n) => n.id === id);
+						return (container?.data?.config?.environment as { name?: string } | undefined)?.name || container?.data?.name || id;
+					}),
+					canRemoveOverlay: !!venvOps && !!projectId,
+					overlayBlockedByRun: isProjectRunning(taskStatuses),
+				});
+			});
+			if (!answer) return false;
+
+			// Disk first. If the node went first and the call then failed — which
+			// it does, with a named busy error, whenever an engine still holds the
+			// overlay's .pyd/.dll — the user would have lost the container and kept
+			// the disk. This way a refusal leaves the container standing, with the
+			// engine's own message explaining it.
+			if (answer.deleteOverlay && venvOps && projectId) {
+				try {
+					for (const envId of containerIds) {
+						// The boolean is not pass/fail: false means there was no
+						// overlay, which is idempotent success. Only a throw refuses.
+						await venvOps.deleteEnv(projectId, envId);
+					}
+				} catch (error) {
+					setConfigSnackbar(error instanceof Error ? error.message : String(error));
+					return false;
+				}
+			}
+
+			if (!answer.deleteMembers) {
+				// Promote before the removal lands, so a member never spends a
+				// render referencing a parent that is already gone.
+				setNodes((nds: FlowNode[]) => promoteContainerMembers(nds, containerIds));
+			}
+
+			return applyVenvDeleteAnswer({ nodes: pendingNodes, edges: pendingEdges }, containerIds, answer.deleteMembers);
+		},
+		[isLocked, currentProject, venvOps, taskStatuses, setNodes, setConfigSnackbar]
 	);
 
 	// =====================================================================
@@ -1184,6 +1337,11 @@ export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactE
 			updateNode,
 			deleteNode,
 			onNodesDelete,
+			onBeforeDelete,
+			venvDeleteRequest,
+			resolveVenvDelete,
+			venvPurgeNodeId,
+			setVenvPurgeNodeId,
 			tempNode,
 			setTempNode,
 			focusOnNode,
@@ -1198,7 +1356,7 @@ export function FlowGraphProvider({ children }: IFlowGraphProviderProps): ReactE
 			configSnackbar,
 			setConfigSnackbar,
 		}),
-		[nodes, edges, nodeMap, setNodes, setEdges, onNodesChange, onEdgesChange, onEdgeConnect, isValidConnection, onDragOver, onDrop, onNodeDragStop, addNode, updateNode, deleteNode, onNodesDelete, tempNode, focusOnNode, editingNodeId, onContentUpdated, loadData, loadCanvas, isFlowReady, quickAddState, configSnackbar]
+		[nodes, edges, nodeMap, setNodes, setEdges, onNodesChange, onEdgesChange, onEdgeConnect, isValidConnection, onDragOver, onDrop, onNodeDragStop, addNode, updateNode, deleteNode, onNodesDelete, onBeforeDelete, venvDeleteRequest, resolveVenvDelete, venvPurgeNodeId, tempNode, focusOnNode, editingNodeId, onContentUpdated, loadData, loadCanvas, isFlowReady, quickAddState, configSnackbar]
 	);
 
 	return <FlowGraphContext.Provider value={value}>{children}</FlowGraphContext.Provider>;

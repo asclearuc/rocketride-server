@@ -281,6 +281,10 @@ Enumerates and reclaims the per-environment `site-packages` overlays under `<exe
   report — a `ttl`-resident engine that still holds an overlay's `.pyd`/`.dll` open makes the
   wipe fail with a named busy error on Windows. Completion is not the same as "the process is
   gone"; stop the engines first.
+- **You rarely need the wire.** Both SDKs wrap this command as `client.venv`
+  ([TypeScript](/develop/typescript/methods/venv) · [Python](/develop/python/venv)), both CLIs
+  expose it as `rocketride venv …`, and the editors put purge and delete on the container
+  itself. The wire surface here is for debugging and for writing your own tooling.
 
 ## Notes
 
@@ -298,4 +302,6 @@ Enumerates and reclaims the per-environment `site-packages` overlays under `<exe
 - [TypeScript SDK](/develop/typescript) · [Python SDK](/develop/python): clients
   that wrap subscriptions behind `getTaskStatus()`, `onEvent`, and `setEvents()` /
   `add_monitor`.
+- Virtual environments: [TypeScript](/develop/typescript/methods/venv) ·
+  [Python](/develop/python/venv) — the `client.venv` namespace over `rrext_venv`.
 - [Execution model](/concepts/execution-model): how a run streams once started.

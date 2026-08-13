@@ -73,6 +73,7 @@ You build your `.pipe` - and you run it against the fastest AI runtime available
 - **File upload** - `send_files()` with progress; streaming with `pipe()`
 - **Connection lifecycle** - Optional persist mode, reconnection, and callbacks (`on_connected`, `on_disconnected`, `on_connect_error`)
 - **Project storage** - Save, retrieve, and version-control pipelines on the server
+- **Virtual environments** - See and reclaim a pipeline's installed packages on the server via `client.venv` ([Virtual Environments](/develop/python/venv))
 - **Async-first** - Built on `asyncio` and `websockets`; supports `async with` context manager
 - **CLI included** - Manage pipelines from the command line
 - **Telemetry reporting** - The shared loose `report()` core via `rocketride.analytics`; each app owns its own event taxonomy ([Analytics / Telemetry Reporting](/develop/python/analytics))
@@ -782,6 +783,8 @@ rocketride stop --token <token>              # Terminate a running task
 rocketride list                              # List all active tasks
 rocketride events ALL --token <token>        # Stream task events
 rocketride store dir /                       # List the root of the file store
+rocketride venv list                         # List virtual-environment overlays
+rocketride venv purge <projectId> <envId>    # Reclaim one environment's packages
 ```
 
 The `store` command's sub-commands are `dir`, `type`, `write`, `rm`, `mkdir`, and `stat` — run `rocketride store --help` for details.

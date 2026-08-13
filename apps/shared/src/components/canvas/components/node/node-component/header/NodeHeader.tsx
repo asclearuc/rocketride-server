@@ -105,6 +105,14 @@ interface INodeHeaderProps {
 	onBadgeClick?: () => void;
 	/** Whether this node's service is flagged as experimental. */
 	isExperimental?: boolean;
+	/**
+	 * Node-type-specific menu entries, appended after Delete and before the
+	 * documentation divider. One hook, not one per node type: the virtual
+	 * environment's Purge arrives this way, and Delete is deliberately left
+	 * alone — it already routes through `onBeforeDelete`, which is where the
+	 * container's questions are asked.
+	 */
+	extraOptions?: Option[];
 }
 
 // =============================================================================
@@ -117,7 +125,7 @@ interface INodeHeaderProps {
  * @param props - Node identity, metadata, and an optional click handler.
  * @returns The fully rendered header bar element.
  */
-export default function NodeHeader({ id, hideEdit = false, nodeType, icon, title, description, documentation, formDataValid, parentId: _parentId, handleClick, classType, errorCount, warningCount, onBadgeClick, isExperimental }: INodeHeaderProps): ReactElement {
+export default function NodeHeader({ id, hideEdit = false, nodeType, icon, title, description, documentation, formDataValid, parentId: _parentId, handleClick, classType, errorCount, warningCount, onBadgeClick, isExperimental, extraOptions }: INodeHeaderProps): ReactElement {
 	// ========================================================================
 	// FlowContext state and actions
 	// ========================================================================
@@ -163,6 +171,12 @@ export default function NodeHeader({ id, hideEdit = false, nodeType, icon, title
 			disabled: isLocked,
 		},
 	];
+
+	// Node-type-specific entries (e.g. the virtual environment's Purge), kept
+	// above the documentation divider so that link stays last.
+	if (extraOptions?.length) {
+		options = [...options, ...extraOptions];
+	}
 
 	// Documentation link — separated by a visual divider if a docs URL is provided
 	if (documentation) {

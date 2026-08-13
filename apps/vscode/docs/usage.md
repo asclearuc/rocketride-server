@@ -60,6 +60,20 @@ The visual editor provides:
 - **Properties panel**: Configure selected component settings (API keys, models, connection strings, etc.).
 - **Lane connections**: Draw lines between component output and input lanes to define data flow.
 
+## Virtual Environment Containers
+
+Components placed inside a **virtual environment** container resolve their dependencies in isolation: the engine installs them into a `site-packages` tree of their own, kept on the **server's** disk. Against a local engine that is your machine; against a remote or cloud one it is not.
+
+Add one with **Add virtual environment** in the canvas toolbar, next to Add annotation, then drag existing nodes into it — members are adopted by dropping them inside, exactly as with a plain group. A container cannot be nested in another container. Rename it, or turn isolation off, in its config panel (the gear).
+
+That tree is a cache, never authored data — the requirements live in the pipeline itself, so reclaiming it costs the next run's install time and nothing else. The container's own controls are:
+
+- **Purge packages** (overflow menu, `⋯`): empties the installed packages and leaves the container, its members and their configuration alone. Guarded by a confirmation. The item is disabled while a run of the pipeline is live — the engine refuses per *pipeline*, not per environment — and the label says so.
+- **Delete** (menu, or the `Delete` / `Backspace` key): asks two things. Whether the member nodes go with the container or stay on the canvas ungrouped, and whether the environment goes from the server's disk. The second is offered only when connected, and is blocked while a run is live. Deleting *just the nodes* stays available at all times, being a canvas edit.
+- **Deleting the pipeline file** reclaims that pipeline's environments in the background. This follows the file watcher, so it also covers a delete made outside VS Code — but not one made while disconnected, which is left to the server's own orphan cleanup.
+
+If the server refuses, its message is shown as it came: it names the cause, usually a run still going or a file an engine still holds open. Stop the engines and retry.
+
 ## Pipeline Execution Defaults
 
 Trace verbosity, the idle timeout (TTL), task arguments, and debug output for pipeline runs are configured once in **Settings → Pipeline** — they are workspace settings, not per-pipeline options:

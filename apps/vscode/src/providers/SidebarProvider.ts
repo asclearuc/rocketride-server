@@ -32,6 +32,7 @@ import { isSubscribed } from '../shared/util/subscriptionGate';
 import { isDeployRunBody } from '../shared/util/runClassification';
 import { checkMissingEnvVars } from '../shared/util/envVarCheck';
 import { getLogger } from '../shared/util/output';
+import { icons } from '../shared/util/icons';
 import { getProjectProvider } from '../extension';
 import { scanWorkspaceApps, appIconDataUri } from '../appdev/appScan';
 import type { ScannedApp } from '../appdev/appScan';
@@ -324,10 +325,38 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 		await this.loadPipelineFiles();
 	}
 
-	/** Removes the deleted file from the parsed-files cache and updates the webview. */
+	/**
+	 * Removes the deleted file from the parsed-files cache, reclaims its
+	 * virtual-environment overlays on the server, and updates the webview.
+	 *
+	 * The cache read comes BEFORE the delete from it — that ordering is the
+	 * whole lookup, since after it there is nothing left holding the
+	 * `project_id` and inferring one from the filename would address an
+	 * unrelated overlay.
+	 *
+	 * Fired by the `**​/*.pipe` watchers' `onDidDelete`, so this covers a delete
+	 * from the VS Code explorer AND one made outside the editor. Still
+	 * best-effort: a file deleted while disconnected leaves its overlays for
+	 * orphan collection (§4.10's real safety net, 2C), which is the designed
+	 * fallback and not a failure worth reporting.
+	 */
 	private async handleFileDeleted(uri: vscode.Uri): Promise<void> {
+		const projectId = this.parsedFiles.get(uri.fsPath)?.projectId;
 		this.parsedFiles.delete(uri.fsPath);
 		this.sendEntriesUpdate();
+
+		if (!projectId) return;
+		try {
+			const client = this.connectionManager.getClient();
+			if (!client || !this.connectionManager.isConnected()) return;
+			// Removes the venvs/<projectId>/ subtree, not the project — the
+			// pipeline itself is already gone by the time a watcher fires.
+			const removed = await client.venv.deleteProject(projectId);
+			if (removed > 0) this.logger.output(`${icons.success} Reclaimed ${removed} environment(s) of the deleted pipeline`);
+		} catch (error) {
+			// Never surfaced: the user deleted a pipeline and that succeeded.
+			this.logger.error(`Reclaiming environments of a deleted pipeline: ${error instanceof Error ? error.message : String(error)}`);
+		}
 	}
 
 	/** Re-parses a changed .pipe file, ensures project_id, and optionally restarts. */

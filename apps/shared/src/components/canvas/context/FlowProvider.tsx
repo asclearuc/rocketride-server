@@ -41,7 +41,7 @@
 
 import { ReactElement, ReactNode } from 'react';
 
-import { IProject, IValidatePipelinePayload, IValidateResponse, ITaskStatus } from '../types';
+import { IProject, IValidatePipelinePayload, IValidateResponse, ITaskStatus, IVenvOps } from '../types';
 
 import { FlowPreferencesProvider } from './FlowPreferencesContext';
 import { FlowProjectProvider } from './FlowProjectContext';
@@ -84,6 +84,8 @@ export interface IFlowProviderProps {
 
 	// --- Host callbacks ----------------------------------------------------
 	handleValidatePipeline?: (pipeline: IValidatePipelinePayload) => Promise<IValidateResponse>;
+	/** Virtual-environment overlay operations on the server. Stable identity required. */
+	venvOps?: IVenvOps;
 	onContentChanged?: (project: IProject) => void;
 	onViewportChange?: (viewport: { x: number; y: number; zoom: number }) => void;
 	onUndo?: () => void;
@@ -141,7 +143,7 @@ export interface IFlowProviderProps {
  * </ReactFlowProvider>
  * ```
  */
-export function FlowProvider({ children, project, projectId, isReadonly, taskStatuses, componentPipeCounts, totalPipes, servicesJson, servicesJsonError, getNodeSchema, inventory, inventoryConnectorTitleMap, handleValidatePipeline, onContentChanged, onViewportChange, onUndo, onRedo, oauth2RootUrl, oauthReturnUrl, onOpenExternal, pendingOAuthTokens, clearPendingOAuthTokens, onOpenLink, googlePickerDeveloperKey, googlePickerClientId, onRunPipeline, onStopPipeline, onOpenStatus, serverHost, isConnected, isSubscribed, initialViewport, isDirty, isNew, onSave, onExport, envKeys }: IFlowProviderProps): ReactElement {
+export function FlowProvider({ children, project, projectId, isReadonly, taskStatuses, componentPipeCounts, totalPipes, servicesJson, servicesJsonError, getNodeSchema, inventory, inventoryConnectorTitleMap, handleValidatePipeline, venvOps, onContentChanged, onViewportChange, onUndo, onRedo, oauth2RootUrl, oauthReturnUrl, onOpenExternal, pendingOAuthTokens, clearPendingOAuthTokens, onOpenLink, googlePickerDeveloperKey, googlePickerClientId, onRunPipeline, onStopPipeline, onOpenStatus, serverHost, isConnected, isSubscribed, initialViewport, isDirty, isNew, onSave, onExport, envKeys }: IFlowProviderProps): ReactElement {
 	return (
 		<FlowPreferencesProvider projectId={projectId} isReadonly={isReadonly}>
 			<FlowProjectProvider
@@ -156,6 +158,7 @@ export function FlowProvider({ children, project, projectId, isReadonly, taskSta
 				inventory={inventory}
 				inventoryConnectorTitleMap={inventoryConnectorTitleMap}
 				handleValidatePipeline={handleValidatePipeline}
+				venvOps={venvOps}
 				onContentChanged={onContentChanged}
 				onViewportChange={onViewportChange}
 				onUndo={onUndo}

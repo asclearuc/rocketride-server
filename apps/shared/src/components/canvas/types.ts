@@ -81,6 +81,57 @@ export enum INodeType {
 export const isContainerType = (type?: string): boolean => type === INodeType.Group || type === INodeType.VirtualEnv;
 
 // ============================================================================
+// Virtual-environment operations (supplied by the host)
+// ============================================================================
+
+/**
+ * Overlay operations for a virtual-environment container.
+ *
+ * The canvas cannot reach a server, so the host supplies these exactly as it
+ * supplies `handleValidatePipeline`. Both act on the `site-packages` overlay
+ * held by the **server the host is connected to** — against a local engine
+ * that is the user's own disk, against a remote or cloud engine it is not.
+ *
+ * An overlay is a rebuildable cache: the requirements live in the pipeline
+ * document, so the next run reinstalls whatever these reclaim. Nothing
+ * authored is lost.
+ *
+ * When the whole prop is absent, Purge is not offered and the "also remove the
+ * environment" question is never asked — but deleting a container from the
+ * canvas keeps working, because that is a graph edit needing no server.
+ *
+ * Deliberately two operations, not four. `list` earns a place only once a
+ * container actually shows overlay state, and removing a project's whole
+ * subtree fires when the pipeline is deleted — which is the host's business,
+ * not the canvas's.
+ */
+export interface IVenvOps {
+	/**
+	 * Empties one environment's `site-packages`, keeping its compiled inputs.
+	 *
+	 * @param projectId - The document's `project_id`, passed raw.
+	 * @param envId     - The container node's own id, passed raw.
+	 * @returns `true` when an overlay was reclaimed; `false` when there was
+	 *          none. `false` is idempotent success, not a failure — a container
+	 *          that never ran has no overlay.
+	 * @throws When the server refuses (a run is live, files are held open). The
+	 *         message names the cause and is shown verbatim.
+	 */
+	purge: (projectId: string, envId: string) => Promise<boolean>;
+
+	/**
+	 * Removes one environment's overlay directory outright.
+	 *
+	 * @param projectId - The document's `project_id`, passed raw.
+	 * @param envId     - The container node's own id, passed raw.
+	 * @returns `true` when a directory was removed; `false` when there was
+	 *          none — idempotent success, same as {@link purge}.
+	 * @throws When the server refuses; the message is shown verbatim.
+	 */
+	deleteEnv: (projectId: string, envId: string) => Promise<boolean>;
+}
+
+// ============================================================================
 // Node Layout & Lane Types
 // ============================================================================
 

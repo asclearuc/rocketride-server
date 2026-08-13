@@ -49,6 +49,7 @@ from .billing import BillingApi
 from .database import DatabaseApi
 from .deploy import DeployApi
 from .log import LogApi
+from .venv import VenvApi
 from .mixins.connection import ConnectionMixin
 from .mixins.execution import ExecutionMixin
 from .mixins.data import DataMixin
@@ -386,6 +387,11 @@ class RocketRideClient(
     def log(self) -> LogApi:
         """Run-log continuum operations (chapters, ranged reads, delete)."""
         return LogApi(self)
+
+    @cached_property
+    def venv(self) -> VenvApi:
+        """Virtual-environment overlay operations (list, purge, delete) on the SERVER's disk."""
+        return VenvApi(self)
 
     # =========================================================================
     # TASK METHODS

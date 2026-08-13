@@ -74,6 +74,7 @@ You build your `.pipe` - and you run it against the fastest AI runtime available
 - **File upload** - `sendFiles()` with progress; streaming with `pipe()`
 - **Connection lifecycle** - Optional persist mode, reconnection, and callbacks (`onConnected`, `onDisconnected`, `onConnectError`)
 - **Full TypeScript support** - Complete type definitions
+- **Virtual environments** - See and reclaim a pipeline's installed packages on the server via `client.venv` ([Virtual Environments](/develop/typescript/methods/venv))
 - **Telemetry reporting** - The shared loose `report()` core via `rocketride/analytics`; each app owns its own event taxonomy ([Analytics / Telemetry Reporting](/develop/typescript/analytics))
 
 ---
