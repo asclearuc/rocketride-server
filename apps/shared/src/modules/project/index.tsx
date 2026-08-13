@@ -9,6 +9,9 @@
 
 export { default as ProjectView } from './ProjectView';
 export type { IProjectViewProps } from './ProjectView';
+// Re-exported beside the props it belongs to: this specifier is the one both
+// hosts import from, and the venvOps object they build is typed by it.
+export type { IVenvOps } from '../../components/canvas';
 export type { IViewProps, ProjectViewMode, ViewState, TaskStatus, TraceEvent, TraceRow, TraceLevel } from './types';
 export { parseServerEvent, isDevLiveEvent, isTeamLiveEvent } from './utils';
 export type { ParsedServerEvent } from './utils';

@@ -189,6 +189,9 @@ from .log import (
     LogPlayItem,
 )
 
+# Virtual-environment types: the on-disk site-packages overlays.
+from .venv import VenvOverlay
+
 # Billing types: subscriptions, Stripe plans, compute credits, promo codes.
 from .billing import (
     AppPrice,
@@ -333,6 +336,8 @@ __all__ = [
     'LogTracesResult',
     'LogTraceDetail',
     'LogPlayItem',
+    # Virtual-environment types
+    'VenvOverlay',
     # Billing types
     'AppPrice',
     'BillingDetail',

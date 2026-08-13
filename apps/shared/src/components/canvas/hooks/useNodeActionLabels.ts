@@ -23,7 +23,7 @@
 
 /**
  * useNodeActionLabels — Provides labelled menu options for node actions
- * (open, duplicate, delete, documentation, ungroup) with
+ * (open, duplicate, delete, documentation, ungroup, purge) with
  * platform-appropriate keyboard shortcut hints.
  */
 
@@ -71,6 +71,11 @@ export default function useNodeActionLabels(): Record<string, Option> {
 		},
 		documentation: {
 			label: 'Documentation',
+		},
+		// Virtual-environment container only. Not on the gear: that already opens
+		// the container's own configuration, which stays editable.
+		purgeEnv: {
+			label: 'Purge packages',
 		},
 	};
 }

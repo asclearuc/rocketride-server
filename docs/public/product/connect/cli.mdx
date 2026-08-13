@@ -526,6 +526,24 @@ Sub-commands:
 | `mkdir <path>` | Create a directory in the store. |
 | `stat <path>` | Print metadata (size, type, modified time) for `<path>`. |
 
+### venv
+
+Use `venv` to list and reclaim the virtual-environment overlays a pipeline's
+containers installed on the server.
+
+```bash
+rocketride venv list                        # every overlay on the server
+rocketride venv list proj-abc               # one pipeline's
+rocketride venv list --sizes                # with byte counts (slow)
+rocketride venv purge proj-abc venv_1       # empty one environment
+rocketride venv delete proj-abc venv_1      # remove one environment
+rocketride venv delete-project proj-abc     # remove a pipeline's subtree
+```
+
+`venv list` also honours `--json`. The destructive commands have no
+confirmation prompt — they are scriptable by design. See
+[Virtual Environments](/clients/python/venv) for what each one reclaims.
+
 ## Related
 
 - [Run from the CLI](/quickstart/cli): the five-step tutorial.

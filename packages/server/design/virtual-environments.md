@@ -2,8 +2,9 @@
 
 **Status:** Living document — largely implemented. Phase 2A (per-environment scoping) and Phase 2B
 (the venv runtime, steps 4–8.7) are shipped and live-verified; what remains open is named where it
-lives — §4.9's base shrink, §4.10's second-run-collision question, the client half of `rrext_venv`
-(§7), and Phase 2C. **2A-4 closed with 6b** (§4.16), which ended in a measurement rather than the
+lives — §4.9's base shrink, §4.10's second-run-collision question, and Phase 2C. **The client
+half of `rrext_venv` closed in 2B** (§7): both SDKs, both CLIs, and operations A/B/C on the
+canvas in both hosts. **2A-4 closed with 6b** (§4.16), which ended in a measurement rather than the
 version move it was scoped as; the one thing it carries forward is the barrel import named at the
 end of its §7 entry. Each increment's record sits with its section, so
 "is this built?" is answered locally rather than here. *This field read "Draft (design round — no
@@ -1475,19 +1476,39 @@ starts — is drawn in **§3.1, view 1**.*
   when two runs of one project collide months later.
 - **Purge & delete (canvas-driven).** *Purge* = remove all installed packages, keeping standard Python
   (delete the contents of the venv's `site-packages`; the base/stdlib survives because it's shared).
-  - **Operation A — Purge (cog):** wipes packages, keeps the container + nodes. Allowed only when no run
+  - **Creation — added in 2B, and it was the gap that made A/B/C unreachable.** `99ff2073` shipped
+    the container's component, type, serialization (with round-trip tests), config-panel editing
+    and drag-drop adoption — but **no way to create one**. `addNode` has always taken a node type
+    (the annotation toolbar button passes `INodeType.Annotation`); nothing ever passed `Group` or
+    `VirtualEnv`, and the catalog has no entry for either — `nodes/src/nodes/venv/` is the runtime
+    sub-pipeline bridge, flagged `internal`, not the canvas container. So the container was
+    uncreatable from the UI from the day it landed, which would have left every operation below
+    pressable only on a hand-edited document. 2B adds the toolbar button beside Add annotation.
+    Two details it must get right: `provider: 'venv'` is what names the node `venv_1` — **and the
+    node id IS the `envId` the engine addresses on disk** — and the button passes explicit
+    dimensions, because without them ReactFlow measures the container to its content and an empty
+    one collapses to header height with its members outside the bounds.
+  - **Operation A — Purge:** wipes packages, keeps the container + nodes. Allowed only when no run
     uses that env (active-task registry, `task_server.py`); deleting files a live process holds fails on
     Windows, so the gate is mandatory. Exposed as an engine command over the protocol (local + cloud).
+    *This bullet said "Purge (cog)" until 2B, and the cog was already taken* — `NodeHeader` renders
+    it when `hideEdit` is false and it opens the container's own configuration, which
+    `NodeVirtualEnv` deliberately keeps editable. Purge ships in the overflow menu instead.
   - **Operation B — Delete the container:** asks (1) delete member nodes + connections? (no = ungroup,
     keep them); (2) also remove the venv? (yes = delete the entire `venvs/<project_id>/<group_id>/`).
+    *2B added a fact worth recording: it is enforced at `onBeforeDelete`, not in the menu item*, so
+    **every** delete route asks — overflow menu, Delete key, region select. Left in the menu handler
+    the dialog would have been decorative, because the fastest way to delete a container skips it;
+    ReactFlow's keyboard path cascades the members in and removes them, which is the opposite of
+    §4.10's "no = ungroup". The hook is async and may return a filtered set, so it awaits the answer
+    and returns exactly what the user confirmed rather than cancelling and asking them to repeat.
   - **Operation C — Pipeline deleted:** delete the whole `venvs/<project_id>/` subtree.
   - **IMPLEMENTED (8.6) — the engine side of all three, plus a `list`.** `rrext_venv` dispatches
     `list` / `purge` / `delete_env` / `delete_project` onto `venv_env` primitives
-    (`packages/server/docs/observability.md` documents the wire surface). **Scope boundary:
-    the protocol command only** — no SDK method and no canvas wiring; A/B/C are the UI actions
-    that will call it. `list` is not in §4.10's original three and was added because without it
-    neither the canvas nor the live check can learn what exists, and the check would then be
-    asserting about files rather than about the protocol.
+    (`packages/server/docs/observability.md` documents the wire surface). `list` is not in §4.10's
+    original three and was added because without it neither the canvas nor the live check can learn
+    what exists, and the check would then be asserting about files rather than about the protocol.
+    **The client half followed in 2B** — see §7.
     *Operation C means the subtree, not its contents:* `delete_project` removes the project
     directory too, and `list_envs` skips a childless project directory, so the closing "list
     shows them gone" cannot be ambiguous between a bug and an empty shell.
@@ -3508,16 +3529,79 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
   compat `=0` isolated-group **demotion** (8.7B: four shapes returned their values, no `venvs/`
   directory, 3 processes where two children would have made 5); purge / delete **lifecycle**
   including the refusal while a run is active (8.6, live end to end). **GC/LRU stays 2C.**
-- **REMAINING in 2B — the client half of `rrext_venv`.** 8.6 shipped the **engine-side protocol
-  command only**: `list` / `purge` / `delete_env` / `delete_project` answer over the socket and are
-  documented in `packages/server/docs/observability.md`. What does **not** exist is anything that
-  calls them — no `client-python` method, no `client-typescript` method, and no canvas wiring, so
-  §4.10's operations **A/B/C are still buttons with nothing to press**. Recorded here rather than
-  only as a scope note inside §4.10's "implemented" bullet, because that is where a reader looks
-  for what shipped, not for what is left.
-  *Nothing is blocked on it:* the driver `e:\tmp\venv-drivers\venv_purge.py` reaches the command
-  through `RocketRideClient.call()`, the generic DAP entry point, which is how the 8.6 live check
-  ran end to end without a single line of client code.
+- **DONE — the client half of `rrext_venv`.** 8.6 shipped the engine-side protocol command and
+  nothing that called it; §4.10's operations A/B/C were buttons with nothing to press. They press
+  now, on four surfaces:
+  - **Both SDKs** carry a `client.venv` namespace — `list` / `purge` / `deleteEnv` /
+    `deleteProject` in TypeScript, the snake_case equivalents in Python — each one call to
+    `rrext_venv` with the matching `subcommand`, unwrapping the body's key. Method names mirror the
+    wire because `observability.md` already publishes that vocabulary and a second set of names
+    would fork it. **The type is `VenvOverlay`, not `VenvEnvironment`**: `PipelineEnvironment`
+    already means the container's block *in the document*, and two near-identical names for the
+    document object and the disk object in one namespace is a trap. Purely additive, so the
+    contract floors pass untouched and no version moved. 13 fake-client unit tests per language
+    pin the wire spelling — a snake_case slip would silently address the shared `default` bucket
+    rather than failing loudly.
+  - **Both CLIs** gained a `venv` group: `list [projectId] [--sizes]`, `purge`, `delete`,
+    `delete-project`. No confirmation prompt in either, matching every other destructive command
+    there (`store rm` deletes on the spot); a prompt here alone would break the scripted use that
+    is the CLI's reason to exist. `--sizes` stays opt-in — `list_envs` sizes recursively, on the
+    order of half a million `stat` calls.
+  - **The canvas**, host-agnostically: `IVenvOps { purge; deleteEnv }` threaded from
+    `ICanvasPanelProps` through `FlowProvider` to `FlowProjectContext`, purge in the container's
+    overflow menu, and the two delete questions at `onBeforeDelete` (see §4.10, operation B).
+    Two operations, not four: `list` earns a place only once the container *shows* overlay state,
+    and `deleteProject` fires when the pipeline is deleted, which is the host's business.
+    **The run gate is not `isPipelineRunning`** — that value reads `state !== COMPLETED &&
+    state !== CANCELLED`, so it counts `NONE` ("no resources allocated") as running and would grey
+    the item out before anything had ever run, while a *failed* run — which reports through
+    `completed`, not a state of its own — is exactly when a user wants the overlay back. The
+    canvas uses `[STARTING, INITIALIZING, RUNNING, STOPPING]` + `!completed` across the whole
+    project, which is what the engine's own `has_active_project_run` decided and for the same
+    reason. A predicate looser than the engine's merely delays a readable refusal; one tighter
+    greys out an operation the engine would have honoured, explaining nothing.
+  - **Both hosts**: rocket-ui calls `getClient().venv.*` directly (resolved inside each member, so
+    the object survives a reconnect); the VS Code extension bridges over `postMessage` as one
+    request/response pair discriminated by `operation`, the way the DAP command is discriminated by
+    its subcommand. Operation C hangs off each host's own delete path — rocket-ui reads the
+    document's id before `fsDelete`, VS Code reads `parsedFiles` before evicting it — file-first
+    and best-effort in both, the opposite ordering from operation B and for the opposite reason:
+    there a refusal must leave the container standing, here the user's intent *is* "delete this
+    pipeline". Neither replaces orphan GC (2C): a delete made outside the app, or while
+    disconnected, still bypasses both hooks.
+  *What the 8.6 record noted as unblocking is now historical:* the driver
+  `e:\tmp\venv-drivers\venv_purge.py` reached the command through `RocketRideClient.call()`, the
+  generic DAP entry point, which is how the 8.6 live check ran without a line of client code.
+- **OPEN — two canvas-side gaps found by 2B's click test, neither caused by it.** Both are the same
+  shape: *the canvas offers what the engine will not accept, and says nothing until it is too late
+  to be cheap.* Recorded together in `INVESTIGATE-venv-source-stub-in-palette.md`, which carries
+  the tables, the traced call paths and two candidate fixes each. Left alone in 2B deliberately —
+  both predate this increment and both are decisions about the catalog and the validation contract,
+  not about the container.
+  1. **`venv_source_stub` is offered in the add-node palette.** The bridge's source stub (from
+     `8ce3e145`) says in its own comment that it is "synthesized by the partitioner and never
+     user-placed", and a user can place it anyway. The cause is not the flag it looks like:
+     `buildInventory` excludes only an empty `classType` and `NoSaas`, and **never consults
+     `IServiceCapabilities.Internal`** — the two sibling services are hidden because they declare
+     `classType: []`, not because they are `internal`. The stub needs `classType: ["source"]` to be
+     instantiable by the child engine, and its own comment rules out `internal` ("an internal
+     source is not registered as a usable pipeline source endpoint"), so neither existing lever
+     separates *registered* from *offerable*.
+  2. **Every scoped structural rejection below is invisible until Run.** The list further up this
+     section is introduced as "structural errors **the editor should have prevented**" — and the
+     editor prevents none of them, because `rrext_validate` (`cmd_misc.py:159`) validates through
+     rocketlib's `validatePipeline` and **never calls the partitioner**. `partition_pipeline` is
+     reached from one place only, `task_engine.py:2599`, on the execute path. So a document that
+     validates green on the canvas can still be structurally impossible, and the user learns it
+     from a run failure. Observed as *"Virtual environment "venv_3" produces output but nothing is
+     routed into it"* on a document whose container had a consumer in main and no producer feeding
+     it — one missing edge on a copied branch. Container-in-container is the single case the canvas
+     does guard (`FlowGraphContext.tsx:561`, on drag), which shows the guard rail is possible.
+     **There is nowhere to hang the fix today:** the canvas's only validate call
+     (`NodeConfigPanel.tsx:443`) sends a *single component*, never the graph, so teaching
+     `rrext_validate` to partition would change nothing on screen — nobody asks it the graph-shaped
+     question. The missing piece is a whole-graph validation call, and with it a decision about
+     when it fires (per edit is wrong for a partition; on save or on arming Run are defensible).
 
 **Phase 2C — Polish & scale.** Multi-process debug/observability across the cut; deploy-time pre-warm;
 the local-IPC transport seam (UDS/named-pipe/shared-mem, §4.5); the **bridge-base + `write_lane`
@@ -3941,6 +4025,43 @@ increment that had to run things on both sides.
 | `builder test` | saas root **and** submodule | two roots, two dists, two caches — **and two different module sets** |
 | `builder nodes:test` | saas root **and** submodule | **needs `ROCKETRIDE_INCLUDE_SKIP`**; xdist defaults to `min(cpus, 8)`, tune with `--pytest-parallel=N` |
 | `builder model_server:test` / `:test-full` | saas root only (not discoverable from the submodule) | **no env var, no `--pytest-parallel`** — neither reaches this lane; it runs single-process |
+| `builder shared:test` | submodule | `node --test` under `tsx`, no engine — minutes. Added to this table at 2B, which is the first increment to put logic in `apps/shared` |
+
+**2B added test files, not lanes.** The SDK namespaces land in `client-typescript:test` and
+`client-python:test` as fake-client unit suites (13 each, no server); the canvas half lands in
+`shared:test` as one pure-logic suite of 16, taking that lane 90 → 106. **The canvas half can only
+be pure logic**: `shared:test` preloads `stub-shell.cjs`, which intercepts both `shell` and
+`rocketride` and returns a module whose only real export is `commonStyles` — every other named
+import is `undefined`, so a rendering test would be rendering `undefined` as a component. Widening
+that stub is a change to the harness, not to a feature. The same stub is why the run gate spells
+its `TASK_STATE` values as literals with a compile-time tie-back rather than reading the enum.
+
+**The `venv` CLI is not on PATH in a dev checkout — worth addressing, not just working around.**
+2B shipped a `venv` command group into both CLIs, and in this repository neither can be invoked by
+name. Both packages declare the **same** bin, `rocketride` — `package.json`'s
+`bin: { rocketride: './dist/cli/cli/rocketride.js' }` and `pyproject.toml`'s
+`[project.scripts] rocketride = 'rocketride.cli.main:main'` — so both work once *installed*
+(`npm i -g`, `pip install`), and installing both would collide on the name. Neither is installed
+here: there is no `rocketride` shim under any `node_modules/.bin`, and the Python package is not
+pip-installed (importing it needs `PYTHONPATH=packages/client-python/src`, and `aiofiles` —
+a declared dependency — is absent from the ambient interpreter, so the CLI's module-scope import in
+the unrelated `events` command fails before any subcommand parses). The practical consequence: the
+one tool that shows what is actually on disk during venv work is reachable only by full path.
+
+The workaround, and what the 2B click test used — one line per PowerShell window, since a function
+lives only in the session that defines it:
+
+```powershell
+function venv { node <repo>\packages\client-typescript\dist\cli\cli\rocketride.js venv @args --uri ws://127.0.0.1:5565 --apikey MYAPIKEY }
+venv list --sizes
+```
+
+What would actually fix it, in rough order of cost: a builder action that links the built CLI into
+the workspace's `node_modules/.bin` (pnpm does not do it for a workspace package's own bin here);
+or documenting `pip install -e packages/client-python` for the Python side, which also fixes the
+`aiofiles` gap by installing the declared dependencies. The name collision between the two CLIs
+should be decided before either is made convenient — today it is invisible only because neither is
+installed.
 
 **The namespace is `model_server:`, with an underscore.** No `modelserver:` task is registered
 anywhere; lookup is `registry.getAction(command)` and an unregistered name exits with `Error:

@@ -49,8 +49,8 @@ import type { DeploySnapshot, TeamDeployment } from 'shared/components/deploy-pa
 import type { DeployArtifact } from 'shell';
 import { useDeployments } from '../hooks/useDeployments';
 import { PrefsProvider } from 'shell';
-import type { TaskEventMessage, TaskEventSession, TaskStatus, TaskTimeline, TraceLevel, ViewState } from 'shared/modules/project';
-import { saveProject, displayName as projectDisplayName } from '../utils/projectStore';
+import type { IVenvOps, TaskEventMessage, TaskEventSession, TaskStatus, TaskTimeline, TraceLevel, ViewState } from 'shared/modules/project';
+import { saveProject, deleteProject, displayName as projectDisplayName } from '../utils/projectStore';
 import { createProjectVfs } from '../utils/projectVfs';
 import { downloadJson } from '../utils/downloadFile';
 import DeploymentProvider from './DeploymentProvider';
@@ -898,6 +898,37 @@ const ProjectProvider: React.FC<ProjectPageProps> = ({ uri, pipeline, isDirty, i
 		[prefs, updatePrefs]
 	);
 
+	/**
+	 * Virtual-environment overlay operations for the canvas containers.
+	 *
+	 * These act on the SERVER's disk, not the browser's — against a cloud
+	 * engine that is not the user's machine at all. No teamId travels: an
+	 * overlay is machine-local state that no team owns, and asserting a scope
+	 * here would resolve the permission against that team while addressing
+	 * these files.
+	 *
+	 * The client is resolved INSIDE each member rather than captured, so the
+	 * object survives a reconnect — precisely the moment a user retries a purge
+	 * that just failed — which is also what lets the memo hold for the life of
+	 * the provider. The canvas context lists venvOps among its dependencies, so
+	 * a fresh object each render would invalidate it on every live event.
+	 */
+	const venvOps = useMemo<IVenvOps>(
+		() => ({
+			purge: async (targetProjectId: string, envId: string): Promise<boolean> => {
+				const c = getClient();
+				if (!c) throw new Error('Not connected to a server');
+				return c.venv.purge(targetProjectId, envId);
+			},
+			deleteEnv: async (targetProjectId: string, envId: string): Promise<boolean> => {
+				const c = getClient();
+				if (!c) throw new Error('Not connected to a server');
+				return c.venv.deleteEnv(targetProjectId, envId);
+			},
+		}),
+		[]
+	);
+
 	return (
 		<div style={styles.container}>
 			<PrefsProvider value={prefsApi}>
@@ -923,6 +954,7 @@ const ProjectProvider: React.FC<ProjectPageProps> = ({ uri, pipeline, isDirty, i
 					fetchTimeline={fetchTimeline}
 					onContentChanged={handleContentChanged}
 					onValidate={handleValidate}
+					venvOps={venvOps}
 					getNodeSchema={handleGetNodeSchema}
 					onPipelineAction={handlePipelineAction}
 					onViewStateChange={handleViewStateChange}
