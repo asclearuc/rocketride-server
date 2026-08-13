@@ -3578,15 +3578,26 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
   the tables, the traced call paths and two candidate fixes each. Left alone in 2B deliberately —
   both predate this increment and both are decisions about the catalog and the validation contract,
   not about the container.
-  1. **`venv_source_stub` is offered in the add-node palette.** The bridge's source stub (from
+  1. ~~**`venv_source_stub` is offered in the add-node palette.**~~ **FIXED** — one word of JSON,
+     and the reason it looked expensive was a claim in the code that does not hold. The stub (from
      `8ce3e145`) says in its own comment that it is "synthesized by the partitioner and never
-     user-placed", and a user can place it anyway. The cause is not the flag it looks like:
-     `buildInventory` excludes only an empty `classType` and `NoSaas`, and **never consults
-     `IServiceCapabilities.Internal`** — the two sibling services are hidden because they declare
-     `classType: []`, not because they are `internal`. The stub needs `classType: ["source"]` to be
-     instantiable by the child engine, and its own comment rules out `internal` ("an internal
-     source is not registered as a usable pipeline source endpoint"), so neither existing lever
-     separates *registered* from *offerable*.
+     user-placed", and a user could place it. Its capabilities comment ruled out the obvious flag —
+     *"NOT `internal`: an internal source is not registered as a usable pipeline source endpoint"* —
+     which pointed at a new capability bit, i.e. at the **frozen shell contract**
+     (`IServiceCapabilities` lives in `packages/shell/contract/versions/v0.d.ts`, guarded by the
+     required `shell:check` job) for a cosmetic gain. Traced instead: `INTERNAL` is read in
+     **exactly one place**, `IServices::getServiceSchemas` (`store/services/services.cpp:2093`),
+     whose only non-test consumer is the pybind export answering a *client's* `getServices` —
+     nothing on the execution path reads it. The three things that make the stub work are each
+     blind to it: `getServiceDefinition` resolves a provider straight out of `m_services`; the
+     endpoint factory is registered off `"register": "endpoint"` alone (`services.cpp:1958`); and a
+     document's `source` is validated against the components list, not the catalog. Adding
+     `internal` beside `noinclude` therefore takes it out of the palette and costs nothing —
+     confirmed live, the catalog went 155 → 154 and the bridge kept working. Separately, note that
+     `buildInventory` excludes only an empty `classType` and `NoSaas` and **never consults
+     `IServiceCapabilities.Internal`**: the two sibling services are hidden because they declare
+     `classType: []`, not because they are `internal`. The canvas-side blindness to that flag is
+     still there; this node simply no longer reaches the canvas.
   2. **Every scoped structural rejection below is invisible until Run.** The list further up this
      section is introduced as "structural errors **the editor should have prevented**" — and the
      editor prevents none of them, because `rrext_validate` (`cmd_misc.py:159`) validates through

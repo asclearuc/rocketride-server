@@ -19,10 +19,22 @@
 	//
 	// Required:
 	//		`noinclude` keeps this node out of dependency include scans; it is synthesized
-	//		by the partitioner and never user-placed. (NOT `internal`: an internal source
-	//		is not registered as a usable pipeline source endpoint.)
+	//		by the partitioner and never user-placed.
 	//
-	"capabilities": ["noinclude"],
+	//		`internal` keeps it out of the palette, and does NOT cost the source
+	//		registration this bullet once claimed it would. Traced through the engine:
+	//		INTERNAL is read in exactly one place, `IServices::getServiceSchemas`
+	//		(store/services/services.cpp), whose only non-test consumer is the pybind
+	//		export that answers a CLIENT's getServices -- nothing on the execution path
+	//		reads it. The three things that actually make this node work are each blind
+	//		to it: `getServiceDefinition` resolves a provider straight out of
+	//		`m_services`; the endpoint factory is registered off `"register": "endpoint"`
+	//		alone; and the document's `source` is validated against the components list,
+	//		not the catalog. Without this flag the node was offered in the add-node
+	//		palette -- a component whose own description says it is synthesized by the
+	//		partitioner and never user-placed.
+	//
+	"capabilities": ["noinclude", "internal"],
 	//
 	// Optional:
 	//		Description of this driver
