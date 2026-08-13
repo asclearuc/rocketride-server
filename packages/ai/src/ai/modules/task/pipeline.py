@@ -864,8 +864,13 @@ def partition_pipeline(pipeline: Dict[str, Any], source: Optional[str] = None, s
         scoped: Whether venv scoping is enabled for this run.
 
     Returns:
-        ``scoped=False`` → a new flat pipeline dict (input not modified).
-        ``scoped=True`` → a :class:`PartitionResult` (input not modified).
+        ``scoped=False`` → a new flat pipeline dict, or ``pipeline`` itself when it holds no
+        container. Neither form modifies the input, but neither is a private copy either: the
+        dict is shallow and its components are the **same objects** as the input's, so mutating
+        a component of the result mutates the caller's document.
+        ``scoped=True`` → a :class:`PartitionResult` built over a ``deepcopy``, sharing nothing
+        with the input. This is the path to use for a speculative call -- a dry partition run
+        only to collect the errors below is safe here and is not safe above.
 
     Raises:
         ValueError: A container nests an environment inside another, holds the source, is
