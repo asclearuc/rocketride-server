@@ -268,20 +268,35 @@ separate places (drop-into, serialization, auto-layout) and two-out-of-three is 
 keeps the full words **Virtual Environment** in the UI and a `VirtualEnv` prefix in code so the two
 do not read as one concept.
 
-**No creation entry yet (deliberate).** The container's members are nested into
-`config.pipeline.components`, which the engine ignores until the partitioner lands (§4.3, §5 question 3). A
-creation button before that would let a user build a pipeline whose members silently vanish at run
-time, so the mechanics ship first and the entry point opens with the partitioner. Placing one today
-is possible only by authoring the document directly — which is what the acceptance fixtures do.
+**Creation — deferred through 2A, shipped in 2B.** This paragraph read "no creation entry yet
+(deliberate)" for the whole of that time, on the sound ground that the members are nested into
+`config.pipeline.components`, which the engine ignored until the partitioner landed (§4.3, §5
+question 3) — a button before that would have built pipelines whose members silently vanished at run
+time. The partitioner then landed and **the entry did not follow**, which is the part worth carrying:
+the deferral had no owner once its precondition was met, so the container stayed uncreatable for two
+more increments and every operation below was reachable only on a hand-authored document. 2B adds
+the toolbar button; §4.10's *Creation* bullet holds the mechanics and the two details it must get
+right.
 
-A **cog** will expose a **Purge environment** action (§4.10) once the engine command exists; a menu
-item that cannot do anything is worse than its absence.
+**Purge is in the overflow menu, not on the cog.** This said "a **cog** will expose a **Purge
+environment** action once the engine command exists" until 2B, and the cog was already taken —
+`NodeHeader` renders it when `hideEdit` is false and it opens the container's own configuration,
+which `NodeVirtualEnv` deliberately keeps editable (§4.10, operation A).
 
 The **bridge/`remote`/`venv` nodes stay internal** — synthesized/inserted by the partitioner, **never
 in the node palette**, never user-placed. (Like the `remote` nodes today, which are not canvas-exposed.)
+*That was an intention rather than a fact until 2B:* `venv_source_stub` needs `classType: ["source"]`
+to be instantiable by its child engine, and the palette gate is `classType`-shaped, so it was offered
+for placement from the day it shipped. Closed by declaring it `internal` — traced to cost nothing,
+because the flag is read only by the client-facing catalog (§7, 2B's canvas-gaps entry).
 
-VS Code host wiring (`apps/vscode/.../ProjectWebview.tsx`) follows the extension rules
-(`Callout.call`, `AppError`, `logger.*`). The schema field is added to
+VS Code host wiring lives in `apps/vscode/.../ProjectWebview.tsx`. *This sentence used to add "follows
+the extension rules (`Callout.call`, `AppError`, `logger.*`)"; two thirds of that is not a thing.*
+Measured while writing 2B's bridge: **`Callout` exists nowhere in this repository**, and `AppError`
+appears in exactly one unrelated file, while `ProjectProvider.ts` holds 44 plain `try` blocks and 37
+`this.logger.*` calls. The logging rule is real and is followed; the other two are aspirational text
+in `.claude/CLAUDE.md` that no code in this area honours, and writing new code to satisfy them means
+inventing the classes first. The schema field is added to
 `packages/client-typescript/src/client/types/pipeline.ts`.
 
 ### 4.2 Pipeline document format — two formats
@@ -319,7 +334,17 @@ the task-start path in `task_engine.py`. Modeled on / generalizing `prepare_pipe
 - **Isolated** groups → a separate flat sub-pipeline per venv; each boundary **data-lane** edge gets a
   bridge-node pair + a `channelId` recorded in a routing table.
 - Builds the **env-quotient graph** to detect cross-env cycles.
-- Reads the **full `components[]`**, not the executing source's reachable subgraph (see §4.13).
+- **Prunes to the source's reachable subgraph first, then reads what is left.** *This bullet said the
+  opposite — "reads the full `components[]`, not the executing source's reachable subgraph" — until
+  2B, and the reversal is a correction rather than a change of policy.* The engine has always built
+  its pipe stack by walking forward from the source and never loading what it does not reach, so a
+  dead branch is free in an ordinary pipeline; the cut ran before any engine could apply that, judged
+  boundaries over branches the engine would have discarded, and refused documents no flat equivalent
+  refuses. Reachability now runs first, over **both** data and invoke edges (§4.3 increment 2, and
+  the withdrawn rejection below). **The requirement *set* is unaffected and still spans the whole
+  document** — §4.7's node set is deliberately the full document across every source, because the
+  on-disk environment is shared by all of them; that paragraph and this one are about different
+  questions and only look contradictory.
 
 **Placement — corrected against the code: BEFORE `_check_pipeline`, not after.** That check looks for
 the run's source among **top-level** components only, so a source inside a plain group is not found
@@ -404,9 +429,11 @@ and `groups` (each venv's `config.environment` block, for step-7/8 logging). The
   conflict fires first — so a cycle fixture must use distinct lanes per direction.
 - **Extra scoped rejections:** a boundary edge on the non-bridgeable `words` lane; an implied
   (`Source`-mode) source or the document `source` field inside a venv; a base environment left with no
-  components while a venv exists; a group whose id is literally `main`. ~~an environment that emits
-  across its boundary but is fed by nothing~~ — **withdrawn in 2B, and it was the cut being stricter
-  than the engine.** The engine loads only what it reaches walking forward from the source
+  components while a venv exists; and a group whose id is literally `main`.
+
+  **One rejection left this list in 2B** — ~~an environment that emits across its boundary but is fed
+  by nothing~~ — **and it was the cut being stricter than the engine, not a rule worth keeping.**
+  The engine loads only what it reaches walking forward from the source
   (`generatePipelineStack` → `walkComponents` for data edges, `walkControl` for invoke;
   `buildConnections` then skips a component with the comment *"we were not included, nobody
   referenced us"*), so a dead branch costs nothing in an ordinary pipeline. But the cut runs
@@ -417,7 +444,15 @@ and `groups` (each venv's `config.environment` block, for step-7/8 logging). The
   source first, over **both** edge kinds (invoke-only nodes — an agent's tool typically has no data
   input at all — are kept, as `walkControl` keeps them; walking data edges alone would delete such a
   tool's environment and leave the agent toolless in silence). A venv nothing routes into is then
-  simply not in the graph. The
+  simply not in the graph.
+  **Withdrawn from this list, not deleted from the code — and the difference is one branch.** The
+  refusal still stands in `_pair_boundaries`, and for a document with a resolvable source it can no
+  longer fire: a surviving node inside an environment is forward-reachable, control edges may not
+  cross a boundary, so the path that reaches it is a data edge and the forward channel exists by
+  construction. What keeps the guard honest is the branch that disables pruning — no source, or a
+  source that is not a leaf of this document — where the old shape survives and so does the
+  refusal. Read the strikethrough as "unreachable where it was wrong", not as "removed"; the
+  `Raises:` list on `partition_pipeline` is accurate for exactly that reason. The
   `scoped=False` path and the 19 increment-1 tests are unchanged; the cut adds `test_partition_cut.py`
   (45 tests after 2B: 39 from step 8.3, plus six pinning the prune — including that a fully live
   document is untouched, and that no source at all disables pruning rather than emptying the
@@ -1126,6 +1161,17 @@ variant — so the backstop is a narrow safety net, not the primary mechanism.
   flat module, which the barrel import satisfied and the full-path import does not
   (`'ai.common.models' is not a package`). Fixed by making the stub a package with an `ocr`
   submodule. Anything else stubbing the barrel will need the same.
+
+  **That last sentence came true, and nothing caught it for two increments.** `audio_transcribe`'s
+  `test_decode_params.py` stubs the same barrel the same flat way, and the commit that moved its
+  `IGlobal.py` onto full-path imports updated the OCR suites beside it and missed this one — 12 tests
+  failing on every run with the same `'ai.common.models' is not a package`, from that commit until
+  2B tripped over them while running the gate. Repaired identically (three levels, each intermediate
+  carrying `__path__`). The transferable half is not the fix: **a prediction written in a design
+  document is not a guard.** This sentence named the exact failure and the exact remedy, and the only
+  thing that would have found the second instance is a check over the tree for flat stubs of a
+  package import — which is what §8.1's barrel guard does for the *walk*, and what nothing does for
+  the *stubs*.
 
 **The backstop is not free** — an under-include means a possibly multi-GB `depends()` install happens
 *mid-run* inside the venv child. Specify timing/failure: prefer resolving all reachable variants
@@ -2488,16 +2534,27 @@ reproduce the build's index configuration (an earlier attempt died on an unrelat
    the genuinely open part → 2C.
 
 ## 6. Risks & gating requirements
-- 🟠 **Metrics/billing multi-PID rollup (money bug) — driver-feasibility DE-RISKED; residual is
-  grouping.** **CPU/RAM** sum across the venv process tree (per-PID). For **GPU**: **concurrent pipelines
+- 🟢 **Metrics/billing multi-PID rollup (money bug) — driver-feasibility DE-RISKED, and the grouping
+  residual CLOSED by 8.4B.** **CPU/RAM** sum across the venv process tree (per-PID). For **GPU**: **concurrent pipelines
   are already billed correctly today**, and each running pipeline is its own `engine.exe` PID — so the
   billing path **already attributes GPU across multiple independent PIDs** on our real hardware. That is
   empirical proof the driver-level per-PID capability exists, so the earlier "feasibility spike" is **no
   longer needed**. Venvs therefore reduce to **bookkeeping**: sum a venv's child PIDs under the **parent
   pipeline's** billing identity (the orchestrator already tracks which children it spawned) rather than
-  counting them as separate pipelines. Residual (still money-critical but **desk-checkable, no spike**):
-  confirm children are **grouped into the parent's bill** — not dropped (under-bill) nor double-counted
-  as standalone pipelines (over-bill).
+  counting them as separate pipelines. That residual — *confirm children are grouped into the
+  parent's bill, neither dropped (under-bill) nor double-counted as standalone pipelines
+  (over-bill)* — **is discharged; 8.4B's §7 entry carries the detail.** `register_extra_pid(env_id,
+  pid)` adds each child *and its own subtree* to the CPU/memory and GPU samplers, **keyed by env id
+  rather than appended to a list**, precisely so a restarted task re-registering the same
+  environment cannot double it: the failure mode on this path is an overcharge, not a crash. Child
+  load is billed rather than merely reported, because under `=0` the same work runs inside the main
+  engine and is billed there, so excluding it would be an unintended discount for using a venv.
+  Measured on a two-child chain: `peak_cpu_memory_mb` **546.1** against 178.0 + 178.6 + 187.2 =
+  543.8 across the three engines, asserted as *greater than the largest single engine* so that
+  main-tree-only sampling cannot pass it. One thing is deliberately **not** sampled: a child's
+  startup, a long overlay install included, because registration happens after the `TaskMetrics`
+  constructor rather than at spawn — which matches the `serviceUp` billing gate, install time not
+  being billed either.
 - 🟠 **Phase 2A blast radius = only pipelines where the scoped path is enabled** (`=1`, or auto with
   isolated groups). Under the default (unset, no venvs) **nothing changes** — §4.15 semantics. The
   radius becomes "every pipeline" only if/when a later release flips auto to scoped-by-default.
@@ -2519,7 +2576,12 @@ reproduce the build's index configuration (an earlier attempt died on an unrelat
   `requirements.txt` are model-server-blind today (`audio_transcribe`, `anonymize`). Note: model-server
   mode does **not** remove the *compile-time* conflict (that glob union is flag-independent), so venvs
   stay necessary.
-- 🟠 **Concurrent install race** — per-env lock (§4.10).
+- 🟢 **Concurrent install race — the lock has been per environment since 8.7A** (extended to `auto`
+  by 8.7B), so two runs can no longer install into one `site-packages`. No lock code moved to
+  achieve it: `env_paths()` had always placed the lock at `<env_dir>/install.lock`, and the item was
+  never blocked on locking but on environments having distinct directories. What §4.10 still owes is
+  not this race but the **policy** beside it — a second run waits on `FileLock` indefinitely (wait,
+  never fail) and whether that is the right answer was never revisited.
 - 🟠 **Large image/video crossings — payload shrinks with cloud store, but the AV lanes stay.** In the
   target architecture AV bytes live in **cloud storage** (`ai..account.store`); bulk bytes are fetched
   from the store rather than streamed node-to-node. **AV metadata still crosses on the
@@ -3030,16 +3092,21 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
 `dist` copy silently measures nothing and comes back green; verify by the child's command line.
 
 **Phase 2B — Venv runtime (the isolation feature), on top of 2A.**
-4. **Schema + UI — DONE except the creation entry.** The Virtual Environment container as a canvas
+4. **Schema + UI — DONE, creation included since 2B.** The Virtual Environment container as a canvas
    node type stored as a `group` + `config.environment` (§4.1), `PipelineEnvironment` /
    `NestedPipeline` / `PipelineComponentConfig` in the SDK schema, `isContainerType()` across the
    three containment checks, the isolated treatment, the name/isolated config form, and the
    canvas-side rejection of a container dropped into a container. Round-trip tests
-   (`canvas/util/graph.test.tsx`) pin the document mapping. Bridge nodes stay internal.
-   *Deferred to step 5, deliberately:* the **creation entry** (a container that cannot execute yet
-   would only produce pipelines that lose members), the **source-in-venv** guard, which belongs where
+   (`canvas/util/graph.test.tsx`) pin the document mapping — extended in 2B with three cases for the
+   created shape (the `venv_N` id, dimensions surviving a save/load round trip, and a dragged node
+   being adopted). Bridge nodes stay internal.
+   *Deferred to step 5 and all since discharged:* the **source-in-venv** guard, which belongs where
    `resolve_implied_source` runs, and **env-cycle** detection, which needs the quotient graph the
-   partitioner builds.
+   partitioner builds — both landed with increment 2. The **creation entry** was deferred on the
+   ground that a container which cannot execute would only produce pipelines that lose members;
+   increment 1 removed that ground and **nothing collected the deferral**, so it waited until 2B
+   found A/B/C pressable only on hand-authored documents. A deferral whose precondition is met
+   silently belongs to nobody, which is the transferable half of this entry (§4.1).
 5. **Partitioner:** generalize `prepare_pipeline.py` (flatten non-isolated; cut isolated; insert bridge
    nodes; routing table; full-document node set).
    *Increment 1 — **DONE**:* flattening and the structural validations (§4.3), hooked into
@@ -3052,7 +3119,8 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
    `channelId`-keyed routing table, one bridge node per environment in main (step 8.3 makes a
    venv→venv lane an edge *between* two of them), and venv-only env-cycle detection over the quotient
    graph, plus the source-in-venv guard on the implied
-   source. 39 unit tests in `test_partition_cut.py` after 8.3; the 19 increment-1 tests are unchanged.
+   source. `test_partition_cut.py` holds 39 unit tests after 8.3 and **45 after 2B**, which added six
+   for the reachability prune; the 19 increment-1 tests are unchanged.
    Wired at the call site since step 7 — `task_engine.py` calls `partition_pipeline`
    with the default `scoped=False`; the orchestrator flips the gate in step 8 via
    `scoping_enabled(use_venv_mode(), has_isolated_group(doc))` (helper exported from `pipeline.py`).
@@ -3192,7 +3260,7 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
    behavioural change is `pipeline.py` plus deleting the duplicate spawn-time guard in
    `task_engine.py`. New rejections: an environment entered more than once around a base component
    (it collapses onto its single bridge node, `MV → m → MV`), and the same-lane-two-producers rule
-   now applied to the whole merged boundary. 39 partitioner tests.
+   now applied to the whole merged boundary. 39 partitioner tests at this point (45 after 2B).
    *Live (chain, diamond, and a linear regression, each against the same pipeline under `=0`):*
    `main→v1→v2→main` with **three** reversals returns `olleh` — deliberately odd, so a pair of
    bridges that quietly passed text through could not produce it; the diamond (v2 fed `text` from v1
@@ -3537,7 +3605,8 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
     §8.3 acceptance solves instead with `use_existing=True` + `terminate()`. Converting them
     would trade 4 directories for a risk of destabilising two live tests that pass today, so they
     are left alone and counted here rather than silently absorbed into "0".
-- **Tests (§8) — all four DONE except GC, which is 2C:** partitioner **unit tests** (39, step 8.3);
+- **Tests (§8) — all four DONE except GC, which is 2C:** partitioner **unit tests** (39 at step 8.3,
+  45 after 2B's prune);
   the **two-venv conflict-coexists** acceptance (`vtest_alpha`/`vtest_beta` split across venvs —
   **run for the first time in 8.7A**, both pins imported, each from its own overlay, none in main);
   compat `=0` isolated-group **demotion** (8.7B: four shapes returned their values, no `venvs/`
@@ -3583,15 +3652,36 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
     there a refusal must leave the container standing, here the user's intent *is* "delete this
     pipeline". Neither replaces orphan GC (2C): a delete made outside the app, or while
     disconnected, still bypasses both hooks.
+  **Exercised in one host, and the asymmetry is stated rather than rounded off.** The whole click
+  list — creation and its explicit dimensions, purge and its three outcomes, both delete routes
+  through one dialog, cancel, the locked canvas, a mixed selection, the pipeline-delete hook and the
+  two read-only surfaces — was walked end to end in the **VS Code extension** and passed. The list
+  itself is `NEXT-STEP-2B-rocket-ui-clicktest.md` beside this file (untracked, like every
+  `NEXT-STEP-*` sibling — a fresh checkout has none of it and it is copied by hand, per the
+  checkout-shape note further down this section). It holds its own status header, so the rocket-ui
+  pass starts from what is already done rather than from the top; the summary above is what
+  survives if the file does not.
+  **rocket-ui was not walked.** What that leaves uncovered is smaller than it sounds and worth
+  naming exactly, because "2B was clicked" will otherwise be read as both: `apps/shared` is the
+  same code under either host, so the operations, both dialogs, `onBeforeDelete` and the run
+  predicate *are* exercised, and the host is only the transport. What stays unexercised is the
+  rocket-ui bridge alone — `ProjectProvider.tsx` building `venvOps` off a direct client, and
+  `projectStore.ts`'s operation C — and **nothing automated covers those two files either**:
+  `apps/rocket-ui` has no test lane, and its rsbuild config carries no type checker, so a green
+  `rocket-ui:build` says nothing about them. The two hosts reach the server by different routes, a
+  direct client against a `postMessage` bridge, which is precisely where a defect lives in one and
+  not the other.
   *What the 8.6 record noted as unblocking is now historical:* the driver
   `e:\tmp\venv-drivers\venv_purge.py` reached the command through `RocketRideClient.call()`, the
   generic DAP entry point, which is how the 8.6 live check ran without a line of client code.
-- **OPEN — two canvas-side gaps found by 2B's click test, neither caused by it.** Both are the same
-  shape: *the canvas offers what the engine will not accept, and says nothing until it is too late
-  to be cheap.* Recorded together in `INVESTIGATE-venv-source-stub-in-palette.md`, which carries
-  the tables, the traced call paths and two candidate fixes each. Left alone in 2B deliberately —
-  both predate this increment and both are decisions about the catalog and the validation contract,
-  not about the container.
+- **Two canvas-side gaps found by 2B's click test, neither caused by it — both answered at the
+  root, one residue left open.** They were the same shape: *the canvas offers what the engine will
+  not accept, and says nothing until it is too late to be cheap.* They were opened as decisions
+  about the catalog
+  and the validation contract rather than about the container, and both were then closed one level
+  below the UI — the palette entry by a capability flag, the reported rejection by making the cut
+  agree with the engine's own reachability. What survives is the *general* shape of the second, and
+  it is narrower than the finding that produced it.
   1. ~~**`venv_source_stub` is offered in the add-node palette.**~~ **FIXED** — one word of JSON,
      and the reason it looked expensive was a claim in the code that does not hold. The stub (from
      `8ce3e145`) says in its own comment that it is "synthesized by the partitioner and never
@@ -3607,18 +3697,29 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
      endpoint factory is registered off `"register": "endpoint"` alone (`services.cpp:1958`); and a
      document's `source` is validated against the components list, not the catalog. Adding
      `internal` beside `noinclude` therefore takes it out of the palette and costs nothing —
-     confirmed live, the catalog went 155 → 154 and the bridge kept working. Separately, note that
+     confirmed live, the **client catalog** went 155 → 154 entries and the bridge kept working —
+     *not* the 155 python-backed providers §4.8 measures over, which is a different set that happens
+     to share the number. Separately, note that
      `buildInventory` excludes only an empty `classType` and `NoSaas` and **never consults
      `IServiceCapabilities.Internal`**: the two sibling services are hidden because they declare
      `classType: []`, not because they are `internal`. The canvas-side blindness to that flag is
      still there; this node simply no longer reaches the canvas.
+     **Left unfixed on purpose, with a trigger rather than a hope** (§4.9's residual is the
+     pattern): the blindness costs nothing while `internal` keeps such a service out of the client
+     catalog entirely, so nothing reaches the inventory to be filtered. It wakes the moment a
+     service must be **in** the catalog — a client has to know it exists — and still must not be
+     placeable, which is a distinction the capability vocabulary cannot express today. Two shapes
+     then: teach `buildInventory` to skip `Internal`, one line and matching what the flag reads
+     like; or a palette-only exclusion, bigger but actually naming "catalogued, not user-placeable".
+     What is **not** part of either, because the trace above killed its premise: nothing needs
+     decoupling from source registration — `internal` never unregistered anything.
   2. **Every scoped structural rejection below is invisible until Run** — and the one that
      triggered this finding turned out not to belong on the list at all. The list further up this
      section is introduced as "structural errors **the editor should have prevented**", and the
      editor prevents none of them: `rrext_validate` (`cmd_misc.py:159`) validates through
      rocketlib's `validatePipeline` and **never calls the partitioner**, which is reached from one
      place only — `task_engine.py:2599`, on the execute path. Container-in-container is the single
-     case the canvas guards (`FlowGraphContext.tsx:561`, on drag).
+     case the canvas guards (`FlowGraphContext.tsx`, `acceptsDragged`, on drag).
      **The reported symptom is fixed at the root instead**, and the fix is better than surfacing
      the error earlier: *"Virtual environment "venv_3" produces output but nothing is routed into
      it"* came from the cut being **stricter than the engine**, not from a real defect in the
@@ -3781,15 +3882,25 @@ Three layers; each test is tagged with the phase that first makes it runnable (*
   returned by identity, members keep their connections; and the validations — nested environments,
   source-in-venv (a plain group is fine), invoke edge across an environment boundary, lane edge into a
   container, and a control edge whose source is a container. *Increment 2 **DONE**, extended by 8.3
-  (39 tests, `test_partition_cut.py`):* `scoped=True` cuts isolated groups → per-venv sub-doc +
+  (39 tests then, **45 after 2B**, `test_partition_cut.py`):* `scoped=True` cuts isolated groups → per-venv sub-doc +
   `venv`/`venv_server` bridge pair + `channelId`-keyed routing table; one bridge node per environment,
   with a venv→venv lane wired as an edge between two of them (chain, diamond, and a venv feeding two
   venvs); venv-only env-cycle detection over the quotient graph **plus** the collapsed-cycle check for
   an environment entered twice around a base component — and its counterpart, a user cycle with no
   bridge node left to the engine; the scoped-path rejections (non-bridgeable `words`, implied/field
-  source in a venv, empty base env, a group named `main`, an environment that emits but is fed by
-  nothing, same lane from two producers on one merged boundary); id-collision suffixing; determinism;
-  and the §4.6 golden authoring→sub-docs example. [2B]
+  source in a venv, empty base env, a group named `main`, same lane from two producers on one merged
+  boundary); id-collision suffixing; determinism; and the §4.6 golden authoring→sub-docs example.
+  *2B removed one rejection from that list and added six cases in its place* — "an environment that
+  emits but is fed by nothing" is withdrawn (§4.3), so the case that asserted its message now asserts
+  the branch is **dropped**, and the prune is pinned from both sides: the same graph flattened
+  behaves identically, a partly dead environment keeps its live half, a node reached only by an
+  invoke edge survives, a fully live document is untouched, and no source at all disables pruning
+  rather than emptying the document. Two neighbouring cases had to be rewritten rather than deleted,
+  which is the part worth carrying: one rested on a premise that no longer exists (a venv with no
+  boundary channel **is** a venv the source cannot reach — the same shape from two directions), and
+  the id-collision case still guards a live mechanism but its colliding node was input-less, so it
+  would now be pruned before the id was minted and the test would pass while checking nothing. Its
+  fixture was fixed, not its expectation. [2B]
 
 ### 8.2 Test-fixture nodes (purpose-built, lightweight, decoupled from `ai/**`)
 A pair of **trivial pure-Python nodes** under the node-test tree at
@@ -4061,8 +4172,11 @@ increment that had to run things on both sides.
 | `builder shared:test` | submodule | `node --test` under `tsx`, no engine — minutes. Added to this table at 2B, which is the first increment to put logic in `apps/shared` |
 
 **2B added test files, not lanes.** The SDK namespaces land in `client-typescript:test` and
-`client-python:test` as fake-client unit suites (13 each, no server); the canvas half lands in
-`shared:test` as one pure-logic suite of 16, taking that lane 90 → 106. **The canvas half can only
+`client-python:test` as fake-client unit suites (13 each, no server), taking the TypeScript lane
+215 → 228 and the Python one to 134 passed / 6 skipped. The canvas half takes `shared:test`
+**90 → 109**: one new pure-logic suite of 16 for the operations, plus three cases added to
+`graph.test.tsx` when the creation button landed (the `venv_N` id, dimensions surviving a round
+trip, and a dragged node being adopted). **The canvas half can only
 be pure logic**: `shared:test` preloads `stub-shell.cjs`, which intercepts both `shell` and
 `rocketride` and returns a module whose only real export is `commonStyles` — every other named
 import is `undefined`, so a rendering test would be rendering `undefined` as a component. Widening
@@ -4230,7 +4344,10 @@ ROCKETRIDE_INCLUDE_SKIP=ocr,ner,detect,detect_segment,caption,background_removal
   an omission, and an AV `action` crosses as `int(action)` and is mapped back to the `AVI_ACTION`
   member on arrival — a member on the header is not JSON-serializable, and a bare int downstream
   matches no branch.
-- `packages/ai/src/ai/modules/task/pipeline.py` — `resolve_implied_source` (source-in-venv guard).
+- `packages/ai/src/ai/modules/task/pipeline.py` — `resolve_implied_source` (source-in-venv guard), and
+  `_prune_unreachable`, which must stay **first** in `_cut_pipeline` and must follow **both** data and
+  invoke edges: it exists to make the cut agree with the engine's own forward walk, and a data-only
+  version silently deletes the environment holding an agent's tool (§4.3).
 - `packages/ai/src/ai/modules/data/data_conn.py` — canonical lane serialization to reuse in the bridge.
 - **Testing:** `nodes/test/framework/pipeline.py` (declarative node tests are mini-pipelines → run
   through the same partitioner); `builder nodes:test` (per-node isolation); `server:run-engtest`
@@ -4256,9 +4373,18 @@ ROCKETRIDE_INCLUDE_SKIP=ocr,ner,detect,detect_segment,caption,background_removal
   read by `depends.py`, so importing anything from the engine side would make the rules untestable
   under bare `pytest`; the same reason `venv_env.py` mirrors helpers instead of importing `depends`.
 - UI: `apps/shared/src/components/canvas/util/graph.ts` (`getProjectComponents`),
-  `.../context/FlowGraphContext.tsx` (`onNodeDragStop`, `isValidConnection`),
+  `.../context/FlowGraphContext.tsx` (`onNodeDragStop`, `isValidConnection`, and since 2B
+  `onBeforeDelete` — the hook every delete route passes through, plus the `deleteNode` change that
+  stops it promoting a venv container's members before the answer is in),
   `.../node/node-group/NodeGroup.tsx`, `packages/client-typescript/src/client/types/pipeline.ts`,
   `apps/vscode/src/providers/views/Project/ProjectWebview.tsx`.
+  **Added by 2B's operations:** `.../canvas/util/venvOps.ts` (the run gate and the delete decision,
+  kept as plain functions because `shared:test` can render nothing — §8.4),
+  `.../canvas/components/Venv{Delete,Purge}Dialog.tsx` (rendered by `FlowCanvas`, never by the node:
+  a node lives inside ReactFlow's transformed viewport and a `position: fixed` dialog there inherits
+  the canvas pan and zoom), `.../canvas/components/FlowCanvas.tsx` (the toolbar's create button),
+  `apps/rocket-ui/src/utils/projectStore.ts` and `apps/vscode/src/providers/SidebarProvider.ts`
+  (operation C, one per host).
 - Reference only (no edits): `packages/server/engine-lib/engLib/store/stack.cpp`,
   `.../endpoint/endpoint.pipes.cpp` — the `(from,to,lane)`/`(from,to,classType)` semantics the
   partitioner must reproduce. `init.cpp` — embedded-Python init (isolated `PyConfig`; `setPaths`).
