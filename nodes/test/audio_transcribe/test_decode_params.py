@@ -78,13 +78,26 @@ def _load_iglobal():
         'ai.common': types.ModuleType('ai.common'),
         'ai.common.config': types.ModuleType('ai.common.config'),
         'ai.common.models': types.ModuleType('ai.common.models'),
+        'ai.common.models.audio': types.ModuleType('ai.common.models.audio'),
+        'ai.common.models.audio.whisper': types.ModuleType('ai.common.models.audio.whisper'),
     }
     stubs['rocketlib'].IGlobalBase = FakeIGlobalBase
     stubs['rocketlib'].debug = lambda message='', *a, **kw: config_holder['debug'].append(str(message))
     stubs['ai.common.config'].Config = type(
         'FakeConfig', (), {'getNodeConfig': staticmethod(lambda lt, cc: config_holder['raw'])}
     )
-    stubs['ai.common.models'].Whisper = _FakeWhisper
+    # IGlobal.py imports by full path -- `from ai.common.models.audio.whisper import Whisper` --
+    # so every level above the leaf has to be a PACKAGE here, not a flat module carrying the
+    # name. A flat `ai.common.models` was what the old barrel import needed and raises
+    # "'ai.common.models' is not a package" against the per-module one. Same break the OCR
+    # suites already carry a note about (test/ocr/test_reader_to_bytes.py), one family over.
+    for _pkg in ('ai', 'ai.common', 'ai.common.models', 'ai.common.models.audio'):
+        stubs[_pkg].__path__ = []
+    stubs['ai.common.models'].audio = stubs['ai.common.models.audio']
+    stubs['ai.common.models.audio'].whisper = stubs['ai.common.models.audio.whisper']
+    stubs['ai.common.models.audio.whisper'].Whisper = _FakeWhisper
+    # Kept for a barrel-style import, which `ai.common.models.audio` really does export.
+    stubs['ai.common.models.audio'].Whisper = _FakeWhisper
 
     for name, stub in stubs.items():
         saved[name] = sys.modules.get(name)
