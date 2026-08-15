@@ -196,6 +196,11 @@ the maximum (§4.10 — parallel spawn is possible now that each env owns its lo
 scope); and **the env id travels in opposite directions at the two ends** — assigned to a child,
 popped from main (§4.15).
 
+*This is the ordering view only. `ProcessGuard` appears here as a participant and is **defined** in
+**§4.10, figures C–G** — what the processes are, what bounds their lifetime, the order the guard is
+driven in, how one child reaches readiness and what its budget actually measures. The env-id
+asymmetry in the last clause is **§4.15, figure H**.*
+
 **View 2 — messages: one socket per child, and no socket between children.**
 
 ```mermaid
@@ -345,6 +350,77 @@ the task-start path in `task_engine.py`. Modeled on / generalizing `prepare_pipe
   document** — §4.7's node set is deliberately the full document across every source, because the
   on-disk environment is shared by all of them; that paragraph and this one are about different
   questions and only look contradictory.
+
+**Figure A — what the transform actually produces.** §4.2 shows the authoring shape and stops there,
+so the document the engine *receives* has never been drawn. Same running example as §3.1 and §4.10:
+`webhook → [v1] → [v2] → response`, under `scoped=True`.
+
+*Drawn as two diagrams rather than one. A single chart has to nest six clusters and then run an edge
+between two of them, which lays out as a maze — and "before" and "after" are two claims, not one.*
+
+**View 1 — the authoring document.** One `.pipe`, containers nested, three edges crossing a boundary.
+
+```mermaid
+flowchart TB
+    W1["webhook_1"]
+    subgraph V1G["venv_v1 - isolated"]
+        A1["alpha_1"]
+    end
+    subgraph V2G["venv_v2 - isolated"]
+        B1["beta_1"]
+    end
+    R1["response_1"]
+
+    W1 -->|"crosses INTO v1"| A1
+    A1 -->|"v1 to v2"| B1
+    B1 -->|"crosses OUT of v2"| R1
+```
+
+**View 2 — what each `engine.exe` receives.** Three flat documents. No nesting survives, and there
+are **no edges between them** — every connection that used to cross a boundary is now either a
+bridge node or a socket.
+
+```mermaid
+flowchart LR
+    subgraph MAINDOC["main.task - what the main engine runs"]
+        direction TB
+        W2["webhook_1"] --> BR1["venv bridge, v1"]
+        BR1 --> BR2["venv bridge, v2"]
+        BR2 --> R2["response_1"]
+    end
+
+    subgraph V1DOC["v1.task - what child v1 runs"]
+        direction TB
+        S1["venv_source_stub"] --> I1["venv_server ingress"]
+        I1 --> A2["alpha_1"]
+        A2 --> E1["venv_server egress"]
+    end
+
+    subgraph V2DOC["v2.task - what child v2 runs"]
+        direction TB
+        S2["venv_source_stub"] --> I2["venv_server ingress"]
+        I2 --> B2["beta_1"]
+        B2 --> E2["venv_server egress"]
+    end
+
+    %% invisible links: the three documents share no edges, so without this the
+    %% renderer packs disconnected clusters in whatever order it likes - observed
+    %% reversed. This pins main, v1, v2 left to right without drawing anything.
+    MAINDOC ~~~ V1DOC ~~~ V2DOC
+```
+
+Four things to read off the pair. The **container disappears** rather than becoming a node — group
+membership carries no runtime meaning by itself. **`input.from` is rewritten only where an edge
+crossed a boundary**: `response_1` now names the v2 bridge, while everything inside a child keeps
+its original ids. Each child gains a **`venv_source_stub`** because a child engine needs a source to
+build a pipe stack at all, and an ingress/egress `venv_server` pair for the lanes. And the **`v1 → v2`
+edge exists in no document at all** — it was cut at both ends, and what replaces it is the ordinary
+main-graph edge `BR1 → BR2` (§4.6, step 8.3).
+
+Each bridge node's config carries `channelId`, `returnChannelId` and `lanes` at this point;
+`urlProcess` is empty and gets filled at spawn by `inject_venv_urls` (§4.10, figure C), because the
+port does not exist yet. Under `scoped=False` none of view 2 is built: the same call returns a single
+flat document with every container flattened, isolated or not.
 
 **Placement — corrected against the code: BEFORE `_check_pipeline`, not after.** That check looks for
 the run's source among **top-level** components only, so a source inside a plain group is not found
@@ -689,6 +765,81 @@ sockets:     bridge ↔ child venv1, bridge ↔ child venv2   (no venv1↔venv2 
 ```
 
 *Sequence view of the same thing, including teardown and merge-back: **§3.1, view 2**.*
+
+**Figure B — the anatomy of one boundary.** The star above says there is one socket per child; this
+says what is *on* it. Drawn because the return-path paragraph in §7 is the densest prose in the
+document and it describes a structure nobody has seen.
+
+*Two diagrams again, and for a sharper reason: the load-bearing claim here is that the egress's
+`callRemote` **nests inside** the ingress loop's `callLocal`. Nesting is a property of a call stack
+over time, and no flowchart can draw it — view 2 is a sequence diagram precisely because activation
+bars can.*
+
+**View 1 — where the parts live, and what the one socket binds to.** No data flows in this view; it
+is the static picture. The socket is drawn as a node only because it fans out to two bindings.
+
+```mermaid
+flowchart TB
+    subgraph MAINP["PM - main engine, one process, one engine thread"]
+        direction LR
+        PR["producer"] --> VC["venv client<br/>the round-trip splice"]
+        VC --> CO["consumer<br/>may be another venv client"]
+    end
+
+    VC --> SOCK["ONE WebSocket, dialled once at beginInstance<br/>ws 127.0.0.1 PORT /venv/pipe ?channel=FWD &return=RET<br/>Bearer token from the env, never argv or config"]
+
+    subgraph CHILDP["P1 - venv child, one process"]
+        direction LR
+        IN["venv_server INGRESS"] --> SUB["the child's sub-pipeline<br/>on its own overlay"]
+        SUB --> EG["venv_server EGRESS"]
+    end
+
+    SOCK -->|"?channel resolves and binds"| IN
+    SOCK -->|"?return binds the SAME socket"| EG
+```
+
+**View 2 — one object crossing, and why there is only ever one thread.**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant VC as venv client, in main
+    participant IN as venv_server ingress, in the child
+    participant SUB as the child's sub-pipeline
+    participant EG as venv_server egress, in the child
+
+    VC->>IN: open, then the forward write* lanes - callRemote
+    activate IN
+    Note over IN: handleWebSocket accept loop - BLOCKING,<br/>and it stays on the stack for everything below
+    IN->>SUB: callLocal applies the forward lanes locally
+    activate SUB
+    SUB->>EG: the engine drives the return write*
+    activate EG
+    EG-->>VC: callRemote back on the SAME socket - NESTED inside the loop
+    deactivate EG
+    deactivate SUB
+    deactivate IN
+    Note over VC,EG: one thread, no second loop, no second connection
+    VC->>IN: close - ONE frame, never closing AND close
+```
+
+The three stacked activation bars are the point: nothing here is concurrent, so there is no ordering
+to arrange. That single socket is also what makes the rest structural rather than merely careful.
+Both channel ids ride one connection, so the spliced object is **never re-opened on main**. The
+egress nests inside the ingress loop, so there is **no async receive pump** and no second thread.
+And main's engine thread is only ever inside one bridge node's call, so a return always arrives on
+the socket being read.
+
+The details the boxes deliberately no longer carry. Forward `write*` are `callRemote`-ed and then
+**`preventDefault`-ed**, so the forward stream does not leak into main's downstream consumer, while
+`open`/`close` are forwarded *and* returned normally so the engine propagates framing downstream too
+— the object opens and closes exactly once on both sides. The return arrives interleaved on
+`callRemote`'s ack channel and is applied by `callLocal → instance.write*` on the **already-open**
+object. Authentication is `hmac.compare_digest` **before** `accept()`, so a bad token closes `1008`
+and no socket is ever serviced; both `venv_server` nodes are then resolved out of `app.state.target`,
+the resident source's published pipe stack. One consequence follows from view 2 rather than from any
+rewrite rule: a chain of N venvs is N **nested blocking** round-trips, so latency composes and an
+inner child's stall blocks every outer bridge.
 
 Why it is correct in one breath: each child has exactly **one** connection, so a double-open is
 impossible by construction; `open`/`closing`/`close` ordering is delegated to **main's engine**; and
@@ -1447,10 +1598,199 @@ Findings behind the cost estimate, to re-verify when the question is reopened:
   shortened id segment** (e.g. first 8 hex of the `project_id` GUID; likewise `group_id`). Point all
   venv installs at **one shared `uv` download cache** so common wheels aren't re-downloaded.
 
-### 4.10 Lifecycle: per-run process, install lock, purge/GC
+### 4.10 Lifecycle: process model, per-run process, install lock, purge/GC
 
-*Startup ordering — what spawns when, what the guard holds, and why children finish before main
-starts — is drawn in **§3.1, view 1**.*
+**Five figures before the policy, because the process model has never been drawn in §4.** Until
+now it was reconstructible only from §3.1's sequence view plus §7's step-7 paragraph and the three
+"superseded on these points" corrections stacked on it — which is a reading order nobody finds. The
+figures and §3.1 answer different questions and neither replaces the other: *§3.1, view 1* is **what
+spawns when**; these are **what the processes are** (C), **what bounds their lifetime** (D), **in
+what order the guard is driven** (E), **what one child's spawn actually does, failure path included**
+(F), and **what the readiness budget measures** (G).
+
+**Figure C — the process tree of a scoped run.** Every box is the *same* `engine` binary in a
+different role: the server runs `ai/eaas.py`, every task subprocess runs `ai/node.py`
+(`CONST_AI_NODE_SCRIPT`) against a task file.
+
+```mermaid
+flowchart TB
+    subgraph SERVER["P0 - engine ai/eaas.py, long-lived, survives every run"]
+        direction TB
+        WS["ws 5565 /task/service - SDK, VS Code and MCP clients speak DAP<br/>WebServer with services, chat, dropper, clients, task, task_http, shell"]
+        TS["TaskServer<br/>assign_port and release_port over base_port to base_port+9999<br/>active-task registry - the purge and delete gate"]
+        TK["Task - ONE PER RUN, and the spawner of everything below<br/>_venv_guard, _venv_children, _engine_process"]
+        WS --> TS --> TK
+    end
+
+    subgraph GUARDED["GUARDED SET - created only on the scoped path<br/>Windows: one anonymous Job Object with KILL_ON_JOB_CLOSE, handle held by P0<br/>POSIX: each member leads its own process group, one pgid recorded per assign"]
+        direction TB
+        P1["P1 - engine ai/node.py v1.task<br/>--autoterm --monitor=app --data_port=8001 --data_host=127.0.0.1<br/>plus inherited --trace, --node_path, --modelserver<br/>env CLIENT_ID, VENV_TOKEN, VENV_ENV_ID=v1, VENV_ISOLATED=1 - figure H<br/>overlay venvs/proj/v1 with its own install.lock<br/>venv_source_stub mounts /venv/pipe, announces ready, then blocks"]
+        P2["P2 - engine ai/node.py v2.task<br/>--data_port=8002, env VENV_ENV_ID=v2<br/>overlay venvs/proj/v2<br/>spawned only after P1 is ready - strictly sequential"]
+        PM["PM - engine ai/node.py main.task<br/>--autoterm --monitor=app --data_port=9000<br/>env CLIENT_ID, VENV_TOKEN, VENV_ISOLATED, and VENV_ENV_ID POPPED - figure H<br/>overlay venvs/proj/main<br/>runs main's graph, its venv bridge nodes dial P1 and P2"]
+        GK["G1 ffmpeg in ai/common/avi/reader.py - G2 uv - G3 audio loaders, model servers<br/>no --autoterm and no pipe to P0<br/>the orphan class 8.5B exists for"]
+    end
+
+    TK -->|"1 - spawn, assign, await ready"| P1
+    TK -->|"2 - spawn, assign, await ready"| P2
+    TK -->|"3 - inject_venv_urls, then spawn and assign"| PM
+    PM -.->|"ws 127.0.0.1:8001 /venv/pipe"| P1
+    PM -.->|"ws 127.0.0.1:8002 /venv/pipe"| P2
+    P1 ==>|"subprocess.Popen"| GK
+    PM ==>|"subprocess.Popen"| GK
+```
+
+Three things it makes visible that no sentence in §4 does. **One binary, three roles** — a venv-child
+spawn is the main-engine spawn with a different script argument, task file and environment, which is
+why `venv_spawn` mirrors `task_engine` rather than inventing a launcher. **The guard holds PM, not
+only the children** — under `=0` that same `ffmpeg`/`uv`/model-server load runs inside the main
+engine, so excluding it would leave the commonest case uncovered. And **grandchildren hang off the
+engines, never off the server**, which is exactly why F1's obvious test proves nothing (figure D).
+
+**Figure D — what actually bounds a process's life.** Three mechanisms, three different coverages;
+the document states them in three separate places and never crosses them, which is what makes the
+one uncovered cell easy to miss.
+
+
+| mechanism | engines `P1 P2 PM` | grandchildren `G1 G2 G3` | after an **abrupt** server death (`kill -9` of P0) |
+| --- | :---: | :---: | --- |
+| **`--autoterm`** — in-child stdin monitor | yes | **no** | yes — engines only |
+| **cooperative teardown** — `_teardown_venv_children` → `kill_process` | yes | **no** | **no** — nobody is left alive to run it |
+| **`ProcessGuard` / Windows** — job, `KILL_ON_JOB_CLOSE` | yes | yes | yes — the kernel closes the handle and takes the whole tree |
+| **`ProcessGuard` / POSIX** — process groups + `killpg` | yes | yes, *graceful only* | **no** — `killpg` needs a live caller |
+
+**The residual, and the only one: POSIX × grandchildren × abrupt server death.**
+
+Read it column-wise and F1's measurement stops being a surprise: **column 1 is covered three times
+over**, so "kill the server, assert no `engine.exe` survives" passes on any commit and proves
+nothing — while **column 2 was covered by nothing at all** until 8.5B. That is the whole content of
+the increment, and it is invisible in any one row. The residual cell is argued below (`PR_SET_PDEATHSIG`
+is refused, not overlooked), and the honest-coverage bullet says which cells CI has ever executed.
+
+**Figure E — the order the guard is driven in, and the two orderings that are correctness.**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as Task, in the server
+    participant G as ProcessGuard
+    participant C as venv child
+    participant M as main engine
+
+    Note over T: scoped run detected, partition, mint the run token
+    T->>G: create - eagerly and per run, never lazily
+    Note over T,G: close invalidates the handle, so a create-if-None guard would bind<br/>a restarted task's children to a dead job and every assign would no-op
+
+    loop per isolated environment
+        Note over T: assign_port, write the child task file, build_child_env
+        T->>C: create_subprocess_exec with spawn_kwargs
+        Note over T,C: POSIX start_new_session=True is NOT decoration - without it the<br/>child inherits the SERVER's group and assign below is invalid
+        T->>G: assign pid
+        Note over G: Windows AssignProcessToJobObject<br/>POSIX record os.getpgid, and REFUSE it when it equals os.getpgrp
+        T->>C: attach the DAP stdio pump
+        T->>C: await_child_ready
+        Note over T,C: assign already happened - the case the guard exists for is a<br/>child that HANGS or dies right here
+        C-->>T: ready - the child's own announcement
+        T->>T: append to _venv_children - only now, which is why teardown cannot loop
+    end
+
+    Note over T: inject_venv_urls, write the main task file
+    T->>M: create_subprocess_exec with spawn_kwargs
+    T->>G: assign pid - the guard holds main as well as the children
+    Note over T,M: the run
+
+    T->>C: teardown - pump disconnect, kill_process, release_port, remove task file
+    T->>G: terminate_all - OUTSIDE the loop, not conditional on the list being non-empty
+    Note over G: Windows TerminateJobObject<br/>POSIX SIGTERM each pgid, grace, then SIGKILL
+    T->>G: close
+    Note over G: Windows CloseHandle - this IS the orphan-safety property<br/>POSIX nothing to close, just drop the pgids
+```
+
+The two orderings called out in the notes are the same fact from both ends: **the case the guard
+exists for is a child that hangs or dies during startup**, so it must be bound before the readiness
+wait — and such a child
+is never appended to `_venv_children`, so teardown that lived inside the loop would skip the backstop
+on precisely the path that needed it, and leak the handle too. A third invariant is not an ordering
+but belongs here: the guard is **per run and created eagerly**, never lazily, because `close()`
+invalidates the handle — a "create if `None`" guard would assign a restarted task's children to a dead
+handle, every `assign` would fail into its deliberate no-op degradation, and orphan safety would
+disappear without a symptom.
+
+**Figure F — one child's spawn, failure path included.** Figure E is the guard's view across the
+whole run; this is one child end to end. Drawn because the failure branch is the half that only
+exists as prose in §7, and it is the branch that runs on someone's first `=1` pipeline.
+
+```mermaid
+stateDiagram-v2
+    direction TB
+    [*] --> AssignPort
+    state "assign_port from the TaskServer broker" as AssignPort
+    state "write the child's flat task file" as WriteTask
+    state "build_child_env - CLIENT_ID, VENV_TOKEN, VENV_ENV_ID, VENV_ISOLATED" as BuildEnv
+    state "create_subprocess_exec with the guard's spawn_kwargs" as Exec
+    state "guard.assign - bind BEFORE readiness" as Assign
+    state "attach the DAP stdio pump - drains pipes, feeds the tail ring, sets ready" as Pump
+    state "await_child_ready - TCP accept, then the child's own announcement" as Await
+    state "READY_CONFIRMED - the child announced itself" as Confirmed
+    state "READY_DEGRADED - socket accepted, no announcement, then silence" as Degraded
+    state "self-cleanup - drain, disconnect, kill and reap, drop the task file" as Cleanup
+    state "run fails synchronously - use raises, quoting the child's OWN last output" as Failed
+
+    AssignPort --> WriteTask
+    WriteTask --> BuildEnv
+    BuildEnv --> Exec
+    Exec --> Assign
+    Assign --> Pump
+    Pump --> Await
+    Await --> Confirmed: announcement seen
+    Await --> Degraded: silence ceiling, but the socket answered
+    Await --> Cleanup: child exited, or nothing ever accepted
+    Confirmed --> [*]: appended to _venv_children, next child spawns
+    Degraded --> [*]: proceeds, and says so via debug_message
+    Cleanup --> Failed
+    Failed --> [*]
+```
+
+Three things the failure branch gets right and prose kept losing. **The cleanup is local**, because
+the child is not in `_venv_children` yet — leave it out and a *hung* child survives until the server
+dies, since its stdin stays open and `--autoterm` never fires. **The drain happens before the
+disconnect**, because the transport's `disconnect()` cancels its readers rather than letting them
+finish, which would truncate exactly the lines the error is about to quote. And **`READY_DEGRADED` is
+not a failure** — it is the pre-8.5 behaviour kept deliberately, so a reworded status line on the node
+side costs latency rather than the run.
+
+**Figure G — the readiness budget is a ceiling on silence, not on elapsed time.** *ASCII rather than
+mermaid here: the point is a quantity that resets against a time axis, and neither `gantt` nor a
+sequence diagram can draw a budget being refunded.*
+
+```text
+   t=0        10s        20s        30s        40s        50s        60s
+   |----------|----------|----------|----------|----------|----------|
+
+ A HEALTHY child doing a cold install        (measured: use() 56.0s, run completes)
+   spawn  h    h    h    h    h    h    h    h    h    h    h   READY
+          ^ depends' 5s install heartbeat -- ANY event refreshes last_event_at
+   longest silence: ~5s, against a 30s ceiling      -> never close to failing
+
+ A WEDGED child (nothing on stdio after spawn)
+   spawn  ..................................X  RuntimeError
+   longest silence: 30s -> fails at the ceiling, once, and promptly
+
+ THE OLD FIXED ~30s DEADLINE (replaced in 8.5A)
+   spawn  h    h    h    h    h    X  killed at 30s while visibly talking
+                                   -> measured: use() returned in 13.2s and send()
+                                      came back HTTP 403 on an already-dead task
+```
+
+That is the whole of 8.5A: the budget moved from *elapsed* to *quiet*, so a slow-but-healthy child is
+waited for while a wedged one still dies inside `silence_ceiling`. The second half of the change is
+what readiness is *proved by* — the child's own announcement after it mounts `/venv/pipe`, not a TCP
+handshake, which since #912 only proves the shared bootstrap server is listening. `clock` is injected
+for a reason worth keeping: a test that drives the ceiling with real `asyncio.sleep` races the
+scheduler, and on a loaded machine a scheduling pause reads as silence and reports a healthy child
+degraded.
+
+*Sequence view of the same startup — what spawns when, and why children finish before main — is
+drawn in **§3.1, view 1**.*
 - **Venv process = the pipeline run.** A venv child is spawned when the run starts and exits when it
   ends — a **sibling** of the main `engine.exe`, mirroring today's process-per-run model. It handles all
   objects in that run but is **never reused across runs**. No warm pool. Two runs (same or different
@@ -1458,7 +1798,8 @@ starts — is drawn in **§3.1, view 1**.*
 - **On-disk env reused across runs** (only the process is per-run): installed once, keyed by stable IDs,
   drift detected by `requirements.hash`.
 - **Orphan safety is OS-level, and the two platforms do NOT deliver the same guarantee (8.5B).**
-  Written as two claims on purpose; one sentence covering both would be false.
+  Written as two claims on purpose; one sentence covering both would be false. *Figure D is the map
+  and these two bullets are the detail — the platform split is the bottom two rows of it.*
   - **Windows: kernel-enforced, whole tree, unconditional.** The server holds an **anonymous** Job
     Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; every venv child *and* the main engine are
     assigned to it. However the server dies — `kill -9` included — the OS closes the handle and the
@@ -1488,7 +1829,8 @@ starts — is drawn in **§3.1, view 1**.*
     unexercised by anything.**
 - **Install timing:** lazy on first run + opt-in deploy-time pre-warm; reuse `depends.py`'s existing
   install-progress reporting verbatim (`updateProgress` / heartbeat / sidecar), tagged per env.
-  **Readiness is proved by the child, and the spawn's patience is bounded by silence (8.5A).** A
+  **Readiness is proved by the child, and the spawn's patience is bounded by silence (8.5A —
+  figure G).** A
   child announces `/venv/pipe` after mounting it, and the parent's budget resets on any event from
   that child, so a first run that compiles and installs is waited for rather than killed at a fixed
   deadline. **First-run cost, stated because it is real:** `_spawn_venv_children` awaits each child
@@ -1583,9 +1925,32 @@ starts — is drawn in **§3.1, view 1**.*
     protocol call must never do, and `venv_env` imports nothing from `depends`. It is the same
     primitive family (`msvcrt` / `fcntl.flock`), because `flock` and `lockf` do not see each
     other on Linux.
-  - **Lifecycle coupling:** the dir lives as long as its canvas entity; **orphan-GC reconciliation** is
-    the safety net (pipelines/groups can be deleted out-of-band — e.g. the `.pipe` removed directly).
-    LRU eviction under disk pressure is a separate, secondary mechanism for still-valid-but-stale envs.
+  - **Lifecycle coupling — settled in 2C as *staleness collection*, not reconciliation, and the
+    difference is not cosmetic.** The original wording promised orphan-GC as a safety net for
+    out-of-band deletes (the `.pipe` removed directly). Reading the code for it **refuted the
+    premise**: no component can enumerate live projects. VS Code's `.pipe` files sit on the client
+    machine and the engine never parses one anyway (§4.8); rocket-ui's documents live in the
+    account `IStore`, scoped per user or team and possibly remote, never at `<exe>`; and neither
+    host sees the other's. "The entity is gone" is therefore unanswerable from here.
+    What ships instead is age: an overlay nothing has activated for `GC_DEFAULT_MAX_AGE_SECONDS`
+    (30 days, floored by an hour) is collected. Safe because an overlay is a rebuildable cache —
+    a premature collection costs one reinstall — and honest because it makes no claim to know
+    what still exists. The signal is a `last_used` sidecar written at activation, so it means
+    **last activated**, not last used: a `ttl=0` resident engine writes it once at open
+    (`endpoint.cpp` fires the hook per endpoint open, not per execution) and then ages while
+    genuinely in use. The registry gate, not the timestamp, is what protects that case, and on
+    POSIX it is the **only** thing that does — unlinking a `.so` another process holds open
+    succeeds silently there, so the named busy error above is a Windows-only backstop.
+    **Consequence to keep in view:** collection cannot tell "abandoned" from "infrequent". A
+    monthly cron schedule keeps its overlay under the 30-day default; a quarterly one does not,
+    and pays a cold install every run. `ROCKETRIDE_VENV_GC_MAX_AGE_DAYS` is the answer there, and
+    nobody finds that knob from a slow first run — so it belongs here.
+    **LRU eviction under disk pressure remains deferred, now against two triggers rather than
+    one:** cheap size accounting (recursive sizing is ~½M `stat` calls today), *and* the SaaS
+    ceiling — overlays there land on the container's writable layer, charged to
+    `ephemeral-storage` (4Gi on `eaas`, 8Gi on the single-replica `alb`), whose breach evicts the
+    pod. Age-based collection provably cannot help there: a pod's writable layer starts empty, so
+    nothing in it is ever old. `last_used` ships now as LRU's ready input.
 
 ### 4.11 Overlay mechanism (sys.path; never move the binary)
 The venv child runs the **original `engine.exe`, unmoved**; the overlay's `site-packages` goes
@@ -1847,6 +2212,40 @@ read once, and only the ones nothing legitimately reads later are removed.
 is read fresh on every check rather than frozen at first read. It is named here because this is
 where a reader audits the feature's variables, and a lever that is absent from the list reads as a
 lever that obeys it; the argument for and against freezing it is with the lever itself.
+
+**Figure H — who sets each variable, who strips it, and who freezes it.** The prose above makes the
+argument; the figure is what an auditor reads. Drawn because "assigned to a child, popped from main"
+is stated in three places (§3.1, here, and 8.7A) and still lands as an oddity rather than a rule.
+
+```mermaid
+flowchart TB
+    SRV["SERVER PROCESS P0 environment<br/>ROCKETRIDE_SERVER_USE_VENV, set by the operator in a launch config, unit file or container<br/>plus whatever else the operator exported - which is the threat the pops answer"]
+
+    BSE["_build_subprocess_env<br/>scrub the DB broker credential, inject the one per-tenant DSN"]
+    BME["build_main_env<br/>then apply the venv keys"]
+    BCE["build_child_env<br/>once per child"]
+
+    MAIN["PM - main engine<br/>USE_VENV inherited, unchanged<br/>VENV_TOKEN set on a scoped run<br/>VENV_ENV_ID is POPPED - main must carry NONE<br/>VENV_ISOLATED set when true, POPPED when false<br/>CLIENT_ID set - ROCKETRIDE_MOCK popped under avoidMocks"]
+    CHILD["P1 and P2 - venv child<br/>USE_VENV inherited, unchanged<br/>VENV_TOKEN set, the same run token<br/>VENV_ENV_ID is ASSIGNED - a child must carry EXACTLY ONE,<br/>so an inherited value has to lose<br/>VENV_ISOLATED always 1 - a venv child IS an isolated group<br/>CLIENT_ID set - ROCKETRIDE_MOCK popped under avoidMocks"]
+
+    SRV -->|"main: two functions in sequence, and only the pair is correct"| BSE
+    BSE --> BME --> MAIN
+    SRV -->|"child"| BCE --> CHILD
+```
+
+| variable | first read | then | why that treatment |
+| --- | --- | --- | --- |
+| `ROCKETRIDE_SERVER_USE_VENV` | frozen | **kept** | the **server** calls `use_venv_mode()` too; popping strips the operator's setting from `os.environ`, and the next `subprocess_env` copy omits it — every later run silently degrades to `auto` |
+| `ROCKETRIDE_VENV_ENV_ID` | frozen | **popped** | consumed: neither node code nor anything a node spawns may observe or change it |
+| `ROCKETRIDE_VENV_ISOLATED` | frozen | **popped** | same rule, same reason |
+| `ROCKETRIDE_VENV_TOKEN` | — | **never consumed at all** | node code is its legitimate reader at connect time; popping it takes the bridge down in every scoped run |
+| `ROCKETRIDE_PKG_PROBE_STRICT` | read fresh, every check | — | §4.16's outlier, listed so that its absence cannot read as compliance |
+
+**The two ends are protected by opposite mechanisms, and unifying them is the error to avoid.** A
+child **assigns** unconditionally; main **pops**. Both defend against the same thing from opposite
+sides — main's environment is a copy of the *server's*, where an operator export would otherwise
+redirect the main engine into another environment's overlay, while a child that inherited an id
+would install into a sibling's. Nothing in the figure is symmetric by accident.
 
 **Known gap.** `<exe>/.env` is loaded by `ai/web/server.py` inside `WebServer.__init__`, but
 `ai/__init__.py` calls `depends()` at import — so a value placed in `.env` is read **after** the
@@ -3611,7 +4010,8 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
   **run for the first time in 8.7A**, both pins imported, each from its own overlay, none in main);
   compat `=0` isolated-group **demotion** (8.7B: four shapes returned their values, no `venvs/`
   directory, 3 processes where two children would have made 5); purge / delete **lifecycle**
-  including the refusal while a run is active (8.6, live end to end). **GC/LRU stays 2C.**
+  including the refusal while a run is active (8.6, live end to end). **GC shipped in 2C-GC below;
+  LRU stays deferred against the two triggers named in §4.10.**
 - **DONE — the client half of `rrext_venv`.** 8.6 shipped the engine-side protocol command and
   nothing that called it; §4.10's operations A/B/C were buttons with nothing to press. They press
   now, on four surfaces:
@@ -3650,8 +4050,10 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
     document's id before `fsDelete`, VS Code reads `parsedFiles` before evicting it — file-first
     and best-effort in both, the opposite ordering from operation B and for the opposite reason:
     there a refusal must leave the container standing, here the user's intent *is* "delete this
-    pipeline". Neither replaces orphan GC (2C): a delete made outside the app, or while
-    disconnected, still bypasses both hooks.
+    pipeline". Neither replaces the collector below: a delete made outside the app, or while
+    disconnected, still bypasses both hooks — those overlays are now reclaimed by age instead,
+    which is what 2C-GC ships and why it collects on staleness rather than on the entity being
+    gone (§4.10).
   **Exercised in one host, and the asymmetry is stated rather than rounded off.** The whole click
   list — creation and its explicit dimensions, purge and its three outcomes, both delete routes
   through one dialog, cancel, the locked canvas, a mixed selection, the pipeline-delete hook and the
@@ -3747,6 +4149,46 @@ codec to delta-compress `apaevt_venv_trace` the way it already does `apaevt_flow
 change — `run_log.py`'s encoder and `log-codec.ts`'s decoder in lockstep — worth doing only if the
 log volume actually bites), and a per-environment renderer for those traces, which the tagged
 `body.env` now makes possible but which no client has yet.
+
+**DONE — 2C-GC: overlays are reclaimed by age.** One increment out of Phase 2C, which stays open
+around it (A1/D1, the debug UX §5 defers here, the second-run collision). What shipped:
+`venv_env.touch_last_used` plus a `last_used` sidecar written from `depends._overlay`, so
+activation leaves a signal; `venv_env.collect_stale`, a stdlib-only collector that walks
+`venvs/`, judges each overlay on the newest of `last_used` / `requirements.hash` / `install.lock`,
+and reuses `_delete_env_dir`; an `rrext_venv gc` subcommand; and a background pass on
+`TaskServer._bg_tasks` (first pass after 15 minutes, then every 6 hours), switched off with
+`--venv-gc-disabled` and re-thresholded with `ROCKETRIDE_VENV_GC_MAX_AGE_DAYS`. Both SDKs, both
+CLIs and the three doc pages follow. §4.10 carries the semantics and why they changed.
+
+Five things worth keeping, because each cost a pass to find and none is visible in the diff:
+
+- **A defect in 8.6's own code, fixed here.** `_delete_env_dir` was *not* hash-first: it wiped in
+  `scandir` order, so the expected Windows failure (a resident engine holding a `.pyd`) could
+  abort mid-wipe and leave a half-emptied `site-packages` still marked installed — precisely the
+  poisoned state `purge_env`'s hash-first rule exists to prevent. Every delete path inherits the
+  fix, not just the collector.
+- **The gate had to widen, and the reason is platform-shaped.** `gc` uses a new
+  `has_registered_project` (any registry entry, complete or not) rather than
+  `has_active_project_run`, because a `ttl`-resident engine keeps an overlay open long after its
+  run completes. On Windows a mistake there surfaces as a named busy error; **on Linux `unlink`
+  of an open `.so` succeeds silently** and the victim fails at its next import, far from the
+  cause. The gate is the only protection there — never narrow it back. §9 updated accordingly.
+- **`projectId` is required on the protocol path.** An unscoped `gc` would have let any holder of
+  `task.control` reclaim every tenant's overlays without naming one — a cross-tenant reach the
+  sibling commands never had, since each needs an id its caller had to know. The whole-tree form
+  exists only in the background pass, which answers to the server rather than to a caller.
+- **Failures are contained per entry, and that is load-bearing rather than tidy.** An escaping
+  error would end the pass; since the walk is sorted, the next pass would abort at the same
+  directory forever — a collector that silently stops. `EnvBusy` is a `RuntimeError` and does not
+  cover raw `OSError`, so both are caught. A liveness callback that *raises* counts as live: the
+  one place where failing open would cost someone else's running engine rather than a reinstall.
+- **What this does not fix, stated so it is not read as covered.** In SaaS the overlay tree is not
+  on the size-limited emptyDir at all — `venvs/` is absent from the mount list and lands on the
+  container's writable layer, charged to `ephemeral-storage`, whose breach evicts the pod. A pod's
+  layer starts empty, so nothing in it is ever old and this mechanism never fires there. The
+  answer is the deferred size-pressure LRU (§4.10's second trigger). The mount asymmetry itself —
+  `cache` and `site-packages` bounded, `venvs/` not — is a deployment question raised with its
+  owner, deliberately not fixed from here.
 
 ---
 
@@ -4111,6 +4553,24 @@ measured).
   leftover is an unused pure-Python package at a version nothing pins. [2A → done]
 - **Lifecycle.** Purge, delete-with-nodes, and pipeline-delete reclaim the right `venvs/...` dirs and are
   **blocked while a run is active** (8.6, live end to end). [2B]
+- **Age-based collection — VERIFIED against a real tree, not only fixtures.** A `nodes:test` run
+  (3305 passed / 134 skipped, unchanged by this increment) left `dist/server/venvs/` holding one
+  project with `main`, `v1` and `v2`, and **each of the three carried a fresh `last_used`** — the
+  signal is written by the real C++ hook → `ensure_env_scoped` → `_overlay` path, per environment,
+  venv children included. `collect_stale` was then dry-run against that tree twice: as-is it
+  scanned 3 and collected 0, and with the clock advanced 60 days it identified all three with
+  correct ages. Both read-only.
+  Unit coverage under bare `pytest`: the touch, the newest-of rule and its dir-mtime fallback, the
+  min-age floor and its echo in the report, fail-closed liveness, per-entry containment of both
+  `EnvBusy` and raw `OSError`, childless-project cleanup, literal-first filtering — plus the
+  protocol matrix (permissions, the required `projectId`, day→second conversion, non-finite
+  refusal, the registry-presence gate) and the loop's delayed first pass and survival of a failing
+  pass.
+  **Not demonstrated, and stated rather than rounded off:** the POSIX half. Windows *refuses* to
+  delete a held overlay, which is the loud, safe case; POSIX silently succeeds, which is the one
+  that matters, and no run here exercised it. It is reasoned about in §4.10 and covered by the
+  bare-`pytest` suite under WSL, not by a second live engine. Nor was the background loop observed
+  firing end to end — its first pass is 15 minutes out by design. [2C]
 - **An image lane crosses a venv boundary — VERIFIED live (2A-4 item 6a), and it was the first time
   any AV lane ever did.** `webhook → { ocr (main), [venv: ocr_surya] } → response`, one PNG, two
   engines, two texts. The point was the two environments, and what it incidentally proved is that
@@ -4330,11 +4790,21 @@ ROCKETRIDE_INCLUDE_SKIP=ocr,ner,detect,detect_segment,caption,background_removal
   children; readiness; teardown; metric/trace fan-in. **Merge-back is not here:** it lives entirely in
   the bridge nodes (`nodes/venv/{server,base,client}/IInstance.py` + `nodes/venv/base/merge.py`, §4.12)
   and the orchestrator never sees it.
-- `packages/ai/src/ai/modules/task/task_server.py` — active-task registry; `project_id`;
-  `has_active_project_run` is the purge/GC gate (matches the raw **and** the shortened id form, or a
-  purge addressed by a name from `list` walks straight past it).
+- `packages/ai/src/ai/modules/task/task_server.py` — active-task registry; `project_id`; **two**
+  project gates, and using the wrong one is a real bug rather than a style choice.
+  `has_active_project_run` is the **purge/delete** gate: it skips completed tasks, because registry
+  entries outlive completion and a presence-only check would refuse purges wherever a finished run
+  is still listed. `has_registered_project` is the **collector's** gate: presence *including*
+  completed, because a `ttl`-resident engine holds the overlay's `.pyd` open long after its run
+  ends — and on POSIX, where unlinking an open file succeeds silently, that gate is the only
+  protection there is. Both match the raw **and** the shortened id form, or a call addressed by a
+  name from `list` walks straight past them. Also here: `_venv_gc_loop`, the background collection
+  pass, and `_start_venv_gc`, extracted so the decision is testable with `__init__` bypassed.
+- `packages/server/engine-lib/rocketlib-python/lib/venv_env.py` — besides the layout and the
+  reclamation primitives, `touch_last_used` (the activation signal, called from `depends._overlay`)
+  and `collect_stale` (the age rule and the walk). Stdlib-only, hence testable under bare `pytest`.
 - `packages/ai/src/ai/modules/task/commands/cmd_venv.py` — the `rrext_venv` mixin (`list` / `purge` /
-  `delete_env` / `delete_project`). Wiring it into `TaskConn` is **three** edits: the import, the base
+  `delete_env` / `delete_project` / `gc`; `gc` **requires** `projectId` — see 2C-GC in §7). Wiring it into `TaskConn` is **three** edits: the import, the base
   class list, and an explicit `VenvCommands.__init__` call — omit the third and the class still
   imports and still constructs, the handler map is simply never built, and the first command dies on
   `AttributeError` at connection time, far from the cause.
