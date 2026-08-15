@@ -199,7 +199,7 @@ popped from main (§4.15).
 *This is the ordering view only. `ProcessGuard` appears here as a participant and is **defined** in
 **§4.10, figures C–G** — what the processes are, what bounds their lifetime, the order the guard is
 driven in, how one child reaches readiness and what its budget actually measures. The env-id
-asymmetry in the last clause is **§4.15, figure H**.*
+asymmetry in the last clause is **§4.15, figure I**.*
 
 **View 2 — messages: one socket per child, and no socket between children.**
 
@@ -1366,7 +1366,9 @@ imports live **exclusively in the local (no-model-server) branch**. Implications
 - `<exe>/venvs/<project_id>/<env_id>/` — **per-environment overlay** for EVERY env, a **top-level
   `venvs/` dir** (sibling of `lib/`, `cache/` — **not** under `cache/`). `env_id ∈ { main, <group_id> }`
   → main lives at `venvs/<project_id>/main`. Each holds `site-packages/` + its own scoped `combined.txt`,
-  `constraints.txt`, `requirements.hash`, lock. The path helpers
+  `constraints.txt`, `requirements.hash`, lock, and — since 2C-GC — a `last_used` sidecar whose
+  **mtime** is the activation signal the collector reads (§4.10; its one line of content is for a
+  human reading the directory and is never parsed). The path helpers
   `_get_combined_path`/`_get_constraints_path`/hash are parameterized by the env dir. **The refactor
   surface is wider than the path helpers** — and by the code it is **three** problems, not one
   (IMPLEMENTED):
@@ -1606,7 +1608,9 @@ now it was reconstructible only from §3.1's sequence view plus §7's step-7 par
 figures and §3.1 answer different questions and neither replaces the other: *§3.1, view 1* is **what
 spawns when**; these are **what the processes are** (C), **what bounds their lifetime** (D), **in
 what order the guard is driven** (E), **what one child's spawn actually does, failure path included**
-(F), and **what the readiness budget measures** (G).
+(F), and **what the readiness budget measures** (G). *A sixth closes the section rather than opening
+it:* **figure H**, how one overlay is judged for collection, sits with the reclamation policy at the
+end because it is about a directory's life, not a process's.
 
 **Figure C — the process tree of a scoped run.** Every box is the *same* `engine` binary in a
 different role: the server runs `ai/eaas.py`, every task subprocess runs `ai/node.py`
@@ -1617,16 +1621,16 @@ flowchart TB
     subgraph SERVER["P0 - engine ai/eaas.py, long-lived, survives every run"]
         direction TB
         WS["ws 5565 /task/service - SDK, VS Code and MCP clients speak DAP<br/>WebServer with services, chat, dropper, clients, task, task_http, shell"]
-        TS["TaskServer<br/>assign_port and release_port over base_port to base_port+9999<br/>active-task registry - the purge and delete gate"]
+        TS["TaskServer<br/>assign_port and release_port over base_port to base_port+9999<br/>task registry - the gate for purge, delete and collection, by two different predicates"]
         TK["Task - ONE PER RUN, and the spawner of everything below<br/>_venv_guard, _venv_children, _engine_process"]
         WS --> TS --> TK
     end
 
     subgraph GUARDED["GUARDED SET - created only on the scoped path<br/>Windows: one anonymous Job Object with KILL_ON_JOB_CLOSE, handle held by P0<br/>POSIX: each member leads its own process group, one pgid recorded per assign"]
         direction TB
-        P1["P1 - engine ai/node.py v1.task<br/>--autoterm --monitor=app --data_port=8001 --data_host=127.0.0.1<br/>plus inherited --trace, --node_path, --modelserver<br/>env CLIENT_ID, VENV_TOKEN, VENV_ENV_ID=v1, VENV_ISOLATED=1 - figure H<br/>overlay venvs/proj/v1 with its own install.lock<br/>venv_source_stub mounts /venv/pipe, announces ready, then blocks"]
+        P1["P1 - engine ai/node.py v1.task<br/>--autoterm --monitor=app --data_port=8001 --data_host=127.0.0.1<br/>plus inherited --trace, --node_path, --modelserver<br/>env CLIENT_ID, VENV_TOKEN, VENV_ENV_ID=v1, VENV_ISOLATED=1 - figure I<br/>overlay venvs/proj/v1 with its own install.lock<br/>venv_source_stub mounts /venv/pipe, announces ready, then blocks"]
         P2["P2 - engine ai/node.py v2.task<br/>--data_port=8002, env VENV_ENV_ID=v2<br/>overlay venvs/proj/v2<br/>spawned only after P1 is ready - strictly sequential"]
-        PM["PM - engine ai/node.py main.task<br/>--autoterm --monitor=app --data_port=9000<br/>env CLIENT_ID, VENV_TOKEN, VENV_ISOLATED, and VENV_ENV_ID POPPED - figure H<br/>overlay venvs/proj/main<br/>runs main's graph, its venv bridge nodes dial P1 and P2"]
+        PM["PM - engine ai/node.py main.task<br/>--autoterm --monitor=app --data_port=9000<br/>env CLIENT_ID, VENV_TOKEN, VENV_ISOLATED, and VENV_ENV_ID POPPED - figure I<br/>overlay venvs/proj/main<br/>runs main's graph, its venv bridge nodes dial P1 and P2"]
         GK["G1 ffmpeg in ai/common/avi/reader.py - G2 uv - G3 audio loaders, model servers<br/>no --autoterm and no pipe to P0<br/>the orphan class 8.5B exists for"]
     end
 
@@ -1796,7 +1800,9 @@ drawn in **§3.1, view 1**.*
   objects in that run but is **never reused across runs**. No warm pool. Two runs (same or different
   pipeline) → separate processes → no interference.
 - **On-disk env reused across runs** (only the process is per-run): installed once, keyed by stable IDs,
-  drift detected by `requirements.hash`.
+  drift detected by `requirements.hash`. It outlives every process that uses it, which is the point —
+  and until 2C-GC it outlived everything else too. Its end is now age: the reclamation policy at the
+  end of this section collects an overlay nothing activates.
 - **Orphan safety is OS-level, and the two platforms do NOT deliver the same guarantee (8.5B).**
   Written as two claims on purpose; one sentence covering both would be false. *Figure D is the map
   and these two bullets are the detail — the platform split is the bottom two rows of it.*
@@ -1905,8 +1911,9 @@ drawn in **§3.1, view 1**.*
     §4.10's "no = ungroup". The hook is async and may return a filtered set, so it awaits the answer
     and returns exactly what the user confirmed rather than cancelling and asking them to repeat.
   - **Operation C — Pipeline deleted:** delete the whole `venvs/<project_id>/` subtree.
-  - **IMPLEMENTED (8.6) — the engine side of all three, plus a `list`.** `rrext_venv` dispatches
-    `list` / `purge` / `delete_env` / `delete_project` onto `venv_env` primitives
+  - **IMPLEMENTED (8.6) — the engine side of all three, plus a `list`.** (2C added a fifth
+    subcommand, `gc`, on the same dispatcher — see the lifecycle bullet below.) `rrext_venv`
+    dispatches `list` / `purge` / `delete_env` / `delete_project` onto `venv_env` primitives
     (`packages/server/docs/observability.md` documents the wire surface). `list` is not in §4.10's
     original three and was added because without it neither the canvas nor the live check can learn
     what exists, and the check would then be asserting about files rather than about the protocol.
@@ -1933,7 +1940,8 @@ drawn in **§3.1, view 1**.*
     account `IStore`, scoped per user or team and possibly remote, never at `<exe>`; and neither
     host sees the other's. "The entity is gone" is therefore unanswerable from here.
     What ships instead is age: an overlay nothing has activated for `GC_DEFAULT_MAX_AGE_SECONDS`
-    (30 days, floored by an hour) is collected. Safe because an overlay is a rebuildable cache —
+    (30 days, floored by an hour) is collected — figure H is the decision for one overlay. Safe
+    because an overlay is a rebuildable cache —
     a premature collection costs one reinstall — and honest because it makes no claim to know
     what still exists. The signal is a `last_used` sidecar written at activation, so it means
     **last activated**, not last used: a `ttl=0` resident engine writes it once at open
@@ -1941,6 +1949,14 @@ drawn in **§3.1, view 1**.*
     genuinely in use. The registry gate, not the timestamp, is what protects that case, and on
     POSIX it is the **only** thing that does — unlinking a `.so` another process holds open
     succeeds silently there, so the named busy error above is a Windows-only backstop.
+    **Two ways in, and they are not alternatives.** A background pass in the server sweeps every
+    project — first run 15 minutes after boot, then every 6 hours — and that is what makes the
+    guarantee; `rrext_venv gc` collects **one named project** on demand, and that is what makes it
+    testable and gives an operator a lever. The delay is the mechanism, not politeness: startup is
+    when cold installs are writing into these same trees. Off with the server flag
+    `--venv-gc-disabled`; re-thresholded for both paths with `ROCKETRIDE_VENV_GC_MAX_AGE_DAYS`
+    (§4.15). Why the on-demand form is per-project rather than tree-wide is a tenancy argument, in
+    §7's 2C-GC entry.
     **Consequence to keep in view:** collection cannot tell "abandoned" from "infrequent". A
     monthly cron schedule keeps its overlay under the 30-day default; a quarterly one does not,
     and pays a cold install every run. `ROCKETRIDE_VENV_GC_MAX_AGE_DAYS` is the answer there, and
@@ -1951,6 +1967,34 @@ drawn in **§3.1, view 1**.*
     `ephemeral-storage` (4Gi on `eaas`, 8Gi on the single-replica `alb`), whose breach evicts the
     pod. Age-based collection provably cannot help there: a pod's writable layer starts empty, so
     nothing in it is ever old. `last_used` ships now as LRU's ready input.
+
+**Figure H — how one overlay is judged, and the two places the answer is deliberately asymmetric.**
+
+```mermaid
+flowchart TD
+    A["env dir under venvs/"] --> B{"in the task registry?"}
+    B -->|yes| S1["skipped - live"]
+    B -->|predicate raised| S2["skipped - liveness unknown"]
+    B -->|no| C{"last_used, requirements.hash or install.lock present?"}
+    C -->|"yes - take the newest"| E{"older than the threshold?"}
+    C -->|none| D["fall back to the env dir mtime"]
+    D --> E
+    E -->|no| K["kept"]
+    E -->|yes| F["delete: hash first, then wipe"]
+    F -->|ok| H["collected"]
+    F -->|EnvBusy or OSError| G["failed - siblings continue"]
+```
+
+The two asymmetries are the content; the rest is bookkeeping. **On the left, unknown means live:**
+a liveness predicate that raises produces a skip, not a collection, because that branch is the only
+thing standing between the collector and a running engine — and on POSIX it is the *only* thing,
+since unlinking a held `.so` succeeds there. **On the right, a failure is a row, not an exit:** the
+walk is ordered, so an escaping error would abort every remaining directory and the next pass would
+abort at the same one, which is a collector that has silently stopped rather than one that skipped
+something. `EnvBusy` is a `RuntimeError` and does not cover a raw `OSError`, so both are caught.
+
+Note what the diagram does *not* branch on: whether the project still exists. Nothing here can
+answer that (see the bullet above), and drawing it would imply a check that no code performs.
 
 ### 4.11 Overlay mechanism (sys.path; never move the binary)
 The venv child runs the **original `engine.exe`, unmoved**; the overlay's `site-packages` goes
@@ -1989,6 +2033,13 @@ them — was the disk debt §4.10's purge/delete operations existed to settle, a
 **8.6 settled it**: `rrext_venv` purges and deletes them under an active-run gate. So the growth
 8.7 causes is now bounded by an operation rather than by nothing, which is why purge landed
 immediately after.
+**2C-GC finished the sentence: bounded by an operation is not the same as bounded.** An operation
+needs someone to invoke it, and nobody invokes one against a directory they have forgotten — which
+is how 152 of them accumulated in the first place. The collector removes the invoker: overlays that
+nothing activates age out on their own (§4.10). These 152 are its first and easiest subjects, since
+by construction nothing will ever activate them again. Note what that does *not* license — the
+count is frozen history only because 8.7A changed what gets produced; had it kept producing
+`main`-only directories, a collector would be trimming a tail while the head still grew.
 
 **It is a swap, not an insert (IMPLEMENTED).** Inserting without removing means applying a second
 environment in one process leaves **both** overlays in front of base: the newer wins for packages
@@ -2108,7 +2159,18 @@ actually comes from (corrected in 8.7A):** not from an unset environment variabl
 never creates a directory at all. This section demonstrates it three paragraphs down for
 `engtest`. The earlier wording ("`ROCKETRIDE_VENV_SITE` unset → overlay no-ops → use base") was
 doubly wrong: nothing ever read that variable, and it is now deleted. `depends.py` tolerates a
-missing `project_id`/`env_id` and falls back to a **default env** (or base). Concrete cases:
+missing `project_id`/`env_id` and falls back to a **default env** (or base).
+
+**`venvs/default/` is collectable like any other overlay, and that is a decision rather than an
+oversight (2C-GC).** It is the one bucket no liveness gate can ever protect: a run without a
+`project_id` is given a fresh UUID in the task registry while its overlay lands under `default`, so
+the registry can never match the directory's name. Exempting it was the tempting alternative and
+would have been a fiction — an exemption implies a check that cannot exist. What protects it instead
+is that it is *shared*: anything actively using it activates it, and the activation signal is
+written on every open, so a bucket in use is never age-stale. Mid-install it is held by the same
+lock every overlay uses. Worst case is the same as everywhere else — one redundant reinstall.
+
+Concrete cases:
 
 - **`engtest`** (engine-lib Catch2 binary, links engLib → embeds Python) runs
   `loadModule("nodes.webhook")`. Its `python::config` test asserts `sys.prefix == sys.executable dir ==
@@ -2147,6 +2209,11 @@ missing `project_id`/`env_id` and falls back to a **default env** (or base). Con
   Per-document keying keeps distinct tests distinct, bounds the directory count, and makes a second
   suite run warm. A "warm" timing measured on `nodes:test` before this was not warm at all — it was
   a cold install with a warm `uv` download cache, which understated the reuse a real pipeline gets.
+  **"Nothing reclaimed the old ones" was true when it was written and is not now (2C-GC).** The
+  collector sweeps by age, and a harness overlay is exactly what it is good at: nothing activates it
+  again after its suite run, so it ages out on its own. Note what this does *not* fix — the harness
+  keys its overlays by document digest, so a changed fixture still mints a new one, and collection
+  bounds the tail rather than the birth rate.
 
   **The `ROCKETRIDE_VENV_ENV_ID`-per-worker half above describes a harness this one is not
   (corrected in 2A-R).** Checked against the code rather than carried forward: declarative node
@@ -2212,8 +2279,19 @@ read once, and only the ones nothing legitimately reads later are removed.
 is read fresh on every check rather than frozen at first read. It is named here because this is
 where a reader audits the feature's variables, and a lever that is absent from the list reads as a
 lever that obeys it; the argument for and against freezing it is with the lever itself.
+**A fifth arrived with 2C-GC, and the rule above does not decide it either — for a reason none of
+the others share.** `ROCKETRIDE_VENV_GC_MAX_AGE_DAYS` (§4.10) is read once in `TaskServer.__init__`
+and never popped, which looks like the switch's treatment and is not. Every variable above it is
+read inside an **engine** process by something — the switch in both the server and the engine, the
+remaining four in engines only, the probe lever included since its check runs during an install —
+and that is what makes "can node code observe or change it" a question worth answering at all.
+This one is never handed to an engine: the server reads it, the collector runs there, and no
+subprocess copy carries it. There is nothing to strip and nothing to expose. Its companion is not
+an environment variable at all — the collector is switched off with the server flag
+`--venv-gc-disabled`, deliberately, since an operator killing a background sweep should be doing it
+where the process is launched rather than through the environment a run inherits.
 
-**Figure H — who sets each variable, who strips it, and who freezes it.** The prose above makes the
+**Figure I — who sets each variable, who strips it, and who freezes it.** The prose above makes the
 argument; the figure is what an auditor reads. Drawn because "assigned to a child, popped from main"
 is stated in three places (§3.1, here, and 8.7A) and still lands as an oddity rather than a rule.
 
@@ -2240,6 +2318,7 @@ flowchart TB
 | `ROCKETRIDE_VENV_ISOLATED` | frozen | **popped** | same rule, same reason |
 | `ROCKETRIDE_VENV_TOKEN` | — | **never consumed at all** | node code is its legitimate reader at connect time; popping it takes the bridge down in every scoped run |
 | `ROCKETRIDE_PKG_PROBE_STRICT` | read fresh, every check | — | §4.16's outlier, listed so that its absence cannot read as compliance |
+| `ROCKETRIDE_VENV_GC_MAX_AGE_DAYS` | once, in `TaskServer.__init__` | **kept** | §4.10's collector threshold. Never reaches an engine — the server is its only reader — so the pops above have nothing to answer here |
 
 **The two ends are protected by opposite mechanisms, and unifying them is the error to avoid.** A
 child **assigns** unconditionally; main **pops**. Both defend against the same thing from opposite
@@ -2525,6 +2604,20 @@ landed has an unchanged `requirements.hash`, so nothing recompiles, nothing rein
 runs. Those environments keep whatever ordering they were built with and get proved on their next
 rebuild. "Every environment is proved" is true going forward, not retroactively.
 
+*2C-GC does not change that sentence but does change its horizon, which is worth having written
+down in both sections.* The unproved population used to be permanent — an overlay nobody rebuilds is
+an overlay nobody proves, indefinitely. It now drains: one nothing activates is collected on age
+(§4.10), and whatever rebuilds in its place is built under these rules and proved. The collector
+proves nothing itself; it removes the thing that was never proved, which reaches the same end state
+by attrition and on the threshold's timescale rather than on anybody's decision.
+Two consequences fall out of the same mechanism and neither is a defect. `probes.unproved` lives in
+the environment directory, so collection takes the marker with the overlay — including a
+*downgraded* one, which this section says "ends when the operator ends it": collection is now a
+second way for it to end, and the honest reading is that the exemption cannot outlive the thing it
+exempts. And the marker is deliberately **not** one of the collector's activity signals, for the
+same reason it is kept out of the drift hash: it is an output of a build, not evidence that anything
+used the environment.
+
 #### Environment facts, and why the package is stdlib-only
 
 `pkg_families` is **stdlib-only**, by the precedent `venv_env` already sets: `depends` reads the
@@ -2646,6 +2739,17 @@ access-denied; main-environment drift on a resident engine therefore requires a 
 relates to 8.6's active-run gate and inherits its check-then-act residual. **Recorded here as the
 decision; building it is a named follow-up** — the lifecycle surface in §4.10 is where the
 implementation belongs.
+
+*Two things 2C-GC changed about that follow-up, neither of which builds it.* First, **the predicate
+it needs now exists**: `has_registered_project` answers "is this project in the registry at all",
+which is what "in use" has to mean here for the same reason it does for collection — a
+`ttl`-resident engine holds an environment open long after its run completes, so the active-run gate
+is too narrow for a rebuild just as it was for a delete. Second, **the heading understates the
+problem by naming the wrong platform.** Windows locks are the *loud* case: the write fails and
+nothing silently diverges. It is POSIX that quiescing actually protects, where a rebuild under a
+live interpreter succeeds and the process keeps serving the old module — the same asymmetry the
+already-imported rule above states, and the same one 2C-GC ran into from the deletion side. Whoever
+builds this should not read "Windows locks" as a scope.
 
 The forced re-lay of the widest member makes the hazard **more reachable** rather than new: a rebuild
 might once have left `cv2/` untouched because uv found it satisfied; now, when the family changes, it
@@ -2957,6 +3061,16 @@ reproduce the build's index configuration (an earlier attempt died on an unrelat
 - 🟠 **Phase 2A blast radius = only pipelines where the scoped path is enabled** (`=1`, or auto with
   isolated groups). Under the default (unset, no venvs) **nothing changes** — §4.15 semantics. The
   radius becomes "every pipeline" only if/when a later release flips auto to scoped-by-default.
+- 🟠 **Overlay growth is bounded on a long-lived host and unbounded in a SaaS pod — different
+  mechanisms, and only the first one shipped.** 2C-GC collects by age, which is the right answer
+  where a machine keeps its disk across runs: §4.11's 152 directories age out and stay out. It is
+  the wrong instrument for a container, and provably so rather than by judgement — a pod's writable
+  layer starts empty, so no overlay in it is ever old enough to collect. There, overlays are charged
+  to `ephemeral-storage` (4Gi on `eaas`, 8Gi on the single-replica `alb`, and `venvs/` is on neither
+  pod's size-limited volume), and the failure is **kubelet eviction**, which on the edge replica is
+  user-visible. What covers it is size-pressure LRU, deferred with this as its second trigger
+  (§4.10). Recorded as a risk rather than a task because the cheaper fix may not be code at all: the
+  manifests put `cache` and `site-packages` on a bounded volume and left the largest writer off it.
 - 🟢 **AST correctness PROVEN and precision prerequisite DONE (§4.8 Prototype result).**
   `ast_deps.py` resolves providers and does the transitive walk; over the three
   hardest nodes it reached **every** ground-truth requirement file with **zero under-includes and zero
@@ -3471,7 +3585,10 @@ entangled and 4 depends on 5.
   class-level bool. Untouched and *unexercised*: nothing in 2A-R put two environments in one
   interpreter.
 - **Overlay churn is reduced, not eliminated** — 41 fresh directories per `=1` run became 4, all from
-  two hand-rolled documents outside the harness (§7 prerequisites).
+  two hand-rolled documents outside the harness (§7 prerequisites). *Still true as written: 2C-GC
+  bounds what those four cost over time, since nothing activates them again and they age out, but it
+  does not stop them being created.* Churn and accumulation are separate problems and only the
+  second one now has an answer.
 
 **Found while doing 2A-R; neither belongs to items 3/4/5.** The first is recorded where its
 consequences land rather than fixed in passing; the second had to be fixed here, because the work
@@ -4004,8 +4121,8 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
     §8.3 acceptance solves instead with `use_existing=True` + `terminate()`. Converting them
     would trade 4 directories for a risk of destabilising two live tests that pass today, so they
     are left alone and counted here rather than silently absorbed into "0".
-- **Tests (§8) — all four DONE except GC, which is 2C:** partitioner **unit tests** (39 at step 8.3,
-  45 after 2B's prune);
+- **Tests (§8) — all four DONE; the fifth, GC, followed in 2C-GC:** partitioner **unit tests** (39 at
+  step 8.3, 45 after 2B's prune);
   the **two-venv conflict-coexists** acceptance (`vtest_alpha`/`vtest_beta` split across venvs —
   **run for the first time in 8.7A**, both pins imported, each from its own overlay, none in main);
   compat `=0` isolated-group **demotion** (8.7B: four shapes returned their values, no `venvs/`
@@ -4158,7 +4275,21 @@ activation leaves a signal; `venv_env.collect_stale`, a stdlib-only collector th
 and reuses `_delete_env_dir`; an `rrext_venv gc` subcommand; and a background pass on
 `TaskServer._bg_tasks` (first pass after 15 minutes, then every 6 hours), switched off with
 `--venv-gc-disabled` and re-thresholded with `ROCKETRIDE_VENV_GC_MAX_AGE_DAYS`. Both SDKs, both
-CLIs and the three doc pages follow. §4.10 carries the semantics and why they changed.
+CLIs and the three doc pages follow. §4.10 carries the semantics and why they changed, §4.15 the
+new variable's treatment.
+
+*Coverage, in the same form 8.6 recorded it:* `test_venv_env.py` **72 → 93 passed** on Windows, 1
+skipped (the POSIX-flock case, unchanged); `test_depends_scoping.py` +1, which runs only under the
+engine interpreter and is the sole automated cover for the one production call site;
+`test_cmd_venv.py` **17 → 29** (nine new functions, one of them parametrised four ways);
+`test_task_server.py` **+5**; the SDK fakes +4 each. Whole suites
+green afterwards: `ai:test` 2136 passed / 124 skipped, `client-python:test` 138/6,
+`client-typescript:test` 232/8, `server:run-rocketlib-test` 248/1, `nodes:test` 3305/134,
+`docs:build` clean. *`nodes:test` was run after the change and not before, so "unchanged" is an
+argument here rather than a measurement:* the only thing this increment adds to that path is one
+small write per environment activation, and nothing in the suite asserts on an overlay directory's
+listing. Worth stating in this form because the same suite is where a **behavioural** regression
+from the activation path would surface, and a number with no baseline cannot show one.
 
 Five things worth keeping, because each cost a pass to find and none is visible in the diff:
 
@@ -4194,7 +4325,8 @@ Five things worth keeping, because each cost a pass to find and none is visible 
 
 ## 8. Verification & testing
 Three layers; each test is tagged with the phase that first makes it runnable (**[2A]** = scoping only,
-**[2B]** = needs the venv runtime).
+**[2B]** = needs the venv runtime, **[2C]** = needs something a 2C increment introduced, so far only
+the overlay collector).
 
 ### 8.1 Unit tests
 - **AST discovery walk** (`depends.py`) — promote the throwaway prototype (§4.8 Prototype result) to a
@@ -4293,6 +4425,15 @@ Three layers; each test is tagged with the phase that first makes it runnable (*
   base untouched, idempotent for the same env) and lands behind an injected `ROCKETRIDE_MOCK` shim;
   one argv builder serves base and overlay (base = overlay minus `--target`); `-r` includes are
   absolutized without backslashes, reach the drift hash, and a missing target is refused by name.
+  **2C-GC added the reclamation half to the same two files** [2C]: the touch writes and never
+  creates a directory, and leaves `requirements.hash` alone; the staleness rule prefers the newest
+  signal, falls back to the env dir's mtime only when none exists, ignores a bumped directory mtime,
+  and floors a zero threshold while echoing the floor it applied; a live project is skipped and so
+  is one whose liveness check *raises*; `EnvBusy` and a raw `OSError` each produce a row and leave
+  the alphabetically later sibling collectable, which is the regression that would otherwise stop
+  the collector permanently. `test_depends_scoping.py` holds the one case that proves activation
+  actually writes the signal — the production call site is a closure, so nothing in the bare-Python
+  file can reach it.
 - **Bridge lane table** (`nodes/venv/base/lanes.py`) — two tiers, split by what a stub can prove.
   `test_venv_lanes.py` runs **bare**, under shallow `sys.modules` stubs: the table's keys match
   `binder.hpp::MethodNames` minus framing, so a new engine lane fails loudly instead of leaving a
@@ -4560,12 +4701,9 @@ measured).
   venv children included. `collect_stale` was then dry-run against that tree twice: as-is it
   scanned 3 and collected 0, and with the clock advanced 60 days it identified all three with
   correct ages. Both read-only.
-  Unit coverage under bare `pytest`: the touch, the newest-of rule and its dir-mtime fallback, the
-  min-age floor and its echo in the report, fail-closed liveness, per-entry containment of both
-  `EnvBusy` and raw `OSError`, childless-project cleanup, literal-first filtering — plus the
-  protocol matrix (permissions, the required `projectId`, day→second conversion, non-finite
-  refusal, the registry-presence gate) and the loop's delayed first pass and survival of a failing
-  pass.
+  The rule's own cases are unit-level and live in §8.1; what this entry adds is that they were
+  checked against a tree the engine actually produced rather than one a fixture fabricated, which
+  is the only way the signal's *call site* gets exercised at all.
   **Not demonstrated, and stated rather than rounded off:** the POSIX half. Windows *refuses* to
   delete a held overlay, which is the loud, safe case; POSIX silently succeeds, which is the one
   that matters, and no run here exercised it. It is reasoned about in §4.10 and covered by the
@@ -4630,10 +4768,13 @@ increment that had to run things on both sides.
 | `builder nodes:test` | saas root **and** submodule | **needs `ROCKETRIDE_INCLUDE_SKIP`**; xdist defaults to `min(cpus, 8)`, tune with `--pytest-parallel=N` |
 | `builder model_server:test` / `:test-full` | saas root only (not discoverable from the submodule) | **no env var, no `--pytest-parallel`** — neither reaches this lane; it runs single-process |
 | `builder shared:test` | submodule | `node --test` under `tsx`, no engine — minutes. Added to this table at 2B, which is the first increment to put logic in `apps/shared` |
+| `builder server:run-rocketlib-test` | submodule | the **engine interpreter**, which is the row's whole point: bare `pytest` over the same directory is *green while skipping* all 66 `engLib` cases, `test_depends_scoping.py` entire. Added at 2C-GC |
 
 **2B added test files, not lanes.** The SDK namespaces land in `client-typescript:test` and
 `client-python:test` as fake-client unit suites (13 each, no server), taking the TypeScript lane
-215 → 228 and the Python one to 134 passed / 6 skipped. The canvas half takes `shared:test`
+215 → 228 and the Python one to 134 passed / 6 skipped. *2C-GC did the same again and moved both
+by four* — `gc`'s wire spelling in each SDK — so the lanes now read **232 passed / 8 skipped**
+(TypeScript) and **138 passed / 6 skipped** (Python); it added no lane either. The canvas half takes `shared:test`
 **90 → 109**: one new pure-logic suite of 16 for the operations, plus three cases added to
 `graph.test.tsx` when the creation button landed (the `venv_N` id, dimensions surviving a round
 trip, and a dragged node being adopted). **The canvas half can only
