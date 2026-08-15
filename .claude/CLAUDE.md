@@ -79,3 +79,42 @@ the corresponding co-located doc in the SAME change:
 Prose-only edits and internal refactors that do not change a public contract do not
 require doc updates. Treat the doc as part of the change, not a follow-up. Do not create
 a separate docs repo or a top-level docs site folder. Verify with `builder docs:build`.
+
+## Design docs: add diagrams
+
+Applies to `packages/server/design/**` (`virtual-environments.md` above all — it is long,
+heavily cross-referenced, and written as a running changelog). When adding or revising a
+section there, **add a diagram whenever the subject is structure, ordering, containment,
+or a lifecycle.** Prose that reconstructs a shape across three sections is the failure this
+rule exists to prevent — a reader should never have to assemble a process tree from a
+sequence diagram plus a phase log plus its corrections.
+
+- **One diagram, one claim.** Two claims means two diagrams. Prefer `view 1` / `view 2`
+  under a single figure, the idiom §3.1 already uses.
+- **Labels name things; prose explains them.** A node label carrying three lines of
+  explanation is prose in a box, and it is what makes a chart unreadable.
+- **Pick the notation for the claim.** `flowchart` for structure and containment
+  (`subgraph` is a real boundary); `sequenceDiagram` for ordering, and for nesting, whose
+  activation bars are the only honest way to draw a call stack; `stateDiagram-v2` for a
+  lifecycle with a failure branch.
+- **Mermaid by default, ASCII only when it carries more.** ASCII wins for a time axis with
+  a quantity resetting against it. A matrix is neither — use a native markdown table,
+  since mermaid has no table primitive.
+- **Keep cluster nesting at one level**, and never run an edge between two clusters that
+  each contain clusters; it lays out as a maze.
+- **Pin the layout when it matters.** Disconnected clusters are ordered arbitrarily by the
+  renderer — constrain them with invisible links (`A ~~~ B`) rather than by reordering the
+  source, which is a renderer-version accident.
+- **Figure letters are positional** (document order), and every figure is referenced from
+  the prose that depends on it. Adding a figure to an earlier section means renumbering —
+  cheap, because letters are file-local. **Section numbers are not:** §4.x is referenced
+  from source docstrings, tests and UI components, so never renumber a section to make
+  room. Put the figure in the section that already owns the subject.
+- **Only claims checked against the code.** Where a number is carried from the document's
+  own prose rather than re-verified, say so.
+
+These files are not part of the docs site — `gather.js` collects
+`{nodes,packages,apps}/**/docs/**`, and `design/` is not `docs/` — so `builder docs:build`
+neither validates nor publishes them. GitHub's native mermaid rendering is the target;
+there is no mermaid dependency in this repo, so a diagram's real check is viewing the file
+on GitHub.
