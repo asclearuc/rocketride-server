@@ -37,6 +37,7 @@
 
 import { describe, it, expect, jest } from '@jest/globals';
 import { VenvApi } from '../src/client/venv';
+import type { VenvGcReport } from '../src/client/types/venv';
 
 const PROJECT = 'proj-abc';
 const ENV = 'group_1';
@@ -160,5 +161,64 @@ describe('VenvApi.deleteProject', () => {
 		const c = fakeClient();
 		c.call.mockResolvedValueOnce({ deletedEnvironments: 0 });
 		expect(await new VenvApi(c).deleteProject(PROJECT)).toBe(0);
+	});
+});
+
+describe('VenvApi.gc', () => {
+	// Shaped like the server's answer, including a project-level failure row with no envId.
+	// If VenvGcFailed.envId were typed required, this fixture would stop compiling — which is
+	// the cheapest possible check on that shape.
+	const report: VenvGcReport = {
+		dryRun: false,
+		maxAgeSeconds: 30 * 24 * 3600,
+		scanned: 3,
+		collected: [{ projectId: PROJECT, envId: ENV, ageSeconds: 40 * 24 * 3600 }],
+		skipped: [{ projectId: PROJECT, reason: 'live' }],
+		failed: [{ projectId: PROJECT, reason: 'permission denied' }],
+	};
+
+	it('sends only the project when no options are given', async () => {
+		const c = fakeClient();
+		c.call.mockResolvedValueOnce(report);
+		await new VenvApi(c).gc(PROJECT);
+		expect(c.call).toHaveBeenCalledWith('rrext_venv', {
+			subcommand: 'gc',
+			projectId: PROJECT,
+		});
+	});
+
+	it('sends every option in wire spelling', async () => {
+		const c = fakeClient();
+		c.call.mockResolvedValueOnce({ ...report, dryRun: true });
+		await new VenvApi(c).gc(PROJECT, { maxAgeDays: 7, dryRun: true, teamId: TEAM });
+		expect(c.call).toHaveBeenCalledWith('rrext_venv', {
+			subcommand: 'gc',
+			projectId: PROJECT,
+			maxAgeDays: 7,
+			dryRun: true,
+			teamId: TEAM,
+		});
+	});
+
+	it('sends maxAgeDays: 0 rather than dropping it — the server floors it, and 0 is legal', async () => {
+		const c = fakeClient();
+		c.call.mockResolvedValueOnce({ ...report, maxAgeSeconds: 3600 });
+		const result = await new VenvApi(c).gc(PROJECT, { maxAgeDays: 0 });
+		expect(c.call).toHaveBeenCalledWith('rrext_venv', {
+			subcommand: 'gc',
+			projectId: PROJECT,
+			maxAgeDays: 0,
+		});
+		expect(result.maxAgeSeconds).toBe(3600);
+	});
+
+	it('returns the whole report — unwrapping one key would discard the reasons', async () => {
+		const c = fakeClient();
+		c.call.mockResolvedValueOnce(report);
+		const result = await new VenvApi(c).gc(PROJECT);
+		expect(result.scanned).toBe(3);
+		expect(result.collected[0].envId).toBe(ENV);
+		expect(result.skipped[0].reason).toBe('live');
+		expect(result.failed[0].envId).toBeUndefined();
 	});
 });

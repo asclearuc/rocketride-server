@@ -44,9 +44,10 @@ rather than loudly: a server launched from anywhere else would enumerate and pur
 different (empty) tree and report success.
 """
 
+import asyncio
 import os
 import sys
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from ai.common.dap import DAPConn, TransportBase
 
@@ -59,8 +60,9 @@ class VenvCommands(DAPConn):
     DAP router for the ``rrext_venv`` command.
 
     Permissions are **per subcommand**, not one blanket check: ``task.monitor`` for the read,
-    ``task.control`` for the three destructive ones. The gate that actually protects an overlay
-    is "no active run for this project", which is orthogonal to permissions and applies on top.
+    ``task.control`` for the four destructive ones. The gate that actually protects an overlay is
+    "this project is not in use", which is orthogonal to permissions and applies on top — though
+    ``gc`` reads it differently from its siblings: they refuse, it reports the project as skipped.
     """
 
     def __init__(
@@ -79,6 +81,7 @@ class VenvCommands(DAPConn):
             'purge': self._venv_purge,
             'delete_env': self._venv_delete_env,
             'delete_project': self._venv_delete_project,
+            'gc': self._venv_gc,
         }
 
     # =========================================================================
@@ -142,6 +145,28 @@ class VenvCommands(DAPConn):
         """
         if args.get(name):
             raise ValueError(f'{name} {why}')
+
+    @staticmethod
+    def _optional_number(args: Dict[str, Any], name: str) -> Optional[float]:
+        """
+        Return an optional non-negative, finite wire number, or ``None`` when absent.
+
+        Non-finite values are refused rather than passed through: ``float('nan')`` and
+        ``float('inf')`` both parse, and either one reaches the response body, where ``inf`` is not
+        valid JSON and ``nan`` silently compares false against every threshold.
+        """
+        raw = args.get(name)
+        if raw is None or raw == '':
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f'{name} must be a number')
+        if value != value or value in (float('inf'), float('-inf')):
+            raise ValueError(f'{name} must be a finite number')
+        if value < 0:
+            raise ValueError(f'{name} must not be negative')
+        return value
 
     @staticmethod
     def _venv_env():
@@ -209,6 +234,48 @@ class VenvCommands(DAPConn):
         self._refuse_if_running(project_id)
         removed = self._venv_env().delete_project(self._exe_dir(), project_id)
         return self.build_response(request, body={'deletedEnvironments': removed})
+
+    async def _venv_gc(self, request: Dict[str, Any], args: Dict[str, Any]) -> Dict[str, Any]:
+        """Reclaim one project's overlays that nothing has activated for ``maxAgeDays``.
+
+        **Requires ``projectId``, and that is a security boundary rather than ergonomics.** The
+        permission check resolves against the caller's own context, and nothing ties an overlay to
+        a team; what has kept the destructive subcommands tenant-safe is that each needs an id its
+        caller had to know. A whole-tree form would let anyone holding ``task.control`` reclaim
+        every tenant's overlays on this machine, without naming one. The unscoped sweep therefore
+        exists only in the server's own background loop, which answers to no caller.
+
+        **Does not refuse a live project**, unlike ``purge``/``delete_*``: the meaning here is
+        "collect what is safely collectable", so a project in use comes back as a ``skipped`` row
+        and the call succeeds. Callers must not wrap this in a try/except expecting the sibling
+        behaviour.
+        """
+        self._verify_venv_access(args, 'task.control')
+        project_id = self._require(args, 'projectId')
+        self._reject(args, 'envId', 'is not accepted by gc; use purge or delete_env for one environment')
+        max_age_days = self._optional_number(args, 'maxAgeDays')
+
+        ve = self._venv_env()
+        if max_age_days is not None:
+            max_age_seconds = max_age_days * 86400
+        else:
+            # The server's own override, so an operator who set it does not find the command
+            # quietly disagreeing with the background sweep. `is not None` rather than `or`:
+            # zero is a legal override, and the collector's floor already makes it safe.
+            configured = self._server.venv_gc_max_age_seconds
+            max_age_seconds = configured if configured is not None else ve.GC_DEFAULT_MAX_AGE_SECONDS
+
+        # Off the event loop unconditionally. The scan is cheap, but a pass that collects unlinks a
+        # populated site-packages per overlay, and since 8.7A a project holds one per environment.
+        report = await asyncio.to_thread(
+            ve.collect_stale,
+            self._exe_dir(),
+            max_age_seconds,
+            dry_run=bool(args.get('dryRun')),
+            project_id=project_id,
+            is_project_live=self._server.has_registered_project,
+        )
+        return self.build_response(request, body=report)
 
     # =========================================================================
     # ROUTER

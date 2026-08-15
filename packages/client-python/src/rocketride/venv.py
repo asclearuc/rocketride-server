@@ -36,18 +36,22 @@ simply was not there — idempotent success, not a failure — and *raises* when
 the engine refuses, most often because a run of that project is still live.
 Refusal messages come from the engine verbatim; do not rewrite them.
 
+``gc`` is the exception to that second shape and the docstring below says so:
+it never refuses over a live project, it reports one.
+
 Usage:
     overlays = await client.venv.list(project_id='proj-1')
     await client.venv.purge('proj-1', 'group_1')
     await client.venv.delete_env('proj-1', 'group_1')
     removed = await client.venv.delete_project('proj-1')
+    report = await client.venv.gc('proj-1', dry_run=True)
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional
 
-from .types.venv import VenvOverlay
+from .types.venv import VenvGcReport, VenvOverlay
 
 if TYPE_CHECKING:
     from .client import RocketRideClient
@@ -194,3 +198,60 @@ class VenvApi:
             args['teamId'] = team_id
         body = await self._client.call('rrext_venv', **args)
         return body['deletedEnvironments']
+
+    async def gc(
+        self,
+        project_id: str,
+        *,
+        max_age_days: Optional[float] = None,
+        dry_run: bool = False,
+        team_id: str = '',
+    ) -> VenvGcReport:
+        """
+        Reclaim this project's overlays that nothing has activated for a while.
+
+        Where :meth:`purge` and :meth:`delete_env` act on an overlay you name,
+        this one acts on age: it removes the environments of ``project_id``
+        whose newest activity is older than the threshold, and leaves the rest.
+        The server runs the same collection across every project on its own
+        schedule; this is the on-demand, one-project form of it.
+
+        **It does not raise over a live project.** That inverts the rule the
+        rest of this namespace follows: a project in use comes back as a
+        ``skipped`` row and the call succeeds. Wrapping this in a try/except
+        expecting the sibling behaviour will catch nothing.
+
+        ``project_id`` is required, and not for convenience: overlays are
+        machine-local disk state that no team owns, so naming the project is
+        what keeps one caller from reclaiming another's.
+
+        Args:
+            project_id: Pipeline ``project_id``, or the on-disk name from
+                :meth:`list`.
+            max_age_days: Collect overlays idle longer than this. Omitted, the
+                server's own threshold applies. The server also enforces a
+                minimum age, so 0 does not mean "everything" -- read
+                ``maxAgeSeconds`` back to see what was actually applied.
+            dry_run: Report what would go without removing anything.
+            team_id: Resolve the permission against this team.
+
+        Returns:
+            The report, in full: what was collected, what was skipped and why,
+            what failed, how many overlays were examined, and the effective
+            threshold.
+
+        Raises:
+            RuntimeError: The caller lacks ``task.control``, ``project_id`` is
+                missing, or ``max_age_days`` is not a finite, non-negative
+                number.
+        """
+        args = {'subcommand': 'gc', 'projectId': project_id}
+        if max_age_days is not None:
+            args['maxAgeDays'] = max_age_days
+        if dry_run:
+            args['dryRun'] = True
+        if team_id:
+            args['teamId'] = team_id
+        # The report *is* the result -- unlike the siblings there is no single
+        # key worth unwrapping, and dropping the rest would discard the reasons.
+        return await self._client.call('rrext_venv', **args)

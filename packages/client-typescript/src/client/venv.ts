@@ -37,10 +37,19 @@
  * simply was not there — idempotent success, not a failure — and *throws* when
  * the engine refuses, most often because a run of that project is still live.
  * Refusal messages come from the engine verbatim; do not rewrite them.
+ *
+ * {@link VenvApi.gc} is the exception to that second shape, and its docstring
+ * says so: it never throws over a live project, it reports one.
  */
 
 import type { RocketRideClient } from './client.js';
-import type { VenvListOptions, VenvOverlay, VenvScope } from './types/venv.js';
+import type {
+	VenvGcOptions,
+	VenvGcReport,
+	VenvListOptions,
+	VenvOverlay,
+	VenvScope,
+} from './types/venv.js';
 
 // =============================================================================
 // VENV API CLASS
@@ -149,5 +158,42 @@ export class VenvApi {
 			...(scope.teamId ? { teamId: scope.teamId } : {}),
 		});
 		return body.deletedEnvironments;
+	}
+
+	/**
+	 * Reclaims this project's overlays that nothing has activated for a while.
+	 *
+	 * Where {@link purge} and {@link deleteEnv} act on an overlay you name, this
+	 * one acts on age: it removes the environments of `projectId` whose newest
+	 * activity is older than the threshold and leaves the rest. The server runs
+	 * the same collection across every project on its own schedule; this is the
+	 * on-demand, one-project form of it.
+	 *
+	 * **It does not throw over a live project.** That inverts the rule the rest
+	 * of this namespace follows: a project in use comes back as a `skipped` row
+	 * and the call resolves. A try/catch expecting the sibling behaviour catches
+	 * nothing.
+	 *
+	 * `projectId` is required, and not for convenience: overlays are
+	 * machine-local disk state that no team owns, so naming the project is what
+	 * keeps one caller from reclaiming another's.
+	 *
+	 * @param projectId - Pipeline `project_id`, or the on-disk name from {@link list}.
+	 * @param options - Age threshold, dry-run switch, and team scope.
+	 * @returns The whole report: collected, skipped with reasons, failed, the
+	 *   number examined, and the threshold actually applied.
+	 * @throws When the caller lacks `task.control`, or `maxAgeDays` is not a
+	 *   finite, non-negative number.
+	 */
+	async gc(projectId: string, options: VenvGcOptions = {}): Promise<VenvGcReport> {
+		// The report *is* the result — unlike the siblings there is no single key
+		// worth unwrapping, and dropping the rest would discard the reasons.
+		return await this.client.call<VenvGcReport>('rrext_venv', {
+			subcommand: 'gc',
+			projectId,
+			...(options.maxAgeDays !== undefined ? { maxAgeDays: options.maxAgeDays } : {}),
+			...(options.dryRun ? { dryRun: true } : {}),
+			...(options.teamId ? { teamId: options.teamId } : {}),
+		});
 	}
 }

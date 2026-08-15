@@ -2317,6 +2317,10 @@ def ensure_env_scoped(
         # imports come from. use_env() deliberately does only the first.
         activate_env(register_env(paths.env_dir))
         _apply_overlay_path(paths.site_packages)
+        # Last, and outside the install lock: the reclamation side needs to know this overlay is
+        # in use, but a bookkeeping write must never be able to fail a run or mask an activation
+        # error above it. venv_env swallows OSError for the same reason.
+        venv_env.touch_last_used(paths.env_dir)
 
     # Resolved at the one production door, not inside run_scoped_install: the resolvers pop
     # os.environ, and that side effect must not hide in a planning function. Unconditional --

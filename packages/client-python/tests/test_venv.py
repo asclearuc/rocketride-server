@@ -218,3 +218,71 @@ class TestDeleteProject:
         """Zero means the project had no overlays -- idempotent success."""
         api, _ = make_api(return_value={'deletedEnvironments': 0})
         assert await api.delete_project(PROJECT) == 0
+
+
+# =========================================================================
+# gc
+# =========================================================================
+
+
+def _report(**overrides):
+    """A gc report shaped like the server's, including a project-level failure row."""
+    report = {
+        'dryRun': False,
+        'maxAgeSeconds': 30 * 24 * 3600,
+        'scanned': 3,
+        'collected': [{'projectId': PROJECT, 'envId': ENV, 'ageSeconds': 40 * 24 * 3600}],
+        'skipped': [{'projectId': PROJECT, 'reason': 'live'}],
+        # No envId: an unreadable project directory has no single environment to blame, which is
+        # why the type makes that field optional.
+        'failed': [{'projectId': PROJECT, 'reason': 'permission denied'}],
+    }
+    report.update(overrides)
+    return report
+
+
+class TestGc:
+    """Tests for VenvApi.gc."""
+
+    @pytest.mark.asyncio
+    async def test_sends_only_the_project_by_default(self):
+        """Omitted options stay off the wire, so the server applies its own threshold."""
+        api, fake = make_api(return_value=_report())
+        await api.gc(PROJECT)
+        assert fake.last_call == {
+            'command': 'rrext_venv',
+            'subcommand': 'gc',
+            'projectId': PROJECT,
+        }
+
+    @pytest.mark.asyncio
+    async def test_sends_every_option_in_wire_spelling(self):
+        """maxAgeDays/dryRun/teamId are camelCase on the wire; snake_case here would fail loudly."""
+        api, fake = make_api(return_value=_report(dryRun=True))
+        await api.gc(PROJECT, max_age_days=7, dry_run=True, team_id=TEAM)
+        assert fake.last_call == {
+            'command': 'rrext_venv',
+            'subcommand': 'gc',
+            'projectId': PROJECT,
+            'maxAgeDays': 7,
+            'dryRun': True,
+            'teamId': TEAM,
+        }
+
+    @pytest.mark.asyncio
+    async def test_returns_the_whole_report(self):
+        """The report is the result: unwrapping one key would discard the reasons."""
+        api, _ = make_api(return_value=_report())
+        result = await api.gc(PROJECT)
+        assert result['scanned'] == 3
+        assert result['collected'][0]['envId'] == ENV
+        assert result['skipped'][0]['reason'] == 'live'
+        assert 'envId' not in result['failed'][0]
+
+    @pytest.mark.asyncio
+    async def test_max_age_zero_is_sent_rather_than_dropped(self):
+        """0 is a legal threshold, not an absent one -- the server's floor makes it safe."""
+        api, fake = make_api(return_value=_report(maxAgeSeconds=3600))
+        result = await api.gc(PROJECT, max_age_days=0)
+        assert fake.last_call['maxAgeDays'] == 0
+        assert result['maxAgeSeconds'] == 3600, 'the report shows the floor the server applied'

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
@@ -196,6 +197,7 @@ def test_env_paths_names():
     assert os.path.basename(p.constraints) == 'constraints.txt'
     assert os.path.basename(p.hash_file) == 'requirements.hash'
     assert os.path.basename(p.lock_file) == 'install.lock'
+    assert os.path.basename(p.last_used_file) == 'last_used'
 
 
 def test_base_paths_keeps_metadata_and_target_apart():
@@ -648,6 +650,20 @@ def test_list_envs_sizes_are_opt_in(tmp_path):
     assert V.list_envs(str(tmp_path), sizes=True)[0]['bytes'] > 0
 
 
+def test_delete_env_dir_drops_the_hash_before_wiping(tmp_path, monkeypatch):
+    # Same invariant as purge, and the delete path is where it actually bites: the expected
+    # failure is a resident engine holding a .pyd, which aborts the wipe part-way.
+    paths = _make_env(tmp_path, 'proj', 'main')
+
+    def _boom(*_a, **_k):
+        raise OSError('wipe failed midway')
+
+    monkeypatch.setattr(V, '_empty_dir', _boom)
+    with pytest.raises(OSError):
+        V.delete_env(str(tmp_path), 'proj', 'main')
+    assert not os.path.exists(paths.hash_file), 'hash must already be gone when the wipe fails'
+
+
 @pytest.mark.skipif(os.name == 'nt', reason='fcntl is POSIX-only')
 def test_purge_reports_busy_against_a_foreign_flock(tmp_path):
     # flock and lockf do not see each other on Linux, so the wrong primitive evaporates the gate
@@ -661,3 +677,250 @@ def test_purge_reports_busy_against_a_foreign_flock(tmp_path):
         with pytest.raises(V.EnvBusy):
             V.purge_env(str(tmp_path), 'proj', 'main')
         fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+
+
+# --- last_used signal + staleness collection (2C) ----------------------------
+
+
+def _age(paths, seconds_old):
+    """Backdate every mtime the staleness rule can read, and return the stamp used."""
+    stamp = time.time() - seconds_old
+    for path in (
+        paths.last_used_file,
+        paths.hash_file,
+        paths.lock_file,
+        paths.combined,
+        paths.constraints,
+        paths.env_dir,
+    ):
+        if os.path.exists(path):
+            os.utime(path, (stamp, stamp))
+    return stamp
+
+
+_DAY = 24 * 3600
+
+
+def test_touch_last_used_creates_the_file_and_bumps_its_mtime(tmp_path):
+    paths = _make_env(tmp_path, 'proj', 'main')
+    V.touch_last_used(paths.env_dir, now=time.time() - 90 * _DAY)
+    assert os.path.isfile(paths.last_used_file)
+    old = os.stat(paths.last_used_file).st_mtime
+    V.touch_last_used(paths.env_dir)
+    assert os.stat(paths.last_used_file).st_mtime > old
+
+
+def test_touch_last_used_never_creates_the_directory(tmp_path):
+    # A touch racing a collection must not resurrect the overlay as an empty shell for the next
+    # pass to collect again -- so an absent directory is silence, not a mkdir.
+    missing = os.path.join(str(tmp_path), 'venvs', 'gone', 'main')
+    V.touch_last_used(missing)
+    assert not os.path.exists(missing)
+
+
+def test_touch_last_used_swallows_oserror(tmp_path, monkeypatch):
+    paths = _make_env(tmp_path, 'proj', 'main')
+
+    def _boom(*_a, **_k):
+        raise OSError('disk is unhappy')
+
+    monkeypatch.setattr('builtins.open', _boom)
+    V.touch_last_used(paths.env_dir)  # a run must not fail because bookkeeping failed
+
+
+def test_touch_last_used_leaves_the_hash_mtime_alone(tmp_path):
+    # The hash mtime is the "installed at" fact list_envs reports through `installed`; the touch
+    # records use and must not disturb it.
+    paths = _make_env(tmp_path, 'proj', 'main')
+    before = os.stat(paths.hash_file).st_mtime
+    V.touch_last_used(paths.env_dir)
+    assert os.stat(paths.hash_file).st_mtime == before
+
+
+def test_collect_stale_collects_an_old_env(tmp_path):
+    paths = _make_env(tmp_path, 'proj', 'main')
+    V.touch_last_used(paths.env_dir)
+    _age(paths, 60 * _DAY)
+    report = V.collect_stale(str(tmp_path))
+    assert not os.path.isdir(paths.env_dir)
+    assert [(r['projectId'], r['envId']) for r in report['collected']] == [('proj', 'main')]
+    assert report['collected'][0]['ageSeconds'] >= 59 * _DAY
+    assert report['scanned'] == 1
+
+
+def test_collect_stale_keeps_a_fresh_env(tmp_path):
+    paths = _make_env(tmp_path, 'proj', 'main')
+    V.touch_last_used(paths.env_dir)
+    report = V.collect_stale(str(tmp_path))
+    assert os.path.isdir(paths.env_dir)
+    assert report['collected'] == []
+    assert report['scanned'] == 1, 'a kept env is still counted, just not itemised'
+
+
+def test_collect_stale_falls_back_to_the_hash_mtime_for_a_legacy_env(tmp_path):
+    # The 152 directories predate the signal entirely; judged by when they were last installed
+    # they are collectable, which is the whole point of newest-of rather than last_used-only.
+    paths = _make_env(tmp_path, 'legacy', 'main')
+    assert not os.path.exists(paths.last_used_file), 'this case is pointless if the signal exists'
+    _age(paths, 60 * _DAY)
+    assert V.collect_stale(str(tmp_path))['collected'] != []
+    assert not os.path.isdir(paths.env_dir)
+
+
+def test_collect_stale_keeps_a_mid_install_env_with_a_fresh_lock(tmp_path):
+    # depends.FileLock truncates install.lock on acquire, so a live install leaves a fresh lock
+    # even when everything else is old. Newest-of has to see that.
+    paths = _make_env(tmp_path, 'proj', 'main')
+    _age(paths, 60 * _DAY)
+    with open(paths.lock_file, 'wb'):
+        pass
+    assert V.collect_stale(str(tmp_path))['collected'] == []
+    assert os.path.isdir(paths.env_dir)
+
+
+def test_collect_stale_ignores_a_bumped_dir_mtime(tmp_path):
+    # syncDir and uv write into these trees for reasons unrelated to use, so the directory's own
+    # mtime is a fallback only -- counting it would keep stale overlays alive forever.
+    paths = _make_env(tmp_path, 'proj', 'main')
+    _age(paths, 60 * _DAY)
+    now = time.time()
+    os.utime(paths.env_dir, (now, now))
+    assert V.collect_stale(str(tmp_path))['collected'] != []
+
+
+def test_collect_stale_floors_the_threshold_and_echoes_it(tmp_path):
+    paths = _make_env(tmp_path, 'proj', 'main')
+    V.touch_last_used(paths.env_dir)
+    report = V.collect_stale(str(tmp_path), 0)
+    assert report['maxAgeSeconds'] == V.GC_MIN_AGE_SECONDS, 'the report must show the floor, not the 0 asked for'
+    assert report['collected'] == []
+    assert os.path.isdir(paths.env_dir)
+
+
+def test_mtime_is_none_for_a_missing_signal(tmp_path):
+    # try/except rather than exists-then-stat: the collector walks a tree installs are writing,
+    # and requirements.hash is created and removed on exactly that path.
+    assert V._mtime(os.path.join(str(tmp_path), 'not-there')) is None
+
+
+def test_collect_stale_judges_on_whichever_signals_exist(tmp_path):
+    # Only last_used survives here; an env must still be judged rather than skipped as unknown.
+    paths = _make_env(tmp_path, 'proj', 'main')
+    V.touch_last_used(paths.env_dir)
+    os.remove(paths.hash_file)
+    _age(paths, 60 * _DAY)
+    report = V.collect_stale(str(tmp_path))
+    assert report['collected'] != []
+    assert report['failed'] == []
+
+
+def test_collect_stale_skips_a_live_project(tmp_path):
+    paths = _make_env(tmp_path, 'proj', 'main')
+    _age(paths, 60 * _DAY)
+    seen = []
+    report = V.collect_stale(str(tmp_path), is_project_live=lambda name: seen.append(name) or True)
+    assert os.path.isdir(paths.env_dir)
+    assert report['skipped'] == [{'projectId': 'proj', 'reason': 'live'}]
+    assert seen == ['proj'], 'the callback sees the on-disk name, which is what the gate matches'
+    assert report['scanned'] == 0, 'a live project is not walked at all'
+
+
+def test_collect_stale_treats_a_raising_liveness_check_as_live(tmp_path):
+    # Fail closed. Everywhere else a swallowed error costs a reinstall; here it would cost
+    # someone else's running engine -- on Linux, where unlink of an open .so quietly succeeds,
+    # this gate is the only protection there is.
+    paths = _make_env(tmp_path, 'proj', 'main')
+    _age(paths, 60 * _DAY)
+
+    def _broken(_name):
+        raise RuntimeError('registry unavailable')
+
+    report = V.collect_stale(str(tmp_path), is_project_live=_broken)
+    assert os.path.isdir(paths.env_dir), 'an unknown answer must not be read as "safe to delete"'
+    assert len(report['skipped']) == 1
+    assert 'registry unavailable' in report['skipped'][0]['reason']
+
+
+def test_collect_stale_dry_run_deletes_nothing(tmp_path):
+    paths = _make_env(tmp_path, 'proj', 'main')
+    _age(paths, 60 * _DAY)
+    report = V.collect_stale(str(tmp_path), dry_run=True)
+    assert report['dryRun'] is True
+    assert [r['envId'] for r in report['collected']] == ['main']
+    assert os.path.isdir(paths.env_dir), 'dry run reports what would go and touches nothing'
+
+
+def test_collect_stale_reports_env_busy_and_keeps_going(tmp_path, monkeypatch):
+    # Provoked by monkeypatch rather than a real lock: the foreign-flock route is POSIX-only, so
+    # a copy of it here would add a second Windows skip and prove nothing extra about containment.
+    first = _make_env(tmp_path, 'proj', 'aaa')
+    second = _make_env(tmp_path, 'proj', 'zzz')
+    _age(first, 60 * _DAY)
+    _age(second, 60 * _DAY)
+    real = V._delete_env_dir
+
+    def _busy_on_first(directory):
+        if os.path.basename(directory) == 'aaa':
+            raise V.EnvBusy('cannot remove x.pyd - a process may still hold it open')
+        return real(directory)
+
+    monkeypatch.setattr(V, '_delete_env_dir', _busy_on_first)
+    report = V.collect_stale(str(tmp_path))
+    assert report['failed'] == [
+        {'projectId': 'proj', 'envId': 'aaa', 'reason': 'cannot remove x.pyd - a process may still hold it open'}
+    ], 'the engine message names the cause and must travel verbatim'
+    assert [r['envId'] for r in report['collected']] == ['zzz']
+    assert os.path.isdir(first.env_dir) and not os.path.isdir(second.env_dir)
+
+
+def test_collect_stale_contains_a_raw_oserror(tmp_path, monkeypatch):
+    # EnvBusy is a RuntimeError, so catching it alone leaves every raw OSError escaping. Escaping
+    # ends the pass, and since the walk is sorted the next pass dies at the same entry: not a
+    # skipped overlay but a permanently dead collector.
+    first = _make_env(tmp_path, 'proj', 'aaa')
+    second = _make_env(tmp_path, 'proj', 'zzz')
+    _age(first, 60 * _DAY)
+    _age(second, 60 * _DAY)
+    real = V._delete_env_dir
+
+    def _raise_on_first(directory):
+        if os.path.basename(directory) == 'aaa':
+            raise OSError('name too long')
+        return real(directory)
+
+    monkeypatch.setattr(V, '_delete_env_dir', _raise_on_first)
+    report = V.collect_stale(str(tmp_path))
+    assert [r['envId'] for r in report['failed']] == ['aaa']
+    assert [r['envId'] for r in report['collected']] == ['zzz'], 'the later sibling must still be reached'
+
+
+def test_collect_stale_removes_a_childless_project_dir(tmp_path):
+    # Must agree with delete_project and list_envs, or the closing "list shows them gone" is
+    # ambiguous between a bug and an empty shell.
+    paths = _make_env(tmp_path, 'proj', 'main')
+    _age(paths, 60 * _DAY)
+    V.collect_stale(str(tmp_path))
+    assert not os.path.isdir(V.resolve_project_dir(str(tmp_path), 'proj'))
+    assert V.list_envs(str(tmp_path)) == []
+
+
+def test_collect_stale_filter_takes_an_on_disk_name_literally(tmp_path):
+    # short_id is not idempotent, so a name read off disk must not be shortened again -- and the
+    # filter must not quietly widen to the whole tree when it fails to resolve.
+    target = _make_env(tmp_path, 'chain-daa01f80', 'main')
+    other = _make_env(tmp_path, 'untouched', 'main')
+    _age(target, 60 * _DAY)
+    _age(other, 60 * _DAY)
+    on_disk = os.path.basename(os.path.dirname(target.env_dir))
+    assert on_disk != 'chain-daa01f80', 'this case is pointless unless the id actually hashed'
+    report = V.collect_stale(str(tmp_path), project_id=on_disk)
+    assert [r['projectId'] for r in report['collected']] == [on_disk]
+    assert os.path.isdir(other.env_dir), 'the other project must be untouched'
+
+
+def test_collect_stale_absent_root_is_an_empty_report(tmp_path):
+    # A server that never ran a scoped pipeline has no venvs/ at all; raising here would make the
+    # background loop log an error every cycle forever.
+    report = V.collect_stale(str(tmp_path))
+    assert report['scanned'] == 0
+    assert report['collected'] == [] and report['skipped'] == [] and report['failed'] == []

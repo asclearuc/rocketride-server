@@ -33,9 +33,12 @@ Types:
     VenvOverlay: One environment overlay on disk, as returned by
         ``client.venv.list()``. Travels on the wire under the key
         ``environments``; named for what a row is rather than for the wire key.
+    VenvGcCollected / VenvGcSkipped / VenvGcFailed: Row shapes inside a
+        ``client.venv.gc()`` report.
+    VenvGcReport: The whole answer from ``client.venv.gc()``.
 """
 
-from typing import TypedDict
+from typing import List, TypedDict
 
 
 class VenvOverlay(TypedDict, total=False):
@@ -53,3 +56,48 @@ class VenvOverlay(TypedDict, total=False):
     # Size of ``site-packages`` in bytes. Present only when ``sizes`` was
     # requested.
     bytes: int
+
+
+class VenvGcCollected(TypedDict):
+    """One overlay that ``gc`` reclaimed, or would reclaim under ``dry_run``."""
+
+    projectId: str
+    envId: str
+    # Age at the moment of the pass, measured from the newest activity signal.
+    ageSeconds: int
+
+
+class VenvGcSkipped(TypedDict):
+    """One project ``gc`` left alone. Project-level: there is no environment to name."""
+
+    projectId: str
+    # ``'live'`` when the project is in use; otherwise the reason the server
+    # could not tell, which is treated the same way — skipping is the safe answer.
+    reason: str
+
+
+class VenvGcFailed(TypedDict, total=False):
+    """One overlay (or project) ``gc`` could not reclaim."""
+
+    projectId: str
+    # Absent when the failure was project-level, e.g. an unreadable project
+    # directory: there is no single environment to blame. Optional for that
+    # reason and not by oversight.
+    envId: str
+    # The server's own message, carried verbatim because it names the cause —
+    # typically a process still holding a file in the overlay open.
+    reason: str
+
+
+class VenvGcReport(TypedDict):
+    """The result of ``client.venv.gc()``."""
+
+    dryRun: bool
+    # The threshold actually applied, in seconds, **after** the server's minimum
+    # age floor. Asking for 0 and reading this back is how you see the floor.
+    maxAgeSeconds: int
+    # Overlays examined. Environments of a skipped project are not examined.
+    scanned: int
+    collected: List[VenvGcCollected]
+    skipped: List[VenvGcSkipped]
+    failed: List[VenvGcFailed]
