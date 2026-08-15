@@ -31,8 +31,9 @@ import hashlib
 import os
 import re
 import stat
+import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 # Load-bearing, not style: a bare ``import msvcrt`` makes this module UNIMPORTABLE on Linux,
 # and this is precisely the module the POSIX test half loads -- the mistake would surface as
@@ -53,6 +54,16 @@ DEFAULT_ID = 'default'
 
 _ID_MAX = 8  # readable prefix kept from a long id segment
 _HASH_LEN = 8  # hex chars of sha1 over the full id, appended whenever the prefix is lossy
+
+# Sidecar recording that an overlay was activated. The **mtime** is the signal; the one line
+# of content exists so a human reading the directory can tell what the file is for. Named for
+# §4.10's "last use" vocabulary even though it records last *activation* -- see touch_last_used.
+LAST_USED_FILE = 'last_used'
+
+# Age thresholds for collect_stale, exported so the server side has a single source for both
+# the background sweep and the protocol default.
+GC_DEFAULT_MAX_AGE_SECONDS = 30 * 24 * 3600  # 30 days: the shortest default a monthly schedule survives
+GC_MIN_AGE_SECONDS = 3600  # floor under any caller-supplied age, so max_age=0 cannot mean "everything"
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +255,7 @@ class EnvPaths:
     constraints: str
     hash_file: str
     lock_file: str
+    last_used_file: str
 
 
 def env_paths(directory: str) -> EnvPaths:
@@ -255,6 +267,7 @@ def env_paths(directory: str) -> EnvPaths:
         constraints=os.path.join(directory, 'constraints.txt'),
         hash_file=os.path.join(directory, 'requirements.hash'),
         lock_file=os.path.join(directory, 'install.lock'),
+        last_used_file=os.path.join(directory, LAST_USED_FILE),
     )
 
 
@@ -272,7 +285,43 @@ def base_paths(cache_dir: str, site_packages: str) -> EnvPaths:
         constraints=os.path.join(cache_dir, 'constraints.txt'),
         hash_file=os.path.join(cache_dir, 'requirements.hash'),
         lock_file=os.path.join(cache_dir, 'install.lock'),
+        # Inert for the base: nothing touches it and the collector never walks outside venvs/.
+        # Present so the two constructors keep returning the same shape.
+        last_used_file=os.path.join(cache_dir, LAST_USED_FILE),
     )
+
+
+def touch_last_used(env_dir: str, now: Optional[float] = None) -> None:
+    """Record that this overlay was activated. Lock-free, failure-tolerant, never creates the dir.
+
+    Called from the activation path on every scoped **endpoint open** -- which is the granularity
+    the C++ hook offers, so this records last *activation*, not last byte executed. A long-open
+    resident engine therefore writes it once and then looks progressively older while genuinely in
+    use; the server's registry gate, not this timestamp, is what protects that case.
+
+    Three deliberate choices, each of which a refactor would plausibly undo:
+
+    * **No ``makedirs``.** A touch racing a concurrent collection must not resurrect a directory
+      that was just removed, leaving an empty shell for the next pass to collect again.
+    * **Plain truncating write, not tmp+replace.** The reader only ever consults the mtime, so a
+      torn write is harmless, while ``os.replace`` onto a file another engine holds open is an
+      extra Windows failure mode bought for nothing.
+    * **``OSError`` swallowed, not ``Exception``.** A run must never fail because a bookkeeping
+      write failed -- but a logic bug here has to surface in tests rather than hide.
+
+    Args:
+        env_dir: The overlay directory. Absent or unwritable -> silently does nothing.
+        now: Epoch seconds to stamp instead of the current time; injectable so tests can age an
+            overlay deterministically.
+    """
+    path = os.path.join(env_dir, LAST_USED_FILE)
+    try:
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(f'{int(now if now is not None else time.time())}\n')
+        if now is not None:
+            os.utime(path, (now, now))
+    except OSError:
+        pass
 
 
 # env_dir of the base runtime context; overlays are keyed by their directory.
@@ -766,15 +815,22 @@ def purge_env(exe_dir: str, project_id: Optional[str], env_id: Optional[str]) ->
 def _delete_env_dir(directory: str) -> bool:
     """Delete one environment overlay **by path**. Shared by both delete entry points.
 
-    Windows cannot remove the lock file while it is held, hence the order: acquire -> delete
-    everything except ``install.lock`` -> release -> unlink the lock best-effort -> remove the
-    now-empty directory. A failure at either of the last two steps is **not** an error: the
-    environment is already gone in every sense that matters.
+    Windows cannot remove the lock file while it is held, hence the order: acquire -> drop the
+    hash -> delete everything except ``install.lock`` -> release -> unlink the lock best-effort ->
+    remove the now-empty directory. A failure at either of the last two steps is **not** an error:
+    the environment is already gone in every sense that matters.
+
+    **Hash-first, for the same reason as** :func:`purge_env`. The wipe is not atomic and its
+    expected failure is a resident engine holding an imported ``.pyd`` open, which aborts it
+    part-way. Dropping ``requirements.hash`` first makes that outcome a redundant reinstall; the
+    other order leaves a half-emptied ``site-packages`` still marked installed, which the next run
+    imports from. Invisible on every happy path, which is exactly why it is stated here.
     """
     if not os.path.isdir(directory):
         return False
     paths = env_paths(directory)
     with _EnvLock(paths.lock_file):
+        _force_remove(paths.hash_file)
         _empty_dir(directory, keep={os.path.basename(paths.lock_file)})
     try:
         os.unlink(paths.lock_file)
@@ -861,3 +917,154 @@ def list_envs(exe_dir: str, project_id: Optional[str] = None, sizes: bool = Fals
                 row['bytes'] = _dir_size(os.path.join(env.path, 'site-packages'))
             rows.append(row)
     return rows
+
+
+def _mtime(path: str) -> Optional[float]:
+    """Modification time, or ``None`` when the path is unreadable or gone.
+
+    ``try``/``except`` rather than ``exists()`` then ``stat()`` on purpose: this walks a tree that
+    installs are concurrently writing, and ``requirements.hash`` is created and removed on exactly
+    that path. Between the two calls the file can vanish, and the whole question here is only ever
+    "is there a signal", which an absent file already answers.
+    """
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+def _reference_time(paths: EnvPaths) -> Optional[float]:
+    """Newest activity signal for one overlay: ``last_used`` / ``requirements.hash`` / ``install.lock``.
+
+    Newest-of, not a priority chain, so a legacy overlay with no ``last_used`` is still judged by
+    when it was last installed rather than treated as ageless.
+
+    The env directory's own mtime is a **last-resort fallback only**, never a member of the set:
+    ``syncDir`` and ``uv`` write into these trees for reasons that have nothing to do with use, so
+    counting it would keep stale overlays alive forever. As a fallback it covers exactly one case
+    -- a directory with none of the three sidecars, which is either a broken shell or an install
+    caught between ``makedirs`` and its first write, and in the latter case reads as brand new.
+    """
+    stamps = [
+        stamp
+        for stamp in (_mtime(paths.last_used_file), _mtime(paths.hash_file), _mtime(paths.lock_file))
+        if stamp is not None
+    ]
+    if stamps:
+        return max(stamps)
+    return _mtime(paths.env_dir)
+
+
+def collect_stale(
+    exe_dir: str,
+    max_age_seconds: float = GC_DEFAULT_MAX_AGE_SECONDS,
+    *,
+    min_age_seconds: float = GC_MIN_AGE_SECONDS,
+    now: Optional[float] = None,
+    dry_run: bool = False,
+    project_id: Optional[str] = None,
+    is_project_live: Optional[Callable[[str], bool]] = None,
+) -> dict:
+    """Reclaim overlays nothing has activated for ``max_age_seconds``. Report in **wire** spelling.
+
+    This is staleness collection, not reconciliation: no component here can enumerate live
+    projects (documents live on the client machine or in a per-tenant store), so age is the only
+    host-independent signal available. It is safe because an overlay is a rebuildable cache -- the
+    cost of collecting one too early is a redundant reinstall.
+
+    Errors are contained **per environment and per project**, never allowed to end the pass. That
+    is not politeness: an escaping error would abort every remaining directory, and since the walk
+    is sorted, the next pass would abort at the same place -- a collector that silently stops.
+
+    Args:
+        exe_dir: Engine directory; the tree walked is ``<exe_dir>/venvs``.
+        max_age_seconds: Age above which an overlay is collectable, floored by ``min_age_seconds``.
+        min_age_seconds: Hard floor, so ``max_age_seconds=0`` still cannot mean "everything".
+        now: Epoch seconds to judge against; sampled once for the whole pass when omitted, so a
+            long collection does not judge its last directories against a later clock than its first.
+        dry_run: Report what would be collected and touch nothing.
+        project_id: Restrict to one project; resolved literal-first, so a name from
+            :func:`list_envs` and the raw document id both address the same directory.
+        is_project_live: Predicate on the **on-disk** project name. Truthy -> the whole project is
+            skipped. A raising predicate also counts as live: it is the only thing standing between
+            this function and an in-use overlay, so it fails closed.
+
+    Returns:
+        ``{'dryRun', 'maxAgeSeconds', 'scanned', 'collected': [...], 'skipped': [...], 'failed': [...]}``
+        where ``maxAgeSeconds`` is the threshold **after** flooring -- an operator who passes 0 and
+        gets an empty report has to be able to see why. ``failed`` rows carry ``envId`` only when the
+        failure was env-scoped; a project whose directory could not be read has no environment to name.
+    """
+    threshold = max(float(max_age_seconds), float(min_age_seconds))
+    moment = time.time() if now is None else float(now)
+    report = {
+        'dryRun': bool(dry_run),
+        'maxAgeSeconds': int(threshold),
+        'scanned': 0,
+        'collected': [],
+        'skipped': [],
+        'failed': [],
+    }
+
+    root = venv_root(exe_dir)
+    if not os.path.isdir(root):
+        return report
+
+    wanted = _resolve_segment(root, project_id) if project_id else None
+    for project in sorted(os.scandir(root), key=lambda e: e.name):
+        if not project.is_dir(follow_symlinks=False):
+            continue
+        if wanted is not None and project.name != wanted:
+            continue
+
+        if is_project_live is not None:
+            try:
+                live = is_project_live(project.name)
+            except Exception as exc:
+                # Fail closed. Everywhere else in this function a swallowed error costs a
+                # reinstall; here it would cost someone else's running engine.
+                report['skipped'].append({'projectId': project.name, 'reason': f'liveness unknown: {exc}'})
+                continue
+            if live:
+                report['skipped'].append({'projectId': project.name, 'reason': 'live'})
+                continue
+
+        try:
+            entries = sorted(os.scandir(project.path), key=lambda e: e.name)
+        except OSError as exc:
+            report['failed'].append({'projectId': project.name, 'reason': str(exc)})
+            continue
+
+        for env in entries:
+            if not env.is_dir(follow_symlinks=False):
+                continue
+            report['scanned'] += 1
+            reference = _reference_time(env_paths(env.path))
+            if reference is None:
+                continue
+            age = moment - reference
+            if age <= threshold:
+                continue
+            row = {'projectId': project.name, 'envId': env.name, 'ageSeconds': int(age)}
+            if dry_run:
+                report['collected'].append(row)
+                continue
+            try:
+                _delete_env_dir(env.path)
+            except (EnvBusy, OSError) as exc:
+                # EnvBusy is a RuntimeError, so it is not covered by OSError -- both are needed,
+                # and the message travels verbatim because it names the cause (a held .pyd).
+                report['failed'].append({'projectId': project.name, 'envId': env.name, 'reason': str(exc)})
+                continue
+            report['collected'].append(row)
+
+        if not dry_run:
+            # Best-effort, and its failure is the mechanism working: rmdir refuses a non-empty
+            # directory, so an install that created a new environment here wins the race by
+            # construction. There is no ordering in which this removes a directory in use.
+            try:
+                os.rmdir(project.path)
+            except OSError:
+                pass
+
+    return report

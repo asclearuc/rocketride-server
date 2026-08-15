@@ -216,6 +216,31 @@ def test_overlay_skips_the_global_constraints_compile(tmp_path, monkeypatch, res
     assert seen == [ctx.paths.constraints]
 
 
+def test_activation_records_last_used(tmp_path, monkeypatch, restore_active_env):
+    # The only production call site of touch_last_used is a closure inside ensure_env_scoped, so
+    # venv_env's own run_scoped_install tests cannot reach it -- they capture on_overlay with
+    # `overlaid.append` and never invoke it. Stubbing the orchestration and calling the callback
+    # the real code passed is what actually exercises the wiring.
+    paths = V.env_paths(V.env_dir(str(tmp_path), 'proj', 'main'))
+    os.makedirs(paths.site_packages, exist_ok=True)
+    called = []
+
+    def _run(*_args, **kwargs):
+        kwargs['on_overlay'](paths)
+        called.append(True)
+        return paths.site_packages
+
+    monkeypatch.setattr(D, '_get_executable_dir', lambda: str(tmp_path))
+    monkeypatch.setattr(V, 'run_scoped_install', _run)
+    monkeypatch.setattr(D, '_reprove_unproved', lambda *a, **k: None)
+    monkeypatch.setattr(D, '_shadowing_check', lambda *a, **k: None)
+
+    D.ensure_env_scoped('proj', 'main', [])
+
+    assert called, 'the overlay callback must have run'
+    assert os.path.isfile(paths.last_used_file), 'activation is what the reclamation side reads'
+
+
 # --- FileLock reentrancy ----------------------------------------------------
 
 

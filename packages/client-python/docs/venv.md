@@ -39,6 +39,7 @@ about, which is the whole point of asking. Pass `project_id` when you mean
 | `venv.purge(project_id, env_id)` | Empty one environment's `site-packages`, keeping its compiled requirement files |
 | `venv.delete_env(project_id, env_id)` | Remove one environment's overlay directory outright |
 | `venv.delete_project(project_id)` | Remove the whole `venvs/<project_id>/` subtree; returns how many went |
+| `venv.gc(project_id, *, max_age_days=None, dry_run=False)` | Reclaim that project's overlays nothing has used lately; returns a report |
 
 `env_id` is the **container node's id** in the pipeline document. Pass both ids
 raw — the server resolves them literal-first and shortens them itself, exactly
@@ -52,7 +53,32 @@ the pipeline, the registry, or anything else the word "project" might suggest.
 > on the order of half a million `stat` calls on a real tree. Ask for it when
 > you are hunting disk, not on a page that refreshes.
 
+## Collecting by age
+
+`gc` is the odd one out: it names no environment. It removes the overlays of
+one project that nothing has activated for longer than a threshold, and leaves
+the rest — the same collection the server runs across every project on its own
+schedule, aimed at a project you choose.
+
+```python
+report = await client.venv.gc('proj-abc', max_age_days=30, dry_run=True)
+for row in report['collected']:
+    print(row['projectId'], row['envId'], row['ageSeconds'])
+```
+
+Read `maxAgeSeconds` back rather than assuming your own number: the server
+enforces a minimum age, so `max_age_days=0` collects nothing recent and the
+report shows you the floor it applied. `scanned` counts the overlays examined,
+which excludes every environment of a project that was skipped.
+
+`project_id` is required. Overlays are machine-local disk state that no team
+owns, so naming the project is what stops one caller reclaiming another's — the
+unscoped, whole-machine form exists only inside the server.
+
 ## Three outcomes, not two
+
+This section describes the **boolean** methods. `gc` is shaped differently: it
+returns a report and does not raise over a live project (see below).
 
 `purge` and `delete_env` return a bool, and it is **not** pass/fail:
 
@@ -74,11 +100,18 @@ no overlays, not that anything failed.
   can hold an overlay's `.pyd`/`.dll`, and the wipe fails naming the file.
   This is a known residual; the message tells you which process to stop.
 - **Missing arguments or permissions.** `purge` and `delete_env` need both ids;
-  `delete_project` takes no `env_id`. Listing needs `task.monitor`, the
-  destructive three need `task.control`.
+  `delete_project` and `gc` take no `env_id`. Listing needs `task.monitor`, the
+  four destructive methods need `task.control`.
 
 Failures arrive as a `RuntimeError` carrying the server's own text. Show it
 unreworded — it names the cause.
+
+**`gc` does not follow the first rule.** A live project does not make it raise;
+it comes back as a `skipped` row and the call succeeds. Wrapping `gc` in a
+`try`/`except RuntimeError` expecting the sibling behaviour catches nothing —
+check `report['skipped']` instead. It still raises for the last rule, missing
+arguments and permissions, and reports per-overlay problems as `failed` rows
+rather than raising on the first one.
 
 ## Usage
 
@@ -137,11 +170,16 @@ rocketride venv list --sizes                # with byte counts (slow)
 rocketride venv purge proj-abc venv_1       # empty one environment
 rocketride venv delete proj-abc venv_1      # remove one environment
 rocketride venv delete-project proj-abc     # remove a pipeline's subtree
+rocketride venv gc proj-abc --dry-run       # what age would reclaim, without doing it
+rocketride venv gc proj-abc --max-age-days 30 --json
 ```
 
-`venv list` also honours `--json`. The destructive commands print what they are
-about to do and report the count afterwards; there is no confirmation prompt —
-these are scriptable by design.
+`venv list` and `venv gc` honour `--json` — both answer with something worth
+diffing between runs, which the boolean commands do not. The destructive
+commands print what they are about to do and report the count afterwards; there
+is no confirmation prompt — these are scriptable by design. `gc`'s plain output
+always lists the skipped and failed rows in full: those are the half that tells
+you why an overlay survived.
 
 ## On the canvas
 

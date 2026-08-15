@@ -58,6 +58,7 @@ class VenvCommand(BaseCommand):
             'purge': self._cmd_purge,
             'delete': self._cmd_delete,
             'delete-project': self._cmd_delete_project,
+            'gc': self._cmd_gc,
         }
 
     async def execute(self, client: 'RocketRideClient') -> int:
@@ -129,4 +130,33 @@ class VenvCommand(BaseCommand):
         print(f'Deleting the overlay subtree of {project_id}...')
         removed = await client.venv.delete_project(project_id)
         print(f'Removed {removed:,} environment(s) of {project_id}')
+        return 0
+
+    async def _cmd_gc(self, client: 'RocketRideClient') -> int:
+        """Reclaim one project's overlays that nothing has activated for a while."""
+        project_id = self.args.projectId
+        max_age_days = getattr(self.args, 'max_age_days', None)
+        dry_run = bool(getattr(self.args, 'dry_run', False))
+        report = await client.venv.gc(project_id, max_age_days=max_age_days, dry_run=dry_run)
+
+        # --json for the same reason list has it and purge does not: this answers with a report,
+        # which an operator will want to diff between runs or feed to something else.
+        if getattr(self.args, 'json', False):
+            print(json.dumps(report, indent=2))
+            return 0
+
+        days = report['maxAgeSeconds'] / 86400
+        verb = 'Would collect' if report['dryRun'] else 'Collected'
+        print(f'Idle longer than {days:,.1f} day(s), of {report["scanned"]:,} overlay(s) examined:')
+        for row in report['collected']:
+            age = row['ageSeconds'] / 86400
+            print(f'  {verb.lower()} {row["projectId"]}/{row["envId"]}  idle {age:,.1f} day(s)')
+        # Skips and failures are the interesting half: a live project is normal, a failure names
+        # the process still holding the overlay. Never summarise these away.
+        for row in report['skipped']:
+            print(f'  skipped {row["projectId"]}  ({row["reason"]})')
+        for row in report['failed']:
+            target = f'{row["projectId"]}/{row["envId"]}' if row.get('envId') else row['projectId']
+            print(f'  FAILED  {target}  {row["reason"]}')
+        print(f'    {len(report["collected"]):>8,} {verb.lower()}, {len(report["failed"]):,} failed')
         return 0

@@ -20,6 +20,7 @@ Focus areas:
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import socket
 import sys
@@ -28,6 +29,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from ai.constants import CONST_VENV_GC_DELAY_TIME
 from ai.modules.task import task_server as task_server_module
 from ai.modules.task.task_server import TaskServer
 from ai.modules.task.types import TaskError
@@ -1191,3 +1193,81 @@ def test_a_control_without_a_project_id_is_skipped():
     ts = _make_server()
     ts._task_control['tk_1'] = _project_control(None, complete=False)
     assert ts.has_active_project_run('chain-daa01f80') is False
+
+
+# ---------------------------------------------------------------------------
+# has_registered_project + the overlay collection loop (2C)
+# ---------------------------------------------------------------------------
+
+
+def test_a_completed_run_still_counts_as_registered():
+    # The deliberate opposite of the gate above, and the one the collector uses: completion is
+    # not "the process is gone" -- a ttl-resident engine still holds the overlay's .pyd open.
+    ts = _make_server()
+    ts._task_control['tk_1'] = _project_control('chain-daa01f80', complete=True)
+    assert ts.has_active_project_run('chain-daa01f80') is False
+    assert ts.has_registered_project('chain-daa01f80') is True
+
+
+def test_registered_project_matches_the_shortened_form_too():
+    import venv_env
+
+    ts = _make_server()
+    ts._task_control['tk_1'] = _project_control('chain-daa01f80', complete=True)
+    on_disk = venv_env.short_id('chain-daa01f80')
+    assert on_disk != 'chain-daa01f80', 'this case is pointless unless the id actually hashed'
+    assert ts.has_registered_project(on_disk) is True
+    assert ts.has_registered_project('other-proj') is False
+
+
+async def test_venv_gc_starts_by_default_and_the_flag_stops_it():
+    ts = _make_server()
+    ts._bg_tasks = []
+    ts._start_venv_gc()
+    assert len(ts._bg_tasks) == 1
+    for task in ts._bg_tasks:
+        task.cancel()
+
+    disabled = _make_server(config={'venv_gc_disabled': True})
+    disabled._bg_tasks = []
+    disabled._start_venv_gc()
+    assert disabled._bg_tasks == []
+
+
+async def test_venv_gc_loop_waits_before_its_first_pass(monkeypatch):
+    # Startup is when cold installs are writing into these trees, which is the worst moment to
+    # walk them -- so the delay is the mechanism, not a nicety.
+    ts = _make_server()
+    slept = []
+
+    async def _sleep(seconds):
+        slept.append(seconds)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, 'sleep', _sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await ts._venv_gc_loop()
+    assert slept == [CONST_VENV_GC_DELAY_TIME], 'nothing may be collected before the first delay'
+
+
+async def test_venv_gc_loop_survives_a_failing_pass(monkeypatch):
+    # A pass that escapes takes the next pass with it: the walk is ordered, so the loop would die
+    # at the same entry forever. The symptom is a collector that silently stops.
+    ts = _make_server()
+    ts._venv_gc_max_age_seconds = None
+    calls = []
+
+    async def _to_thread(fn, *args, **kwargs):
+        calls.append(kwargs)
+        raise OSError('unreadable directory')
+
+    async def _sleep(_seconds):
+        if len(calls) >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, 'to_thread', _to_thread)
+    monkeypatch.setattr(asyncio, 'sleep', _sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await ts._venv_gc_loop()
+    assert len(calls) == 2, 'the loop must come back for another pass after a failure'
+    assert ts.debug_message.called

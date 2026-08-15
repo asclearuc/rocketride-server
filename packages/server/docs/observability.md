@@ -261,6 +261,7 @@ Enumerates and reclaims the per-environment `site-packages` overlays under `<exe
 | `purge`          | `projectId`, `envId`                   | `task.control` | `{ purged: bool }`         |
 | `delete_env`     | `projectId`, `envId`                   | `task.control` | `{ deleted: bool }`        |
 | `delete_project` | `projectId`                            | `task.control` | `{ deletedEnvironments: n }` |
+| `gc`             | `projectId`, `maxAgeDays?`, `dryRun?`  | `task.control` | a report — see below       |
 
 - **`purge`** empties an environment's `site-packages` and keeps `combined.txt` /
   `constraints.txt`. It drops `requirements.hash` first, so the next run reinstalls from a
@@ -275,12 +276,39 @@ Enumerates and reclaims the per-environment `site-packages` overlays under `<exe
 - **`teamId` is optional.** Present, the permission resolves against that team; absent, against
   the caller's default context. It is a caller-asserted scope check — overlays are machine-local
   disk state and are **not** team-owned.
-- **Gated on "no active run for this project"**, matched against both the raw and the shortened
-  id form. The gate is per *project*, not per environment. Two residuals, accepted for v1: the
-  check-then-act race between the gate and the wipe, and — the one that will look like a bug
-  report — a `ttl`-resident engine that still holds an overlay's `.pyd`/`.dll` open makes the
-  wipe fail with a named busy error on Windows. Completion is not the same as "the process is
-  gone"; stop the engines first.
+- **`purge`, `delete_env` and `delete_project` are gated on "no active run for this project"**,
+  matched against both the raw and the shortened id form. The gate is per *project*, not per
+  environment. Two residuals, accepted for v1: the check-then-act race between the gate and the
+  wipe, and — the one that will look like a bug report — a `ttl`-resident engine that still holds
+  an overlay's `.pyd`/`.dll` open makes the wipe fail with a named busy error on Windows.
+  Completion is not the same as "the process is gone"; stop the engines first.
+- **`gc` reads that gate differently: it reports rather than refuses.** A project in use comes
+  back as a `skipped` row and the call succeeds, because the meaning of `gc` is "collect what is
+  safely collectable". It also uses the wider predicate — *any* registry entry for the project,
+  complete or not — since a finished-but-resident engine still holds its overlay open. On Windows
+  a busy overlay surfaces as a `failed` row carrying the engine's message; on Linux the same
+  situation cannot be detected at all, because unlinking a file another process holds open
+  succeeds there. The gate, not the error, is what protects a running engine.
+- **`gc` answers with a report, not a boolean:** `{ dryRun, maxAgeSeconds, scanned, collected[],
+  skipped[], failed[] }`. `maxAgeSeconds` is the threshold **after** the server's minimum-age
+  floor, which is how asking for `maxAgeDays: 0` and getting nothing back explains itself. A
+  `failed` row carries `envId` only when the failure was environment-scoped — an unreadable
+  project directory has none to name. `projectId` is **required**: the unscoped, whole-machine
+  form exists only in the server's own background pass, because a caller-facing version of it
+  would let anyone holding `task.control` reclaim every other tenant's overlays without naming
+  one.
+- **An overlay is collected on age, not on ownership.** The signal is a `last_used` file in the
+  environment directory, written every time a run activates that overlay; where it is absent
+  (overlays built before this existed) the newest of `requirements.hash` and `install.lock`
+  stands in. "Last used" therefore means "last activated" — a long-running resident engine writes
+  it once at startup, which is why the registry gate rather than the timestamp is what keeps its
+  overlay safe.
+- **The server collects on its own, too.** A background pass starts 15 minutes after boot and
+  repeats every 6 hours, over every project rather than one. Start the server with
+  `--venv-gc-disabled` to switch it off, and set `ROCKETRIDE_VENV_GC_MAX_AGE_DAYS` to override
+  the 30-day threshold for both the pass and the `gc` subcommand. The pass logs a line only when
+  something happened; visibility depends on the engine's debug level. Note it walks the overlay
+  root of *its own* executable, so a server started from outside its `dist` quietly finds nothing.
 - **You rarely need the wire.** Both SDKs wrap this command as `client.venv`
   ([TypeScript](/develop/typescript/methods/venv) · [Python](/develop/python/venv)), both CLIs
   expose it as `rocketride venv …`, and the editors put purge and delete on the container

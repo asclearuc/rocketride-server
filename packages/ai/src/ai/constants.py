@@ -118,6 +118,12 @@ CONST_LOG_KF_OPEN_CEILING = 4096
 CONST_CLEANUP_DELAY_TIME = 5 * 60  # seconds grace period to keep completed tasks (5 minutes)
 CONST_CLEANUP_SLEEP_TIME = 1 * 60  # seconds between cleanup scans (1 minute)
 
+# venv overlay collection. The first pass is delayed rather than run at startup on purpose:
+# startup is when cold installs are writing into these same trees, which is the worst possible
+# moment to walk them. The cadence is deliberately slow — reclaiming disk is not urgent work.
+CONST_VENV_GC_DELAY_TIME = 15 * 60  # seconds before the first collection pass (15 minutes)
+CONST_VENV_GC_SLEEP_TIME = 6 * 3600  # seconds between collection passes (6 hours)
+
 # =============================================================================
 # Web Server Configuration
 # =============================================================================

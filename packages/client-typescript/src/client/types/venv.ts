@@ -89,3 +89,81 @@ export interface VenvListOptions extends VenvScope {
 	 */
 	sizes?: boolean;
 }
+
+/**
+ * Parameters for `client.venv.gc()`. The project is a positional argument, not
+ * part of this bag: it is required, and an options object hides that.
+ */
+export interface VenvGcOptions extends VenvScope {
+	/**
+	 * Collect overlays idle longer than this. Omitted, the server's own
+	 * threshold applies. The server enforces a minimum age on top, so `0` does
+	 * not mean "everything" — read {@link VenvGcReport.maxAgeSeconds} back to
+	 * see what was actually applied.
+	 */
+	maxAgeDays?: number;
+
+	/** Report what would be collected without removing anything. */
+	dryRun?: boolean;
+}
+
+/** One overlay `gc` reclaimed, or would reclaim under `dryRun`. */
+export interface VenvGcCollected {
+	projectId: string;
+	envId: string;
+
+	/** Age at the moment of the pass, measured from the newest activity signal. */
+	ageSeconds: number;
+}
+
+/** One project `gc` left alone. Project-level: there is no environment to name. */
+export interface VenvGcSkipped {
+	projectId: string;
+
+	/**
+	 * `'live'` when the project is in use; otherwise the reason the server could
+	 * not tell, which is treated the same way — skipping is the safe answer.
+	 */
+	reason: string;
+}
+
+/** One overlay, or one project, `gc` could not reclaim. */
+export interface VenvGcFailed {
+	projectId: string;
+
+	/**
+	 * Absent when the failure was project-level, e.g. an unreadable project
+	 * directory: there is no single environment to blame. Optional for that
+	 * reason and not by oversight.
+	 */
+	envId?: string;
+
+	/**
+	 * The server's own message, carried verbatim because it names the cause —
+	 * typically a process still holding a file in the overlay open.
+	 */
+	reason: string;
+}
+
+/**
+ * The result of `client.venv.gc()`.
+ *
+ * Note this is a report rather than the boolean its destructive siblings
+ * return: `gc` does not refuse over a live project, it reports one as skipped.
+ */
+export interface VenvGcReport {
+	dryRun: boolean;
+
+	/**
+	 * The threshold actually applied, in seconds, **after** the server's minimum
+	 * age floor. Asking for 0 and reading this back is how you see the floor.
+	 */
+	maxAgeSeconds: number;
+
+	/** Overlays examined. Environments of a skipped project are not examined. */
+	scanned: number;
+
+	collected: VenvGcCollected[];
+	skipped: VenvGcSkipped[];
+	failed: VenvGcFailed[];
+}

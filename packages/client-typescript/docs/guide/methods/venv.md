@@ -6,6 +6,7 @@ date: 2026-08-12
 - [Overview](#overview)
 - [Whose disk](#whose-disk)
 - [Methods](#methods)
+- [Collecting by age](#collecting-by-age)
 - [Three outcomes, not two](#three-outcomes-not-two)
 - [When the server refuses](#when-the-server-refuses)
 - [Usage Examples](#usage-examples)
@@ -49,6 +50,7 @@ when you mean "this pipeline's".
 | `venv.purge(projectId, envId)` | Empty one environment's `site-packages`, keeping its compiled requirement files |
 | `venv.deleteEnv(projectId, envId)` | Remove one environment's overlay directory outright |
 | `venv.deleteProject(projectId)` | Remove the whole `venvs/<projectId>/` subtree; returns how many went |
+| `venv.gc(projectId, options?)` | Reclaim that project's overlays nothing has used lately; returns a report |
 
 `envId` is the **container node's id** in the pipeline document. Pass both ids
 raw — the server resolves them literal-first and shortens them itself, exactly
@@ -62,7 +64,34 @@ the pipeline, the registry, or anything else the word "project" might suggest.
 > on the order of half a million `stat` calls on a real tree. Ask for it when
 > you are hunting disk, not on a page that refreshes.
 
+## **Collecting by age**
+
+`gc` is the odd one out: it names no environment. It removes the overlays of
+one project that nothing has activated for longer than a threshold, and leaves
+the rest — the same collection the server runs across every project on its own
+schedule, aimed at a project you choose.
+
+```typescript
+const report = await client.venv.gc('proj-abc', { maxAgeDays: 30, dryRun: true });
+for (const row of report.collected) {
+    console.log(row.projectId, row.envId, row.ageSeconds);
+}
+```
+
+Read `maxAgeSeconds` back rather than assuming your own number: the server
+enforces a minimum age, so `maxAgeDays: 0` collects nothing recent and the
+report shows you the floor it applied. `scanned` counts the overlays examined,
+which excludes every environment of a project that was skipped.
+
+`projectId` is a required positional argument rather than part of the options
+bag. Overlays are machine-local disk state that no team owns, so naming the
+project is what stops one caller reclaiming another's — the unscoped,
+whole-machine form exists only inside the server.
+
 ## **Three outcomes, not two**
+
+This section describes the **boolean** methods. `gc` is shaped differently: it
+returns a report and does not throw over a live project (see below).
 
 `purge` and `deleteEnv` return a boolean, and it is **not** pass/fail:
 
@@ -84,11 +113,18 @@ no overlays, not that anything failed.
   can hold an overlay's `.pyd`/`.dll`, and the wipe fails naming the file.
   This is a known residual; the message tells you which process to stop.
 - **Missing arguments or permissions.** `purge` and `deleteEnv` need both ids;
-  `deleteProject` takes no `envId`. Listing needs `task.monitor`, the
-  destructive three need `task.control`.
+  `deleteProject` and `gc` take no `envId`. Listing needs `task.monitor`, the
+  four destructive methods need `task.control`.
 
 Failures arrive as a thrown `Error` carrying the server's own text. Show it
 unreworded — it names the cause.
+
+**`gc` does not follow the first rule.** A live project does not make it throw;
+it comes back as a `skipped` row and the promise resolves. A `try`/`catch`
+expecting the sibling behaviour catches nothing — check `report.skipped`
+instead. It still throws for the last rule, missing arguments and permissions,
+and reports per-overlay problems as `failed` rows rather than throwing on the
+first one.
 
 ## **Usage Examples**
 
@@ -135,10 +171,17 @@ rocketride venv list --sizes                # with byte counts (slow)
 rocketride venv purge proj-abc venv_1       # empty one environment
 rocketride venv delete proj-abc venv_1      # remove one environment
 rocketride venv delete-project proj-abc     # remove a pipeline's subtree
+rocketride venv gc proj-abc --dry-run       # what age would reclaim, without doing it
+rocketride venv gc proj-abc --max-age-days 30 --json
 ```
 
 The destructive commands print what they are about to do and report the count
 afterwards. There is no confirmation prompt — these are scriptable by design.
+
+`gc` takes `--json` for the same reason `list` does and `purge` does not: it
+answers with a report worth diffing between runs, not a boolean. Its plain
+output always lists the skipped and failed rows in full — those are the half
+that tells you why an overlay survived.
 
 ## **On the canvas**
 

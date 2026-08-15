@@ -111,6 +111,14 @@ Examples:
         help='Enable SaaS account implementation (requires extension overlay)',
     )
 
+    # Overlay collection. Named for the collector rather than "--gc-disabled" so the help says
+    # which one, and so a second collector later need not fight for the generic name.
+    parser.add_argument(
+        '--venv-gc-disabled',
+        action='store_true',
+        help='Disable background reclamation of unused per-environment venv overlays',
+    )
+
     return parser
 
 
@@ -137,6 +145,8 @@ async def run(config: Dict[str, Any] = None) -> None:
         config['modelserver'] = args.modelserver
         config['base_port'] = args.base_port
         config['verbose'] = args.verbose
+        # Reaches TaskServer as server.config; it takes no config argument of its own.
+        config['venv_gc_disabled'] = args.venv_gc_disabled
 
     if config.get('modelserver'):
         print(f'  Model Server: {config["modelserver"]}')

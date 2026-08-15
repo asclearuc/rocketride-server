@@ -67,6 +67,7 @@ Central orchestration server managing:
 
 import time
 import errno
+import os
 import socket
 import sys
 import asyncio
@@ -82,6 +83,8 @@ from ai.constants import (
     CONST_TTL_CHECK,
     CONST_MAX_UNAUTHED_CONNS_PER_IP,
     CONST_MAX_UNAUTHED_IPS,
+    CONST_VENV_GC_DELAY_TIME,
+    CONST_VENV_GC_SLEEP_TIME,
 )
 from ai.common.dap import TransportWebSocket, DAPBase
 from rocketride import TASK_STATUS, EVENT_TYPE
@@ -291,6 +294,12 @@ class TaskServer(DAPBase):
         self._server = server
         self._config = server.config
 
+        # Overlay collection is configured from here, which is why it starts after the two lines
+        # above rather than inside the list literal: _bg_tasks is built before _config exists.
+        # Read as an attribute rather than looked up at use time so a test instance can seed it.
+        self._venv_gc_max_age_seconds = self._read_venv_gc_max_age()
+        self._start_venv_gc()
+
         # Register authentication handler for our keys
         server.add_authenticator(self.authenticate)
 
@@ -366,6 +375,103 @@ class TaskServer(DAPBase):
 
             # Wait before next cleanup cycle
             await asyncio.sleep(CONST_CLEANUP_SLEEP_TIME)
+
+    def _read_venv_gc_max_age(self) -> Optional[float]:
+        """
+        Resolve ``ROCKETRIDE_VENV_GC_MAX_AGE_DAYS`` into seconds, or ``None`` to use the default.
+
+        Read with a plain ``os.environ.get`` rather than ``venv_env``'s pop-on-read idiom, and the
+        difference is not stylistic: that idiom exists because node code runs inside the *engine*
+        process and could observe or rewrite the variable mid-run. This process hosts no node code.
+
+        Returns:
+            Seconds, or None when unset or unparsable (the collector then applies its own default).
+        """
+        raw = (os.environ.get('ROCKETRIDE_VENV_GC_MAX_AGE_DAYS') or '').strip()
+        if not raw:
+            return None
+        try:
+            days = float(raw)
+        except ValueError:
+            self.debug_message(f'Ignoring unparsable ROCKETRIDE_VENV_GC_MAX_AGE_DAYS: {raw!r}')
+            return None
+        if days < 0:
+            self.debug_message(f'Ignoring negative ROCKETRIDE_VENV_GC_MAX_AGE_DAYS: {raw!r}')
+            return None
+        return days * 86400
+
+    @property
+    def venv_gc_max_age_seconds(self) -> Optional[float]:
+        """The operator's overlay-age override in seconds, or None when unset.
+
+        Exposed so the ``rrext_venv gc`` handler defaults to the same threshold this server's
+        background pass uses; without it an operator's override would apply to the sweep and be
+        silently ignored by the command.
+        """
+        return self._venv_gc_max_age_seconds
+
+    def _start_venv_gc(self) -> None:
+        """Start the overlay collection loop unless ``--venv-gc-disabled`` was passed.
+
+        A separate method rather than two lines in ``__init__`` because ``__init__`` is bypassed by
+        the test helper in ``test_task_server.py``; welded inline, this decision would be untestable.
+        """
+        if self._config.get('venv_gc_disabled'):
+            return
+        self._bg_tasks.append(asyncio.create_task(self._venv_gc_loop()))
+
+    async def _venv_gc_loop(self) -> None:
+        """
+        Background reclamation of per-environment overlays that nothing has activated in a while.
+
+        Deliberately **not** a startup sweep: the first pass waits, because startup is exactly when
+        cold installs are writing into the same trees. Thereafter it runs on a slow cadence — disk
+        reclamation is never urgent, and every pass competes with real work for I/O.
+
+        Two properties this loop must keep, both of which a plausible simplification would break:
+
+        * **The wipe runs off the event loop.** Collecting one overlay unlinks a populated
+          ``site-packages`` (thousands of files); done inline, every connection waits on it.
+        * **Nothing escapes.** ``collect_stale`` contains its own per-entry failures, and the outer
+          handler catches whatever is left, so a single bad directory cannot end the loop. A pass
+          that dies takes the *next* pass with it, since the walk is ordered and would abort at the
+          same place — the failure mode is a collector that silently stops.
+
+        Cancellation reaches this coroutine, not the worker thread: a wipe already in progress
+        finishes and interpreter exit joins it. That is the right trade — an interrupted wipe is the
+        half-emptied state the hash-first ordering exists to prevent — but it can briefly delay
+        shutdown.
+        """
+        await asyncio.sleep(CONST_VENV_GC_DELAY_TIME)
+        while True:
+            try:
+                # Guarded like every other venv_env use here: the library lives on the engine's
+                # sys.path, and a deployment without it has nothing for this loop to do. Ordered
+                # before the general handler, or the import failure is retried every cycle forever.
+                import venv_env
+
+                exe_dir = os.path.dirname(sys.executable)
+                kwargs = {'is_project_live': self.has_registered_project}
+                if self._venv_gc_max_age_seconds is not None:
+                    kwargs['max_age_seconds'] = self._venv_gc_max_age_seconds
+                report = await asyncio.to_thread(venv_env.collect_stale, exe_dir, **kwargs)
+
+                # Report anything that is not a routine "still in use" skip. A condition of
+                # "collected or failed" would stay silent while a broken liveness gate turned
+                # every project into a skip and collection quietly stopped happening.
+                noteworthy = [row for row in report['skipped'] if row.get('reason') != 'live']
+                if report['collected'] or report['failed'] or noteworthy:
+                    self.debug_message(
+                        f'venv gc: collected {len(report["collected"])}, '
+                        f'failed {len(report["failed"])}, skipped {len(report["skipped"])} '
+                        f'of {report["scanned"]} scanned'
+                    )
+            except ImportError:
+                return
+            except Exception as e:
+                self.debug_message(f'Error during venv gc cycle: {e}')
+
+            await asyncio.sleep(CONST_VENV_GC_SLEEP_TIME)
 
     async def _monitor_ttl(self) -> None:
         """
@@ -680,6 +786,41 @@ class TaskServer(DAPBase):
         Returns:
             True if a task of that project exists and is not complete.
         """
+        return self._project_in_registry(project_id, include_complete=False)
+
+    def has_registered_project(self, project_id: str) -> bool:
+        """
+        Whether ``project_id`` appears in the task registry **at all**, complete or not.
+
+        The deliberate opposite of :meth:`has_active_project_run`'s exclusion, and the gate the
+        venv **collector** uses. Completion is not the same as "the process is gone": a
+        ``ttl``-resident engine that imported from an overlay still holds its ``.pyd``/``.dll``
+        open, and its registry entry outlives the run by design. Reclaiming on "not active" would
+        therefore delete out from under a live process.
+
+        Presence is a strict superset of active, so the collector needs this one alone — and it
+        must stay a presence scan: on POSIX, unlinking an open ``.so`` succeeds silently, which
+        makes this predicate the only protection there is rather than a second line of defence.
+
+        Args:
+            project_id: Raw document id or the on-disk (shortened) name.
+
+        Returns:
+            True if any task of that project is registered, regardless of completion.
+        """
+        return self._project_in_registry(project_id, include_complete=True)
+
+    def _project_in_registry(self, project_id: str, *, include_complete: bool) -> bool:
+        """
+        Shared body of the two project gates; they differ only in whether completion skips.
+
+        Args:
+            project_id: Raw document id or the on-disk (shortened) name.
+            include_complete: Count entries whose task has finished.
+
+        Returns:
+            True on the first matching registry entry.
+        """
         try:
             import venv_env  # engine sys.path only; same guarded idiom as Task._venv_scoping_enabled
 
@@ -691,7 +832,7 @@ class TaskServer(DAPBase):
         for control in list(self._task_control.values()):
             if not control or not control.project_id:
                 continue
-            if control.task.is_task_complete():
+            if not include_complete and control.task.is_task_complete():
                 continue
             if given == control.project_id:
                 return True
