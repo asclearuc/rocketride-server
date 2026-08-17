@@ -197,9 +197,9 @@ scope); and **the env id travels in opposite directions at the two ends** — as
 popped from main (§4.15).
 
 *This is the ordering view only. `ProcessGuard` appears here as a participant and is **defined** in
-**§4.10, figures C–G** — what the processes are, what bounds their lifetime, the order the guard is
+**§4.10, figures D–H** — what the processes are, what bounds their lifetime, the order the guard is
 driven in, how one child reaches readiness and what its budget actually measures. The env-id
-asymmetry in the last clause is **§4.15, figure I**.*
+asymmetry in the last clause is **§4.15, figure K**.*
 
 **View 2 — messages: one socket per child, and no socket between children.**
 
@@ -355,9 +355,6 @@ the task-start path in `task_engine.py`. Modeled on / generalizing `prepare_pipe
 so the document the engine *receives* has never been drawn. Same running example as §3.1 and §4.10:
 `webhook → [v1] → [v2] → response`, under `scoped=True`.
 
-*Drawn as two diagrams rather than one. A single chart has to nest six clusters and then run an edge
-between two of them, which lays out as a maze — and "before" and "after" are two claims, not one.*
-
 **View 1 — the authoring document.** One `.pipe`, containers nested, three edges crossing a boundary.
 
 ```mermaid
@@ -418,7 +415,7 @@ edge exists in no document at all** — it was cut at both ends, and what replac
 main-graph edge `BR1 → BR2` (§4.6, step 8.3).
 
 Each bridge node's config carries `channelId`, `returnChannelId` and `lanes` at this point;
-`urlProcess` is empty and gets filled at spawn by `inject_venv_urls` (§4.10, figure C), because the
+`urlProcess` is empty and gets filled at spawn by `inject_venv_urls` (§4.10, figure D), because the
 port does not exist yet. Under `scoped=False` none of view 2 is built: the same call returns a single
 flat document with every container flattened, isolated or not.
 
@@ -769,11 +766,6 @@ sockets:     bridge ↔ child venv1, bridge ↔ child venv2   (no venv1↔venv2 
 **Figure B — the anatomy of one boundary.** The star above says there is one socket per child; this
 says what is *on* it. Drawn because the return-path paragraph in §7 is the densest prose in the
 document and it describes a structure nobody has seen.
-
-*Two diagrams again, and for a sharper reason: the load-bearing claim here is that the egress's
-`callRemote` **nests inside** the ingress loop's `callLocal`. Nesting is a property of a call stack
-over time, and no flowchart can draw it — view 2 is a sequence diagram precisely because activation
-bars can.*
 
 **View 1 — where the parts live, and what the one socket binds to.** No data flows in this view; it
 is the static picture. The socket is drawn as a node only because it fans out to two bindings.
@@ -1359,6 +1351,43 @@ imports live **exclusively in the local (no-model-server) branch**. Implications
   mode; the flag is a **footprint optimization, not a conflict fix**.
 
 ### 4.9 Directory layout, identity & keying
+
+**Figure C — the layout, and which process writes each entry.**
+
+```text
+ <exe>/
+ |
+ +-- lib/site-packages/          BASE -- engine runtime only, shared by EVERY process.
+ |                               Written by the startup compile. (Target state: ai/**
+ |                               still lands here at bootstrap -- the residual is below.)
+ +-- cache/
+ |   +-- constraints.txt         GLOBAL -- governs ONLY the base runtime and the legacy
+ |   |                           path (=0, and auto without a venv). Under =1 the
+ |   |                           nodes/** glob is NARROWED, not dropped.
+ |   +-- models/<name>/          SHARED weights, resolved from sys.executable. A child
+ |                               runs the same unmoved engine.exe, so it resolves the
+ |                               same path -- weights are not packages, so not per-env.
+ +-- venvs/                      sibling of lib/ and cache/, NOT under cache/
+     +-- <project_id>/
+         +-- main/               env_id "main" is an environment like any other
+         |   +-- site-packages/     <- uv pip install --target, by the process owning the env
+         |   +-- combined.txt       <- that env's OWN requirement set, scoped to its nodes
+         |   +-- constraints.txt    <- compiled from that combined.txt ALONE, no global base
+         |   +-- requirements.hash  <- drift detector; an unchanged mtime means no rebuild
+         |   +-- install.lock       <- one lock per env dir, never the global one
+         |   +-- last_used          <- 2C-GC: the MTIME is the signal, content is never parsed
+         +-- <group_id>/         one per isolated group, same six entries
+         +-- <group_id>/
+```
+
+Three properties of the shape rather than of any one file. **Granularity is per environment, not per
+project** — `main` and every group each get their own `constraints.txt`, which is precisely what lets
+one env hold `torch 2.0` while its neighbour holds `2.1`. **The per-env `install.lock` cost nothing to
+build**: `env_paths()` had always placed it at `<env_dir>/install.lock`, so it became per-environment
+the moment 8.7A gave environments distinct directories — the code was written for it and then starved
+of them. And **`cache/models/` is deliberately outside all of this**, because isolating weights per
+environment would multiply gigabytes to solve a problem nobody has.
+
 - `<exe>/lib/site-packages` — **base = engine runtime only** (engLib + bundled deps); **no node deps**.
   *The target, not today's state:* node deps are already out, but base still receives `ai/**` at
   startup bootstrap — the residual and its reopening trigger are below, under "base is not yet
@@ -1606,13 +1635,13 @@ Findings behind the cost estimate, to re-verify when the question is reopened:
 now it was reconstructible only from §3.1's sequence view plus §7's step-7 paragraph and the three
 "superseded on these points" corrections stacked on it — which is a reading order nobody finds. The
 figures and §3.1 answer different questions and neither replaces the other: *§3.1, view 1* is **what
-spawns when**; these are **what the processes are** (C), **what bounds their lifetime** (D), **in
-what order the guard is driven** (E), **what one child's spawn actually does, failure path included**
-(F), and **what the readiness budget measures** (G). *A sixth closes the section rather than opening
-it:* **figure H**, how one overlay is judged for collection, sits with the reclamation policy at the
+spawns when**; these are **what the processes are** (D), **what bounds their lifetime** (E), **in
+what order the guard is driven** (F), **what one child's spawn actually does, failure path included**
+(G), and **what the readiness budget measures** (H). *A sixth closes the section rather than opening
+it:* **figure I**, how one overlay is judged for collection, sits with the reclamation policy at the
 end because it is about a directory's life, not a process's.
 
-**Figure C — the process tree of a scoped run.** Every box is the *same* `engine` binary in a
+**Figure D — the process tree of a scoped run.** Every box is the *same* `engine` binary in a
 different role: the server runs `ai/eaas.py`, every task subprocess runs `ai/node.py`
 (`CONST_AI_NODE_SCRIPT`) against a task file.
 
@@ -1628,9 +1657,9 @@ flowchart TB
 
     subgraph GUARDED["GUARDED SET - created only on the scoped path<br/>Windows: one anonymous Job Object with KILL_ON_JOB_CLOSE, handle held by P0<br/>POSIX: each member leads its own process group, one pgid recorded per assign"]
         direction TB
-        P1["P1 - engine ai/node.py v1.task<br/>--autoterm --monitor=app --data_port=8001 --data_host=127.0.0.1<br/>plus inherited --trace, --node_path, --modelserver<br/>env CLIENT_ID, VENV_TOKEN, VENV_ENV_ID=v1, VENV_ISOLATED=1 - figure I<br/>overlay venvs/proj/v1 with its own install.lock<br/>venv_source_stub mounts /venv/pipe, announces ready, then blocks"]
+        P1["P1 - engine ai/node.py v1.task<br/>--autoterm --monitor=app --data_port=8001 --data_host=127.0.0.1<br/>plus inherited --trace, --node_path, --modelserver<br/>env CLIENT_ID, VENV_TOKEN, VENV_ENV_ID=v1, VENV_ISOLATED=1 - figure K<br/>overlay venvs/proj/v1 with its own install.lock<br/>venv_source_stub mounts /venv/pipe, announces ready, then blocks"]
         P2["P2 - engine ai/node.py v2.task<br/>--data_port=8002, env VENV_ENV_ID=v2<br/>overlay venvs/proj/v2<br/>spawned only after P1 is ready - strictly sequential"]
-        PM["PM - engine ai/node.py main.task<br/>--autoterm --monitor=app --data_port=9000<br/>env CLIENT_ID, VENV_TOKEN, VENV_ISOLATED, and VENV_ENV_ID POPPED - figure I<br/>overlay venvs/proj/main<br/>runs main's graph, its venv bridge nodes dial P1 and P2"]
+        PM["PM - engine ai/node.py main.task<br/>--autoterm --monitor=app --data_port=9000<br/>env CLIENT_ID, VENV_TOKEN, VENV_ISOLATED, and VENV_ENV_ID POPPED - figure K<br/>overlay venvs/proj/main<br/>runs main's graph, its venv bridge nodes dial P1 and P2"]
         GK["G1 ffmpeg in ai/common/avi/reader.py - G2 uv - G3 audio loaders, model servers<br/>no --autoterm and no pipe to P0<br/>the orphan class 8.5B exists for"]
     end
 
@@ -1648,12 +1677,11 @@ spawn is the main-engine spawn with a different script argument, task file and e
 why `venv_spawn` mirrors `task_engine` rather than inventing a launcher. **The guard holds PM, not
 only the children** — under `=0` that same `ffmpeg`/`uv`/model-server load runs inside the main
 engine, so excluding it would leave the commonest case uncovered. And **grandchildren hang off the
-engines, never off the server**, which is exactly why F1's obvious test proves nothing (figure D).
+engines, never off the server**, which is exactly why F1's obvious test proves nothing (figure E).
 
-**Figure D — what actually bounds a process's life.** Three mechanisms, three different coverages;
+**Figure E — what actually bounds a process's life.** Three mechanisms, three different coverages;
 the document states them in three separate places and never crosses them, which is what makes the
 one uncovered cell easy to miss.
-
 
 | mechanism | engines `P1 P2 PM` | grandchildren `G1 G2 G3` | after an **abrupt** server death (`kill -9` of P0) |
 | --- | :---: | :---: | --- |
@@ -1670,7 +1698,7 @@ nothing — while **column 2 was covered by nothing at all** until 8.5B. That is
 the increment, and it is invisible in any one row. The residual cell is argued below (`PR_SET_PDEATHSIG`
 is refused, not overlooked), and the honest-coverage bullet says which cells CI has ever executed.
 
-**Figure E — the order the guard is driven in, and the two orderings that are correctness.**
+**Figure F — the order the guard is driven in, and the two orderings that are correctness.**
 
 ```mermaid
 sequenceDiagram
@@ -1719,7 +1747,7 @@ invalidates the handle — a "create if `None`" guard would assign a restarted t
 handle, every `assign` would fail into its deliberate no-op degradation, and orphan safety would
 disappear without a symptom.
 
-**Figure F — one child's spawn, failure path included.** Figure E is the guard's view across the
+**Figure G — one child's spawn, failure path included.** Figure F is the guard's view across the
 whole run; this is one child end to end. Drawn because the failure branch is the half that only
 exists as prose in §7, and it is the branch that runs on someone's first `=1` pipeline.
 
@@ -1762,9 +1790,7 @@ finish, which would truncate exactly the lines the error is about to quote. And 
 not a failure** — it is the pre-8.5 behaviour kept deliberately, so a reworded status line on the node
 side costs latency rather than the run.
 
-**Figure G — the readiness budget is a ceiling on silence, not on elapsed time.** *ASCII rather than
-mermaid here: the point is a quantity that resets against a time axis, and neither `gantt` nor a
-sequence diagram can draw a budget being refunded.*
+**Figure H — the readiness budget is a ceiling on silence, not on elapsed time.**
 
 ```text
    t=0        10s        20s        30s        40s        50s        60s
@@ -1804,7 +1830,7 @@ drawn in **§3.1, view 1**.*
   and until 2C-GC it outlived everything else too. Its end is now age: the reclamation policy at the
   end of this section collects an overlay nothing activates.
 - **Orphan safety is OS-level, and the two platforms do NOT deliver the same guarantee (8.5B).**
-  Written as two claims on purpose; one sentence covering both would be false. *Figure D is the map
+  Written as two claims on purpose; one sentence covering both would be false. *Figure E is the map
   and these two bullets are the detail — the platform split is the bottom two rows of it.*
   - **Windows: kernel-enforced, whole tree, unconditional.** The server holds an **anonymous** Job
     Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; every venv child *and* the main engine are
@@ -1836,7 +1862,7 @@ drawn in **§3.1, view 1**.*
 - **Install timing:** lazy on first run + opt-in deploy-time pre-warm; reuse `depends.py`'s existing
   install-progress reporting verbatim (`updateProgress` / heartbeat / sidecar), tagged per env.
   **Readiness is proved by the child, and the spawn's patience is bounded by silence (8.5A —
-  figure G).** A
+  figure H).** A
   child announces `/venv/pipe` after mounting it, and the parent's budget resets on any event from
   that child, so a first run that compiles and installs is waited for rather than killed at a fixed
   deadline. **First-run cost, stated because it is real:** `_spawn_venv_children` awaits each child
@@ -1940,7 +1966,7 @@ drawn in **§3.1, view 1**.*
     account `IStore`, scoped per user or team and possibly remote, never at `<exe>`; and neither
     host sees the other's. "The entity is gone" is therefore unanswerable from here.
     What ships instead is age: an overlay nothing has activated for `GC_DEFAULT_MAX_AGE_SECONDS`
-    (30 days, floored by an hour) is collected — figure H is the decision for one overlay. Safe
+    (30 days, floored by an hour) is collected — figure I is the decision for one overlay. Safe
     because an overlay is a rebuildable cache —
     a premature collection costs one reinstall — and honest because it makes no claim to know
     what still exists. The signal is a `last_used` sidecar written at activation, so it means
@@ -1968,7 +1994,7 @@ drawn in **§3.1, view 1**.*
     pod. Age-based collection provably cannot help there: a pod's writable layer starts empty, so
     nothing in it is ever old. `last_used` ships now as LRU's ready input.
 
-**Figure H — how one overlay is judged, and the two places the answer is deliberately asymmetric.**
+**Figure I — how one overlay is judged, and the two places the answer is deliberately asymmetric.**
 
 ```mermaid
 flowchart TD
@@ -2000,6 +2026,37 @@ answer that (see the bullet above), and drawing it would imply a check that no c
 The venv child runs the **original `engine.exe`, unmoved**; the overlay's `site-packages` goes
 **ahead of base** on `sys.path` for **overlay precedence** (venv `torch` wins; appending would let
 base shadow it). **`PYTHONPATH` won't work** (isolated `PyConfig`); use the runtime insert.
+
+**Figure J — the precedence stack, and the two ways to get it wrong.**
+
+```text
+  sys.path inside a venv child engine
+  =====================================================================
+  [0]  <exe>/venvs/<project_id>/<env_id>/site-packages    <-- THE OVERLAY
+       Inserted at runtime by _apply_overlay_path, through ensure_env_scoped's
+       on_overlay callback. The CHILD computes this path itself from
+       ROCKETRIDE_VENV_ENV_ID -- nobody hands it one (8.7A).
+  ---------------------------------------------------------------------
+  [1]  <exe>/lib/site-packages                            <-- BASE
+       engine runtime, shared by every process on the machine
+  ---------------------------------------------------------------------
+  [2]  stdlib, and the rest of the usual
+  =====================================================================
+
+  WRONG WAY 1 -- append instead of insert:
+      base would shadow the overlay, `import torch` resolves to base's torch,
+      and the whole feature is inert while appearing to be wired up.
+
+  WRONG WAY 2 -- reach for PYTHONPATH:
+      the engine embeds Python with an ISOLATED PyConfig, which ignores it.
+      The insert must happen at runtime, inside the process that needs it.
+```
+
+Position `[0]` is the entire mechanism, and §8.3's headline acceptance is what proves it rather than
+asserts it: `tabulate==0.8.10` and `==0.9.0` — a mutually unsatisfiable pair — both imported in one
+pipeline, each from its own overlay, with **no `tabulate` in main's `site-packages` at all**. The two
+report different *files* as well as different versions (`tabulate.py` versus `tabulate/__init__.py`),
+which is independent evidence that they are two distributions rather than one counted twice.
 
 **Correction (measured) — now history; the variable is gone as of 8.7A.** This section once said
 "the bootstrap reads `ROCKETRIDE_VENV_SITE`". It never did, and nothing else did either: searched
@@ -2291,7 +2348,7 @@ an environment variable at all — the collector is switched off with the server
 `--venv-gc-disabled`, deliberately, since an operator killing a background sweep should be doing it
 where the process is launched rather than through the environment a run inherits.
 
-**Figure I — who sets each variable, who strips it, and who freezes it.** The prose above makes the
+**Figure K — who sets each variable, who strips it, and who freezes it.** The prose above makes the
 argument; the figure is what an auditor reads. Drawn because "assigned to a child, popped from main"
 is stated in three places (§3.1, here, and 8.7A) and still lands as an oddity rather than a rule.
 
@@ -2331,6 +2388,28 @@ would install into a sibling's. Nothing in the figure is symmetric by accident.
 resolution it would govern and silently has no effect. Putting the switch there therefore does not work
 today. Closing this properly means moving the engine's `load_dotenv` ahead of dependency resolution, not
 teaching `venv_env` to parse the file.
+
+**Figure L — the gate, in full.** Two inputs, one function (`scoping_enabled`), six cases.
+
+| `ROCKETRIDE_SERVER_USE_VENV` | mode | isolated group in the document? | `scoping_enabled` | what actually runs |
+| --- | --- | :---: | :---: | --- |
+| `0` | `off` | no | **false** | legacy single process, global-glob `constraints.txt` |
+| `0` | `off` | **yes** | **false** | the isolated group is **demoted** to a plain group and flattened — never an error |
+| unset, or any other value | `auto` | no | **false** | byte-for-byte the legacy path |
+| unset | `auto` | **yes** | **true** | partition, spawn children, per-env scoping — this is what 8.7B turned on |
+| `1` | `on` | no | **true** | no children to spawn, but main still scopes into `venvs/<proj>/main` |
+| `1` | `on` | **yes** | **true** | the full path |
+
+**`off` short-circuits on its first branch, before the document fact is ever consulted** — and that
+is precisely what makes it safe to broadcast `ROCKETRIDE_VENV_ISOLATED` as a *raw fact* rather than a
+resolved decision. `scoping_enabled(USE_OFF, True)` is `False` however stale that variable gets, so
+the `=0` floor stays inside a function every process calls instead of resting on the discipline of
+whoever stamps the environment. The consequence to state plainly rather than hide: **under `=0` a
+document with an isolated group still gets the variable stamped, and it is inert.**
+
+Row 5 is the one people forget — `=1` **also** narrows the `nodes/**` glob in the global startup
+compile to `nodes/requirement*.txt` (§4.9), so it changes the base compile even for a pipeline with
+no venv in it at all.
 
 - **Unset (default) = auto — IMPLEMENTED as of 8.7B.** The partitioner inspects the *resolved*
   pipeline: an `isolated` group present → venv runtime **and** per-environment scoping; none
@@ -3121,6 +3200,65 @@ reproduce the build's index configuration (an earlier attempt died on an unrelat
 ---
 
 ## 7. Phased implementation plan
+
+**Figure M — what unblocked what.** This section is long and written as a running log, so the
+*order* is visible while the *dependencies* are not; the edges below are the ones the entries state
+about themselves, not inferred ones.
+
+> **This figure dates faster than anything else in the document.** It is a map of a phase plan that
+> is still moving. Where it and a §7 entry disagree, **the entry is authoritative** — and the figure
+> is the thing to fix.
+
+```mermaid
+flowchart TB
+    subgraph P2A["Phase 2A - foundation, independently shippable"]
+        A["2A - per-environment requirement scoping<br/>DONE except the base shrink"]
+    end
+
+    subgraph P2B["Phase 2B - the venv runtime"]
+        direction TB
+        I1["1 - flatten containers, structural validation<br/>closes the dropped-members bug on its own"]
+        I2["2 - the cut: per-env sub-documents,<br/>bridge pairs, routing table, cycle detection"]
+        I7["7 - local spawn and transport,<br/>live round trip"]
+        I81["8.1 - one bridge node per environment,<br/>all its lanes on one socket"]
+        I82["8.2 - response and failure merge-back"]
+        I83["8.3 - graph serialization:<br/>venv to venv, and chains"]
+        I84["8.4A and 8.4B - DAP stdio pump,<br/>event fan-in"]
+        I85A["8.5A - readiness by the child's own<br/>announcement, bounded by silence"]
+        I85B["8.5B - ProcessGuard,<br/>orphan-safe teardown"]
+        I7S["8.7S - freeze the mode switch<br/>at process init"]
+        I7A["8.7A - the child's own env id,<br/>F6 closed"]
+        I7B["8.7B - scoping under the default auto mode"]
+        I86["8.6 - engine-side purge, delete, list"]
+    end
+
+    subgraph P2C["Phase 2C - polish and scale"]
+        GC["2C-GC - the overlay collector"]
+        REST["still deferred: LRU under disk pressure,<br/>OS-ACL local IPC, direct venv-to-venv mesh,<br/>shared memory for large AV buffers"]
+    end
+
+    A --> I1
+    I1 --> I2
+    I2 --> I7
+    I7 --> I81
+    I81 --> I83
+    I7 --> I82
+    I7 --> I84
+    I84 --> I85A
+    I85A --> I85B
+    I7S --> I7A
+    I7A --> I7B
+    I7A --> I86
+    I86 --> GC
+    GC --> REST
+```
+
+Two chains and one hinge. The **left chain is the data path** — flatten, cut, spawn, then widen what
+may cross a boundary (8.1, then 8.3). The **right chain is the environment** — freeze the switch,
+give each child its own id, then extend that to the default mode. `8.7A` is the hinge: it is what
+finally produced per-group overlays, which made disk growth real, which is why `8.6` and then
+`2C-GC` follow it rather than the data path. `8.4A` earns its edge to `8.5A` for a concrete reason —
+readiness is proved by an event the stdio pump delivers, so the pump had to exist first.
 
 **Phase 1 — this design document.** (Done; pauses for review.)
 
