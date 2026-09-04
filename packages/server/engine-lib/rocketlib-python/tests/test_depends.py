@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import pkg_families
+
 try:
     import depends
 
@@ -32,6 +34,22 @@ def _write(path, text='x\n'):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding='utf-8')
     return path
+
+
+def _bump_the_declared_namespace_version(monkeypatch):
+    """Edit the cv2 declaration the only way a test can: swap the registry it comes from.
+
+    The same shape as in test_depends_constraints.py, which proves the other cache folds
+    the declarations in — both keys have to, and neither proves anything about the other.
+    """
+    cv2 = pkg_families.family_by_name('cv2')
+    moved = pkg_families.Family(
+        name=cv2.name,
+        import_name=cv2.import_name,
+        members=cv2.members,
+        namespace_version='9.9.9',
+    )
+    monkeypatch.setattr(pkg_families, '_registry', lambda: (moved,))
 
 
 class TestFindRequirementFiles:
@@ -300,6 +318,34 @@ class TestSatisfiedVerdict:
         self._cold_process(env)
 
         assert len(env.resolves) == 2
+
+    def test_family_declaration_change_reruns_the_resolve(self, env, monkeypatch):
+        """The declarations are the one input no file walk can reach.
+
+        They live in lib/pkg_families/, which no requirements glob and no include walk ever
+        opens, and the exclusion set a resolve is handed is composed out of them. A key blind
+        to them keeps reporting "satisfied" across the edit that changed what a resolve would
+        conclude — the same silence the closure and the installed-set fields exist to prevent.
+        """
+        env.constraints.write_text('opencv-python-headless==4.13.0.92\n', encoding='utf-8')
+        self._cold_process(env)
+
+        _bump_the_declared_namespace_version(monkeypatch)
+        self._cold_process(env)
+
+        assert len(env.resolves) == 2
+
+    def test_a_family_free_environment_keeps_its_verdict(self, env, monkeypatch):
+        """The other half, and the reason the test above cannot stand alone: folding the
+        declarations in unconditionally would satisfy it just as well, and every environment
+        holding no family member would lose its verdict to a declaration it never uses.
+        """
+        self._cold_process(env)
+
+        _bump_the_declared_namespace_version(monkeypatch)
+        self._cold_process(env)
+
+        assert len(env.resolves) == 1
 
     def test_installed_set_change_reruns_the_resolve(self, env):
         """Any change to the installed dist-info set invalidates the verdict."""
