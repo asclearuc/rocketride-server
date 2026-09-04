@@ -61,6 +61,34 @@ let clientId = 0;
  * const result = await pipe.close();
  * ```
  */
+// WebSocket close codes mean the transport gave up, not that the caller got something wrong.
+// Matched as text because the message is all that crosses back from the server.
+const TRANSPORT_CLOSE = ['sent 100', 'received 100', 'sent 101', 'received 101'];
+
+/**
+ * Troubleshooting text for a failed pipe open, chosen by what the failure was.
+ *
+ * A transport close is never a wrong token or a wrong MIME type, and offering that checklist
+ * against one sends the reader looking in the wrong place.
+ */
+function openFailureHint(message: string): string {
+	if (TRANSPORT_CLOSE.some((marker) => message.includes(marker))) {
+		return (
+			'The connection was closed by one side, so this is not a token, source or MIME type problem. ' +
+			'The close code says which:\n' +
+			"- 1009: a frame was larger than the receiver's limit\n" +
+			'- 1011: keepalive expired -- the peer was busy and did not answer a ping\n' +
+			'The full reason is in the server log; this message is what crossed back.\n'
+		);
+	}
+	return (
+		'Common causes:\n' +
+		"- Pipeline isn't running (wrong token or task terminated)\n" +
+		'- Pipeline source must be chat, webhook, or dropper\n' +
+		"- MIME type doesn't match the source lane (try mimeType='text/plain')\n"
+	);
+}
+
 export class DataPipe {
 	private _client: RocketRideClient;
 	private _token: string;
@@ -145,7 +173,7 @@ export class DataPipe {
 			// The server's message stays the message: an application may show it to
 			// an end user. The developer checklist rides along as `hint`
 			// (PipeException.hint), and `code` classifies the failure.
-			const hint = 'Common causes:\n' + "- Pipeline isn't running (wrong token or task terminated)\n" + '- Pipeline source must be chat, webhook, or dropper\n' + "- MIME type doesn't match the source lane (try mimeType='text/plain')\n";
+			const hint = openFailureHint(response.message || '');
 			throw new PipeException({ ...response, message: response.message || 'Failed to open a data pipe.', hint });
 		}
 

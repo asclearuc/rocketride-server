@@ -4469,11 +4469,11 @@ change — `run_log.py`'s encoder and `log-codec.ts`'s decoder in lockstep — w
 log volume actually bites), and a per-environment renderer for those traces, which the tagged
 `body.env` now makes possible but which no client has yet.
 
-**OPEN — transport defects a real dataset exposed (2026-09-04/05).** Three fixed and measured,
-four open, plus two that belong to other areas. The findings, the measurements and an ordered list
-of what to do next are in **§8.3.1**; they are not repeated here. Read that list before starting
-anything in this phase — its first item is that the fixes themselves are still unlanded and
-ungated.
+**OPEN — transport defects a real dataset exposed (2026-09-04/05).** Five fixed and measured, five
+open, plus two that belong to other areas. The findings, the measurements and an ordered list of
+what is left are in **§8.3.1**; they are not repeated here. Read that list before starting
+anything in this phase — the closed items are kept in place, so it also shows what has already
+been tried.
 
 **DONE — 2C-GC: overlays are reclaimed by age.** One increment out of Phase 2C, which stays open
 around it (A1/D1, the debug UX §5 defers here, the second-run collision). What shipped:
@@ -5229,47 +5229,41 @@ doesn't match". None of those was ever the cause. The real line was in the serve
 and the hint sent two separate investigations in the wrong direction before the close code was read.
 
 **Open items, in the order they are worth doing.** Ordered by what unblocks the rest, not by
-severity: the first two cost minutes and stop the next investigation from being misled the way both
-of this session's were.
+severity. Closed items keep their place rather than being deleted, so the order stays readable and
+a reader can see what was already tried.
 
-0. **Land what is already fixed.** Three transport changes sit in the working tree unreviewed and
-   ungated: `MAX_FRAME_SIZE` in `nodes/venv/base`, `ping_interval=None` in `nodes/venv/client`, and
-   `config['internal']` in `ai/web/server.py` + `ai/node.py`. Each is measured above; none has been
-   through `builder test`, `nodes:test` or `ai:test`. Do this before anything below, or the next
-   run cannot tell a new defect from an unlanded one.
+- ~~**Land what was fixed.**~~ Done: the funnel in `8142d849`, the three transport changes in
+  `ea6889a5`, both through `server:run-rocketlib-test` 326/1, `ai:test` 2874/124 and `nodes:test`
+  4435/230 — the last unchanged from before them.
+- ~~**Stop the SDK's generic hint from hiding transport failures.**~~ Done in the commit that struck this line out. The
+  checklist was duplicated in both SDKs and attached unconditionally, so a WebSocket close arrived
+  claiming a wrong token or MIME type. Each SDK now picks the hint from the failure: a message
+  naming a close code gets that code's meaning and a pointer at the server log.
+- ~~**Say `ttl` when the reason is `ttl`.**~~ Done in the commit that struck this line out. `stop_task` already used `reason`
+  correctly for the recorded outcome and then logged `Task stopped by user request` regardless.
 
-1. **Stop the SDK's generic hint from hiding transport failures.** A pipe failure reaches the caller
-   as "Pipeline isn't running / source must be chat, webhook or dropper / MIME type doesn't match"
-   whatever actually happened; the close code and the real message stay in the server console. Two
-   separate investigations here went the wrong way because of it. Surface the close code and the
-   underlying text; keep the hint for the cases it was written for.
-
-2. **Say `ttl` when the reason is `ttl`.** `stop_task(reason)` receives it and logs
-   `Task stopped by user request`, which is how a TTL expiry came to look like a human pressing stop.
-   One line.
-
-3. **Answer a caller whose object was in flight when its task died.** Measured: no error, no close,
+1. **Answer a caller whose object was in flight when its task died.** Measured: no error, no close,
    still waiting nine minutes later. `DataConn.disconnect()` fails its remaining pipes but dies with
    the task process, so it cannot reach an external caller — the missing notification is on the eaas
    side. **Establish the mechanism first**; the fix is not obvious from the task side.
 
-4. **Decide what TTL is measuring.** Today it restarts on `_send_data`, i.e. on arrival, so a single
+2. **Decide what TTL is measuring.** Today it restarts on `_send_data`, i.e. on arrival, so a single
    object slower than the TTL kills its own task while it is working. Either count processing as
    activity, or separate "no inbound data" from "doing nothing" and act differently on each.
 
-5. **Find where the time goes above one in-flight object.** 36 s at `--max-concurrent 1`, 316 s at 2
+3. **Find where the time goes above one in-flight object.** 36 s at `--max-concurrent 1`, 316 s at 2
    and at 3, identical. Unmeasured, and the obvious suspect is not the bridge: `parse` is a C++ node
    reaching Java over JNI with one `g_jvm` per process. Until this is measured, "concurrency does not
    help" is an observation without a cause, and the pipeline shape (three `parse` over one document)
    may be the real answer.
 
-6. **Decide whether the bridge socket needs a lock.** One socket per child, `m_threadCount` engine
+4. **Decide whether the bridge socket needs a lock.** One socket per child, `m_threadCount` engine
    worker threads, no lock in `nodes/venv/base/IInstance.py`. The GIL covers the Python that touches
    it; `websockets.sync` releases the GIL during I/O. The answer may well be "no lock needed", but it
    should be argued rather than inherited — §4.6's correctness argument currently rests on the
    process being single-threaded, which it is not.
 
-7. **Chunk AV across the bridge (step 7).** Raising `max_size` moved the ceiling to 250 MB; one
+5. **Chunk AV across the bridge (step 7).** Raising `max_size` moved the ceiling to 250 MB; one
    `write*` is still one frame, so a larger buffer fails the same way. Already owed by `lanes.py`.
 
 Two items belong to other areas and are recorded here only because this is where they surfaced:
