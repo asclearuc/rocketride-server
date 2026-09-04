@@ -11,6 +11,14 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'lib'))
 
+try:
+    from rocketlib import IInstanceBase  # noqa: F401
+except ImportError:
+    # test_media_normalization subclasses an engine-only base at module level, so a skipif
+    # marker fires too late — and one collection error takes the whole directory down with
+    # it. Under the engine interpreter the import succeeds and the file runs normally.
+    collect_ignore = ['test_media_normalization.py']
+
 
 @pytest.fixture(autouse=True)
 def fresh_venv_env_cache():

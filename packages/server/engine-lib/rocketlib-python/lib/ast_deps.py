@@ -104,6 +104,7 @@ _NON_REQUIREMENT_TOPS = frozenset(
         'traceback',
         'uuid',
         'random',
+        'statistics',
         'struct',
         'datetime',
         'shutil',

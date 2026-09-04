@@ -294,6 +294,48 @@ def test_shadowing_is_checked_even_when_there_is_nothing_to_do(monkeypatch, tmp_
     assert '4.13.0.92' in str(raised.value) and '4.11.0.86' in str(raised.value)
 
 
+def test_a_refused_environment_records_no_satisfied_verdict(monkeypatch, tmp_path):
+    """Order matters between the two checks above and the verdict cache, not just tidiness.
+
+    ``_verdict_cached`` returns far above this branch, so a verdict written over a pending
+    refusal is not merely premature: the next process skips the resolve, never reaches the
+    check, and never repeats the advice. The refusal would be given exactly once, by
+    whichever process happened to be first, and silently never again.
+    """
+    _load_cv2_from(monkeypatch, tmp_path, '4.13.0.92')
+    monkeypatch.setattr(D, '_install_dry_run', lambda *a, **k: [])
+    monkeypatch.setattr(D, '_family_work', lambda *a, **k: [])
+    recorded = []
+    monkeypatch.setattr(D, '_save_verdict', lambda *a, **k: recorded.append(a))
+
+    requirements = tmp_path / 'r.txt'
+    requirements.write_text('numpy\n', encoding='utf-8')
+    constraints = _constraints(tmp_path, 'opencv-python-headless==4.11.0.86\n')
+
+    with pytest.raises(D.RestartRequired):
+        D._install_requirements_inner(str(requirements), constraints)
+
+    assert recorded == [], 'a refused environment must not be cached as satisfied'
+
+
+def test_an_agreeing_environment_with_nothing_to_do_still_records_the_verdict(monkeypatch, tmp_path):
+    """The other half, and the reason the test above cannot stand alone: deleting the record
+    entirely would satisfy it just as well, and every cold process would pay the resolve again.
+    """
+    monkeypatch.setattr(D, '_install_dry_run', lambda *a, **k: [])
+    monkeypatch.setattr(D, '_family_work', lambda *a, **k: [])
+    recorded = []
+    monkeypatch.setattr(D, '_save_verdict', lambda *a, **k: recorded.append(a))
+
+    requirements = tmp_path / 'r.txt'
+    requirements.write_text('numpy\n', encoding='utf-8')
+    constraints = _constraints(tmp_path, 'numpy==2.5.1\n')
+
+    D._install_requirements_inner(str(requirements), constraints)
+
+    assert len(recorded) == 1, 'a clean environment with nothing to do must still be cached'
+
+
 def test_the_shadowing_check_costs_nothing_when_the_namespace_is_not_loaded(monkeypatch, tmp_path):
     """A ``sys.modules`` lookup per registered family; the resolution is read only past that.
     ``builder nodes:test`` makes a great many ``depends()`` calls, and this one is on all of them.
