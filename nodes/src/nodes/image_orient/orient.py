@@ -31,7 +31,7 @@ releases it on return.
 """
 
 import numpy as np
-from ai.common.opencv import cv2
+import cv2
 from ai.common.utils import source_quality
 from rocketlib import debug, warning
 

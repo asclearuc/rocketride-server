@@ -57,9 +57,16 @@ def _load_recognizer_module():
         'ai.common.config': types.SimpleNamespace(
             Config=types.SimpleNamespace(getNodeConfig=lambda *a, **k: {}),
         ),
-        'ai.common.models': types.SimpleNamespace(GLiNER=lambda *a, **k: None),
+        # The recognizer reaches the model by its full path rather than through the
+        # ai.common.models barrel, so the whole chain has to be packages: a namespace
+        # object here fails with "ai.common.models is not a package".
+        'ai.common.models': types.ModuleType('ai.common.models'),
+        'ai.common.models.gliner': types.ModuleType('ai.common.models.gliner'),
+        'ai.common.models.gliner.gliner': types.SimpleNamespace(GLiNER=lambda *a, **k: None),
     }
     stubs[package_name].__path__ = [os.path.abspath(_ANON_DIR)]
+    stubs['ai.common.models'].__path__ = []
+    stubs['ai.common.models.gliner'].__path__ = []
     stubs['ai'].common = stubs['ai.common']
 
     path = os.path.join(_ANON_DIR, 'glinerRecognizer.py')

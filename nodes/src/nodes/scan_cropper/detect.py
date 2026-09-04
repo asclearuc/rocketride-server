@@ -44,7 +44,7 @@ actually reaches ``fit_rect``.
 
 from dataclasses import dataclass
 
-from ai.common.opencv import cv2
+import cv2
 import numpy as np
 
 from .geometry import normalise_rect, ratio_error, rect_axes

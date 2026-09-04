@@ -27,7 +27,7 @@ while str(NODES_SRC) in sys.path:
     sys.path.remove(str(NODES_SRC))
 sys.path.insert(0, str(NODES_SRC))
 
-from ai.common.opencv import cv2  # noqa: E402
+import cv2  # noqa: E402
 from image_orient import orient as orient_module  # noqa: E402
 from image_orient.vote import NO_FACES  # noqa: E402
 
