@@ -4469,6 +4469,12 @@ change — `run_log.py`'s encoder and `log-codec.ts`'s decoder in lockstep — w
 log volume actually bites), and a per-environment renderer for those traces, which the tagged
 `body.env` now makes possible but which no client has yet.
 
+**OPEN — transport defects a real dataset exposed (2026-09-04/05).** Three fixed and measured,
+four open, plus two that belong to other areas. The findings, the measurements and an ordered list
+of what to do next are in **§8.3.1**; they are not repeated here. Read that list before starting
+anything in this phase — its first item is that the fixes themselves are still unlanded and
+ungated.
+
 **DONE — 2C-GC: overlays are reclaimed by age.** One increment out of Phase 2C, which stays open
 around it (A1/D1, the debug UX §5 defers here, the second-run collision). What shipped:
 `venv_env.touch_last_used` plus a `last_used` sidecar written from `depends._overlay`, so
@@ -5141,6 +5147,136 @@ with no `projectId` is refused by the **CLI** before the server sees it, so the 
 rather than from that string; report rows name a project in its **on-disk** form
 (`venvdemo-5a23b9ec`) while the command accepts the document's id (`venvdemo-flat`); and `--json` is
 required for `maxAgeSeconds` and the `skipped` rows to be printed at all.
+
+### 8.3.1 Live transport findings, 2026-09-04/05 — what a real dataset broke
+
+A user pipeline — `dropper → [venv: parse ×3 + funnel] → response_image` — was run over 62 mixed
+files (110 MB, office documents with embedded video). It failed in ways that looked like network
+trouble and were not. Four transport defects came out of it, three fixed and measured here, and a
+set of questions this document should not pretend are answered.
+
+**The runs, so the numbers below are comparable.** Same server (`auto`, no `--node_path`,
+`--venv-gc-disabled`), same dataset, warm overlays; only `--max-concurrent` and the fix under test
+change. `1009`/`1011` are counted by close code, never by message text — the client truncates the
+text, and counting the word "keepalive" reported zero while two sockets were dying.
+
+| concurrency | before any fix | frame ceiling raised | + keepalive off, dialled end | + keepalive off, both ends |
+| --- | --- | --- | --- | --- |
+| 1 | 16/62, `1009` ×46 | 62/62 in 34 s | 62/62 in 97 s | 62/62 in 36 s |
+| 2 | — | 61/62, `sent 1011` ×2 | 61/62, `received 1011` ×2 | 61/62, no socket failure, killed by TTL |
+| 3 | — | 60/62, `sent 1011` ×5 | 60/62, `received 1011` ×5 | not reached |
+
+**Fixed 1 — a boundary had two frame ceilings.** The child's uvicorn accepts
+`CONST_WEB_WS_MAX_SIZE` (250 MB); the dialled end took `websockets`' default of 1 MiB because
+`connect()` never passed `max_size`. An image a little over a megabyte therefore crossed *to* the
+child and died coming back, as `frame with 1051117 bytes exceeds limit of 1048576 bytes`. One
+constant, `MAX_FRAME_SIZE`, and 46 failures became none. It does **not** make AV chunked — one
+`write*` is still one frame, which is step 7's work; it stops the ceiling from being the limit.
+
+**Fixed 2 and 3 — keepalive is two-sided, and both sides were inherited defaults.** A venv child
+cannot answer a ping while it is inside a call: `handleWebSocket` blocks for the whole sub-pipeline.
+So any node slower than the keepalive window kills its own bridge. The dialled end used the
+library's 20 s; the accepting end used the *public* server's `CONST_WS_PING_TIMEOUT` (300 s),
+because a child builds the same `WebServer` class. Turning off the first moved every failure to the
+other side — 2 and 5, exactly — which is what proves the mechanism rather than merely suggesting it.
+The second needed a per-instance switch (`config['internal']`), never a constant: the public server
+must keep pinging, since there a missing pong is the only evidence a client is gone.
+
+**What the fixes uncovered, and this is the part worth reading.** Keepalive had been holding two
+unrelated holes shut, badly — by killing healthy work before either could be reached:
+
+- **TTL measures gaps in the inbound stream, not whether the task is busy.** `reset_idle_timer` is
+  called from `_send_data`, so the clock restarts when data *arrives*, not while it is processed. A
+  single object slower than the TTL therefore kills its own task with three processes burning CPU on
+  it. Previously the bridge died at 20 s, the object failed, the client sent the next file and the
+  clock restarted — the 900 s path was never reached by accident, not by design. It is also logged
+  as `Task stopped by user request` although `reason='ttl'` is passed in and could be said.
+- **A client whose object was in flight when the task died got no answer.** Measured: no error, no
+  close, still waiting nine minutes later when the run was abandoned. Server-side cleanup was clean
+  and complete — ports released, children torn down, status removed — and produced no message to the
+  waiting caller. `DataConn.disconnect()` does fail its remaining pipes, but `DataConn` lives *inside*
+  the task process and dies with it, so its cleanup cannot by construction reach an external caller.
+  **The mechanism is not established**; the eaas side is where to look, not the task side.
+
+**Two claims in §4.6 that this run contradicts.** They are recorded rather than rewritten, because
+correcting them properly means answering the question they raise:
+
+- "main's engine thread is only ever inside one bridge node's call" reads as if the engine were
+  single-threaded. It is not: `IPipeTask::startQueue` starts a worker queue of `m_threadCount`
+  threads (default 4, the same number that sizes `data_conn`'s pipe semaphore). The statement is
+  true of *one* thread's stack, not of the process.
+- Which makes the next question live: **the bridge client socket is shared and unlocked.** One
+  socket per child, several engine worker threads, and no lock anywhere in
+  `nodes/venv/base/IInstance.py`. The GIL serialises the Python that touches it, but
+  `websockets.sync` releases the GIL during I/O. Nothing observed today proves a race — the runs
+  were correct — but the correctness argument in §4.6 rests on a premise that no longer holds.
+
+**Concurrency is not merely useless here, it is negative.** 36 s at `--max-concurrent 1`; 316 s at 2
+and at 3, identical, with failures rising 0 → 2 → 5. Throughput saturates at two in-flight objects
+and only the number of broken bridges grows. The cause is **not** measured: `parse` is not a Python
+node — it is C++ reaching Java over JNI, with one `g_jvm` per process — so contention for the JVM is
+the first place to look, not the GIL and not the bridge.
+
+**One more, unrelated to venv but found here.** `/webhook/{project}/{source}` cannot resolve a task
+whose document feeds two isolated environments from one source: it answers `Task token is required`
+while the task is healthy, both children are up, and `upload --token` feeds it fine. Reproduced on a
+freshly restarted server carrying that one task, against a chained variant of the same project that
+resolves immediately. A task-lookup defect, not a venv one.
+
+**And a warning about the error text.** Every transport failure above reached the client wearing the
+SDK's generic hint — "Pipeline isn't running / source must be chat, webhook or dropper / MIME type
+doesn't match". None of those was ever the cause. The real line was in the server console each time,
+and the hint sent two separate investigations in the wrong direction before the close code was read.
+
+**Open items, in the order they are worth doing.** Ordered by what unblocks the rest, not by
+severity: the first two cost minutes and stop the next investigation from being misled the way both
+of this session's were.
+
+0. **Land what is already fixed.** Three transport changes sit in the working tree unreviewed and
+   ungated: `MAX_FRAME_SIZE` in `nodes/venv/base`, `ping_interval=None` in `nodes/venv/client`, and
+   `config['internal']` in `ai/web/server.py` + `ai/node.py`. Each is measured above; none has been
+   through `builder test`, `nodes:test` or `ai:test`. Do this before anything below, or the next
+   run cannot tell a new defect from an unlanded one.
+
+1. **Stop the SDK's generic hint from hiding transport failures.** A pipe failure reaches the caller
+   as "Pipeline isn't running / source must be chat, webhook or dropper / MIME type doesn't match"
+   whatever actually happened; the close code and the real message stay in the server console. Two
+   separate investigations here went the wrong way because of it. Surface the close code and the
+   underlying text; keep the hint for the cases it was written for.
+
+2. **Say `ttl` when the reason is `ttl`.** `stop_task(reason)` receives it and logs
+   `Task stopped by user request`, which is how a TTL expiry came to look like a human pressing stop.
+   One line.
+
+3. **Answer a caller whose object was in flight when its task died.** Measured: no error, no close,
+   still waiting nine minutes later. `DataConn.disconnect()` fails its remaining pipes but dies with
+   the task process, so it cannot reach an external caller — the missing notification is on the eaas
+   side. **Establish the mechanism first**; the fix is not obvious from the task side.
+
+4. **Decide what TTL is measuring.** Today it restarts on `_send_data`, i.e. on arrival, so a single
+   object slower than the TTL kills its own task while it is working. Either count processing as
+   activity, or separate "no inbound data" from "doing nothing" and act differently on each.
+
+5. **Find where the time goes above one in-flight object.** 36 s at `--max-concurrent 1`, 316 s at 2
+   and at 3, identical. Unmeasured, and the obvious suspect is not the bridge: `parse` is a C++ node
+   reaching Java over JNI with one `g_jvm` per process. Until this is measured, "concurrency does not
+   help" is an observation without a cause, and the pipeline shape (three `parse` over one document)
+   may be the real answer.
+
+6. **Decide whether the bridge socket needs a lock.** One socket per child, `m_threadCount` engine
+   worker threads, no lock in `nodes/venv/base/IInstance.py`. The GIL covers the Python that touches
+   it; `websockets.sync` releases the GIL during I/O. The answer may well be "no lock needed", but it
+   should be argued rather than inherited — §4.6's correctness argument currently rests on the
+   process being single-threaded, which it is not.
+
+7. **Chunk AV across the bridge (step 7).** Raising `max_size` moved the ceiling to 250 MB; one
+   `write*` is still one frame, so a larger buffer fails the same way. Already owed by `lanes.py`.
+
+Two items belong to other areas and are recorded here only because this is where they surfaced:
+**`/webhook/{project}/{source}` failing to resolve a task that feeds two environments from one
+source** (a task-lookup defect — the task is healthy and `upload --token` works), and **a base
+runtime left unusable by an interrupted install** — stale `*.dist-info` without `RECORD` break
+`nodes:test` collection until they are deleted by hand.
 
 ### 8.4 Test matrix for venv increments
 
