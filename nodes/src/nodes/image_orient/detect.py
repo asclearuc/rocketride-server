@@ -35,7 +35,7 @@ import os
 import tempfile
 import urllib.request
 
-from ai.common.opencv import cv2
+import cv2
 from rocketlib import debug, warning
 
 # YuNet, MIT licensed (Copyright 2020 Shiqi Yu). Pinned and checksummed so the engine cannot be

@@ -38,7 +38,7 @@ region dicts are built with explicit casts rather than by handing values through
 
 import math
 
-from ai.common.opencv import cv2
+import cv2
 import numpy as np
 from rocketlib import debug, warning
 

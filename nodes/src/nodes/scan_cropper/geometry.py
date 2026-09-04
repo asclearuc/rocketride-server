@@ -32,7 +32,7 @@ Ported from the author's own work: the rectangle helpers and ``cut_out`` from ``
 (commit ``120c81b``).
 """
 
-from ai.common.opencv import cv2
+import cv2
 import numpy as np
 
 # Aspect ratios of the standard print sizes, long side over short: 1:1, 8x10, 4:3, 7:5,

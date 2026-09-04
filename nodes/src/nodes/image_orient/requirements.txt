@@ -1,7 +1,10 @@
+# headless: this node calls core, imgproc, imgcodecs and objdetect (FaceDetectorYN),
+# never a GUI function and nothing from contrib.
+opencv-python-headless<5
 #
-# No package is named here on purpose.
+# Nothing else is named on purpose.
 #
-# cv2 arrives through ai.common.opencv and numpy is a base engine dependency, so the detector
-# costs nothing beyond the model file itself. That is the whole reason YuNet was chosen over
-# MediaPipe BlazeFace, which would have pulled in mediapipe.
+# numpy is a base engine dependency, so beyond cv2 the detector costs nothing but the
+# model file itself. That is the whole reason YuNet was chosen over MediaPipe BlazeFace,
+# which would have pulled in mediapipe.
 #

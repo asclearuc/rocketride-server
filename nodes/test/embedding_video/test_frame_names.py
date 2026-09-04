@@ -22,7 +22,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import ai.common.image
-import ai.common.opencv
 import pytest
 from rocketlib import AVI_ACTION
 from ai.common.avi.descriptor import build_stream_descriptor, descriptor_to_payload
@@ -164,7 +163,9 @@ def _descriptor_payload():
 @pytest.fixture
 def node(monkeypatch):
     """An embedding_video node with OpenCV and the embedding model stubbed."""
-    monkeypatch.setattr(ai.common.opencv, 'cv2', _FakeCv2)
+    # ``_process_video`` imports cv2 inside the function, so the stub has to be what the
+    # import machinery hands back rather than an attribute on some module it reads.
+    monkeypatch.setitem(sys.modules, 'cv2', _FakeCv2)
     monkeypatch.setattr(ai.common.image, 'ImageProcessor', _FakeImageProcessor)
 
     inst = IInstance()
