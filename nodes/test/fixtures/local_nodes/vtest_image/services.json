@@ -1,0 +1,27 @@
+{
+	"title": "VTest Image",
+	"protocol": "vtest_image://",
+	"classType": [
+		"filter"
+	],
+	"capabilities": [],
+	"register": "filter",
+	"node": "python",
+	"path": "local_nodes.vtest_image",
+	"prefix": "VTestImage",
+	"description": [
+		"Test-only node. Emits a whole BEGIN/WRITE/END image stream inside one writeText callback -- the well-behaved shape. Two in parallel must pass through a funnel untouched. Never shipped."
+	],
+	"lanes": {
+		"text": [
+			"image"
+		]
+	},
+	"shape": [
+		{
+			"section": "Pipe",
+			"title": "VTest Image",
+			"properties": []
+		}
+	]
+}

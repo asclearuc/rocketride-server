@@ -1,0 +1,27 @@
+{
+	"title": "VTest Image Split",
+	"protocol": "vtest_image_split://",
+	"classType": [
+		"filter"
+	],
+	"capabilities": [],
+	"register": "filter",
+	"node": "python",
+	"path": "local_nodes.vtest_image_split",
+	"prefix": "VTestImageSplit",
+	"description": [
+		"Test-only node. Deliberately splits its image stream across callbacks: BEGIN on writeText, END on closing. Two in parallel interleave, which the funnel guard must refuse. Never shipped."
+	],
+	"lanes": {
+		"text": [
+			"image"
+		]
+	},
+	"shape": [
+		{
+			"section": "Pipe",
+			"title": "VTest Image Split",
+			"properties": []
+		}
+	]
+}
