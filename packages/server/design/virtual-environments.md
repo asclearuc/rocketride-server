@@ -1987,6 +1987,19 @@ drawn in **§3.1, view 1**.*
     monthly cron schedule keeps its overlay under the 30-day default; a quarterly one does not,
     and pays a cold install every run. `ROCKETRIDE_VENV_GC_MAX_AGE_DAYS` is the answer there, and
     nobody finds that knob from a slow first run — so it belongs here.
+    **What that variable refuses, and why the list is not the obvious one.** Unparsable, negative
+    and **non-finite** values are all ignored with a log line, leaving the collector's own default
+    in force. The first two are ordinary input validation; the third was a real defect, found
+    while writing the tests for this parser and fixed with it. `float()` parses `'nan'` and
+    `'inf'`, and a sign check catches only `-inf` — so both used to reach `collect_stale`, which
+    raises on `int(threshold)` while building its report, **before** it walks anything. Inside the
+    background loop that exception meets the outer handler that exists to keep one bad directory
+    from ending a pass, and the result is the failure mode the loop is built to avoid: every pass
+    dies at the same line, reclamation silently never happens, and the only trace is one log line
+    per cycle. Measured, not reasoned — the collector's behaviour against both values is pinned in
+    `test_venv_env.py`. The command form already refused a non-finite `maxAgeDays`; the two doors
+    now agree, which is the property worth keeping, since §4.10's whole point is that the command
+    and the sweep answer to the same threshold.
     **LRU eviction under disk pressure remains deferred, now against two triggers rather than
     one:** cheap size accounting (recursive sizing is ~½M `stat` calls today), *and* the SaaS
     ceiling — overlays there land on the container's writable layer, charged to
@@ -2786,6 +2799,32 @@ person will not re-derive them.
   rebuild once for a mechanism it never uses. The digest is read from the environment's *previous*
   resolution, the only thing that knows which families it holds before the compile that would say so
   again.
+- **Two caches fold the declarations in, not one — and the count is the thing to check when a
+  third appears.** The drift hash above is the older one; the second is the *satisfied-verdict*
+  cache that arrived from develop (`_verdict_key`, `cache/satisfied/`), which lets a cold process
+  skip the uv resolve entirely when nothing an earlier resolve depended on has moved. Its own
+  docstring claims "everything that can change what a resolve concludes is part of it", and on
+  develop that was true of a platform-constant exclusion set; here the set is composed per
+  install out of these declarations, so the same digest has to enter that key too, with the same
+  per-family shape and the same byte-identical treatment of a family-free environment. A key
+  blind to them keeps answering "satisfied" across exactly the edit whose whole purpose is to
+  change what the resolve does — the failure this bullet already describes, arriving through a
+  second door. Pinned in `TestSatisfiedVerdict` by a declaration-change case and its family-free
+  twin; taking the digest back out fails the first and nothing else, which is how "untested" was
+  measured rather than asserted.
+- **"Verdict" now means two unrelated things, and only one of them is this document's.**
+  Everywhere above, a verdict is the *probe's* — pass / fail-version / inconclusive, §4.16's
+  measurement that an environment actually imports. The satisfied verdict is develop's resolve
+  cache and has nothing to do with it. Nothing renames either, so the collision is recorded here
+  instead: a reader who greps this file for the mechanism behind `_save_verdict` will land on the
+  probe and be wrong.
+- **The probe and the shadowing check run *before* the satisfied verdict is recorded, and the
+  order is load-bearing.** `_verdict_cached` returns far above them, so a verdict written over a
+  pending `RestartRequired` is not merely premature — the next process skips the resolve, never
+  reaches either check, and never repeats the advice. The refusal would then be given exactly
+  once, by whichever process happened to be first, and silently never again. Both halves are
+  asserted in `test_depends_families.py`, since either alone is satisfied by deleting the other:
+  a refused environment records nothing, a clean one with nothing to do still records.
 - **When the namespace is already imported in this process, the environment is finished and
   *recorded*, and then the run is refused.** A loaded extension module cannot be replaced under a
   live interpreter: on Windows the write fails on the locked file, on Linux it succeeds while the
@@ -4429,6 +4468,38 @@ small write per environment activation, and nothing in the suite asserts on an o
 listing. Worth stating in this form because the same suite is where a **behavioural** regression
 from the activation path would surface, and a number with no baseline cannot show one.
 
+
+**Re-measured after the branch was rebased onto a develop 57 commits newer (2026-09-04).** The
+numbers above stand as what was true when 2C-GC landed; these are the same suites afterwards, and
+they are recorded separately because the difference is not this increment's work: `nodes:test`
+**4422 passed / 230 skipped**, `ai:test` 2837/124, `client-python:test` 163/6,
+`client-typescript:test` 250/8, `server:run-rocketlib-test` **324 passed / 1 skipped** (the same
+POSIX-flock skip), the bare-`pytest` lane 183/113, `docs:build` clean, `builder test` green from
+**both** roots, `ruff` clean in both repositories.
+
+*Two things the rebase broke that no merge could have flagged, both found by that run and worth the
+space because the shape recurs.* Neither is a textual conflict: git had nothing to report.
+
+- **`_verdict_key` called a function this branch had deleted.** `_excludes_content` became
+  `_base_excludes` when a family install gained the right to add members to the exclusion set —
+  a `NameError` on every install, caught by `ruff` before any test ran. The repair was not a
+  rename; see §4.16, where the same edit had to widen the key rather than restore a symbol.
+- **Two new develop nodes import a module this branch removed.** `image_orient` and
+  `scan_cropper` both carry `from ai.common.opencv import cv2`; the shim went when `cv2` ownership
+  moved to `pkg_families`. A deletion on one side and new files on the other merge in silence, so
+  the first sign was five collection errors and two failures in `nodes:test`. What makes this
+  worth recording is that **the removal's own README predicted it in those words** — "a new
+  consumer copying the old convention would import something that does not exist" — and the
+  prediction came true through a route nobody could have merged against: a branch that had not
+  yet seen the removal. Both nodes now import `cv2` plainly and declare
+  `opencv-python-headless<5` themselves, per the rule that replaced the shim (§4.16).
+
+*Still not run:* the heavy-model lane (`ROCKETRIDE_INCLUDE_SKIP`), and a real `builder build`
+against one deliberate change to `packages/ai/scripts/tasks.js` — develop's richer `syncDir`
+options were kept with this branch's removal of `mirror: false` re-applied on top. Mirror deletes
+destination entries absent from the source and develop's new `ignore` list names things that do
+not belong in `dist` anyway, so the combination reads as coherent; it has not been exercised.
+
 Five things worth keeping, because each cost a pass to find and none is visible in the diff:
 
 - **A defect in 8.6's own code, fixed here.** `_delete_env_dir` was *not* hash-first: it wiped in
@@ -4458,6 +4529,37 @@ Five things worth keeping, because each cost a pass to find and none is visible 
   answer is the deferred size-pressure LRU (§4.10's second trigger). The mount asymmetry itself —
   `cache` and `site-packages` bounded, `venvs/` not — is a deployment question raised with its
   owner, deliberately not fixed from here.
+
+**A third pass over the same increment (2026-09-04), and it found a defect rather than confirming
+the numbers.** Written up separately from the two blocks above because its subject is what the
+earlier coverage *missed*, and the shape of the miss is reusable: every gap was on a surface whose
+neighbours were well covered, which is exactly where an eye stops looking.
+
+- **`_read_venv_gc_max_age` had no tests at all** — the parser for the operator's only threshold
+  lever, sitting beside a `collect_stale` covered twenty ways. Writing them surfaced the non-finite
+  hole (§4.10): `nan` and `inf` reached the collector and stopped reclamation permanently, one
+  swallowed exception per cycle. Fixed with `math.isfinite`, matching the refusal `_venv_gc` already
+  applied to `maxAgeDays`.
+- **The background loop had never been run end to end.** Its two existing tests stub the pass, so
+  they pinned control flow — waits before the first sweep, survives a failing one — and nothing
+  about what a sweep does to disk. It now runs against a real tree: collects a stale overlay, keeps
+  a fresh one, honours the operator's threshold, and leaves a registered project alone. Pointing
+  `sys.executable` at a `tmp_path` is what makes that cheap, and patching the two cadence constants
+  is what makes it a test rather than a fifteen-minute wait.
+- **`Task._venv_scoping_enabled` and `ai.eaas.create_parser` were both uncovered** — the call site
+  that decides a run's shape, and the flag that switches the collector off. §8.1 carries the first;
+  the second is the server's *only* argument test, which is its own small finding.
+- **`collect_stale` against a non-finite threshold** is now characterised where the behaviour lives,
+  so the reason both callers screen these values out is readable from the collector's own tests.
+
+*Measured:* 39 tests added — `test_task_server.py` **+22**, `test_task_engine.py` **+11**,
+`test_eaas_args.py` **4** (new file), `test_venv_env.py` **+2**. Suites afterwards:
+`server:run-rocketlib-test` **326 passed / 1 skipped** (from 324/1) and `ai:test` **2874 / 124**
+(from 2837/124), `ruff` clean. *Every new test was then mutation-checked* — nine deliberate
+regressions introduced one at a time into the code each test guards, all nine caught, sources
+restored and both suites re-run. That step is worth naming because "the tests pass" and "the tests
+would notice" are different claims, and this increment's history is mostly the second one failing
+quietly.
 
 ---
 
@@ -4596,6 +4698,17 @@ the overlay collector).
   explaining why the call is absent. [2B]
 - **Compatibility switch** — `ROCKETRIDE_SERVER_USE_VENV` unset(auto) / `0`(force-off, isolated group
   demoted to a plain group, global-glob) / `1`(force-on). [2A scoping paths; 2B demotion path]
+  **The resolution rule and the call site are different tests, and only the first was covered.**
+  `venv_env.scoping_enabled` is pure and was pinned next to the library from the start; what
+  decides whether a *run* cuts isolated groups into children is `Task._venv_scoping_enabled`, and
+  it owns two things the pure function does not — reading the switch out of the process
+  environment, and degrading to the legacy flatten path when `venv_env` will not import, which is
+  every non-engine context and any deployment missing `lib/`. Both are now in
+  `test_task_engine.py`, over the full mode × isolated-group matrix. A test there must clear
+  `venv_env._MODE_CACHE`: the first real-environment resolution is frozen for the life of the
+  process on purpose (§4.15), which is also why no switch position can be changed on a running
+  server — a fact the live matrix depends on and one a reader is otherwise likely to discover by
+  being confused.
 - **Model-server pruning** — a proxied node contributes only wrapper/networking deps, not `ai/**` heavy
   files (§4.8). [2A]
 - **Partitioner** (`pipeline.py`) — **increment 1 DONE (19 tests, `test_partition.py`):** flatten

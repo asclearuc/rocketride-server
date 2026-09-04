@@ -924,3 +924,18 @@ def test_collect_stale_absent_root_is_an_empty_report(tmp_path):
     report = V.collect_stale(str(tmp_path))
     assert report['scanned'] == 0
     assert report['collected'] == [] and report['skipped'] == [] and report['failed'] == []
+
+
+@pytest.mark.parametrize('bad', [float('nan'), float('inf')])
+def test_collect_stale_refuses_a_non_finite_threshold_up_front(tmp_path, bad):
+    """Characterisation, and the reason both callers screen these out first.
+
+    Raising before the walk is the safe direction, but not a graceful one: inside the background
+    loop the outer handler swallows it, so every pass dies at the same line and reclamation
+    silently stops. `_read_venv_gc_max_age` and `_venv_gc` therefore refuse non-finite ages.
+    """
+    paths = _make_env(tmp_path, 'proj', 'main')
+    _age(paths, 60 * _DAY)
+    with pytest.raises((ValueError, OverflowError)):
+        V.collect_stale(str(tmp_path), bad)
+    assert os.path.isdir(paths.env_dir), 'a refused threshold must not have collected anything'

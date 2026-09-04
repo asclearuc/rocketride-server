@@ -67,6 +67,7 @@ Central orchestration server managing:
 
 import time
 import errno
+import math
 import os
 import socket
 import sys
@@ -394,6 +395,11 @@ class TaskServer(DAPBase):
             days = float(raw)
         except ValueError:
             self.debug_message(f'Ignoring unparsable ROCKETRIDE_VENV_GC_MAX_AGE_DAYS: {raw!r}')
+            return None
+        if not math.isfinite(days):
+            # Passed through, these make `collect_stale` raise on `int(threshold)` before it walks
+            # anything, and the loop's outer handler swallows it: reclamation stops for good.
+            self.debug_message(f'Ignoring non-finite ROCKETRIDE_VENV_GC_MAX_AGE_DAYS: {raw!r}')
             return None
         if days < 0:
             self.debug_message(f'Ignoring negative ROCKETRIDE_VENV_GC_MAX_AGE_DAYS: {raw!r}')
