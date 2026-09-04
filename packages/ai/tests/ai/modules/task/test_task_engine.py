@@ -1582,3 +1582,68 @@ async def test_main_env_composes_credential_hygiene_with_the_venv_keys(monkeypat
     assert VENV_ENV_ID_ENV not in env
     assert env[VENV_TOKEN_ENV] == 'tok-1'
     assert env[VENV_ISOLATED_ENV] == '1'
+
+
+# ---------------------------------------------------------------------------
+# _venv_scoping_enabled — the master switch, where a run actually consults it
+# ---------------------------------------------------------------------------
+#
+# `venv_env.scoping_enabled` is covered next to the library; what only exists here is reading the
+# switch from the process environment, and degrading to the legacy flatten path when `venv_env` is
+# not importable. `use_venv_mode()` caches its first real-environment resolution for the life of
+# the process, hence the cache reset in the fixture -- and hence a switch that can only be changed
+# by restarting the engine.
+
+
+@pytest.fixture
+def switch(monkeypatch):
+    """Set ROCKETRIDE_SERVER_USE_VENV and defeat venv_env's process-lifetime cache."""
+    import venv_env
+
+    def _set(value):
+        if value is None:
+            monkeypatch.delenv('ROCKETRIDE_SERVER_USE_VENV', raising=False)
+        else:
+            monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', value)
+        monkeypatch.setattr(venv_env, '_MODE_CACHE', None)
+
+    return _set
+
+
+@pytest.mark.parametrize(
+    'value,isolated,expected',
+    [
+        # off: never, not even for a document that asks for isolation.
+        ('0', True, False),
+        ('0', False, False),
+        # on: always, including a document with no isolated group at all.
+        ('1', True, True),
+        ('1', False, True),
+        # auto -- unset, and anything unrecognised. What users get by default.
+        (None, True, True),
+        (None, False, False),
+        ('yes', True, True),
+        ('yes', False, False),
+        ('', True, True),
+    ],
+)
+def test_venv_scoping_follows_the_switch(switch, value, isolated, expected):
+    switch(value)
+    assert Task._venv_scoping_enabled(SimpleNamespace(), isolated) is expected
+
+
+def test_venv_scoping_is_off_when_venv_env_is_unavailable(monkeypatch):
+    # A broken install should run pipelines the old way, not fail to run them.
+    monkeypatch.setitem(sys.modules, 'venv_env', None)  # makes `import venv_env` raise ImportError
+    assert Task._venv_scoping_enabled(SimpleNamespace(), True) is False
+
+
+def test_venv_scoping_reads_the_switch_once_per_process(switch, monkeypatch):
+    """A node rewriting `ROCKETRIDE_SERVER_USE_VENV` mid-run could otherwise move the startup glob
+    for the next `depends()` call, reaching the base runtime -- which outlives the run.
+    """
+    switch('1')
+    assert Task._venv_scoping_enabled(SimpleNamespace(), False) is True
+
+    monkeypatch.setenv('ROCKETRIDE_SERVER_USE_VENV', '0')  # no cache reset: this must not take
+    assert Task._venv_scoping_enabled(SimpleNamespace(), False) is True

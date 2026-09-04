@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import os
 import socket
 import sys
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1271,3 +1273,160 @@ async def test_venv_gc_loop_survives_a_failing_pass(monkeypatch):
         await ts._venv_gc_loop()
     assert len(calls) == 2, 'the loop must come back for another pass after a failure'
     assert ts.debug_message.called
+
+
+# ---------------------------------------------------------------------------
+# ROCKETRIDE_VENV_GC_MAX_AGE_DAYS — the operator's threshold override (2C-GC)
+# ---------------------------------------------------------------------------
+#
+# The `rrext_venv gc` handler reads the same resolved value, so a mis-parse does not merely
+# mistune the background sweep -- it desynchronises the command from it.
+
+
+def _max_age(monkeypatch, raw):
+    """Resolve the override with the environment set to `raw` (None = unset)."""
+    ts = _make_server()
+    if raw is None:
+        monkeypatch.delenv('ROCKETRIDE_VENV_GC_MAX_AGE_DAYS', raising=False)
+    else:
+        monkeypatch.setenv('ROCKETRIDE_VENV_GC_MAX_AGE_DAYS', raw)
+    return ts, ts._read_venv_gc_max_age()
+
+
+def test_gc_max_age_override_is_none_when_unset(monkeypatch):
+    _, seconds = _max_age(monkeypatch, None)
+    assert seconds is None, 'unset must mean "the collector decides", not zero'
+
+
+@pytest.mark.parametrize('raw', ['', '   ', '\t'])
+def test_gc_max_age_override_treats_blank_as_unset(monkeypatch, raw):
+    # The shape a shell leaves behind (`set VAR=`); of the plausible readings, 0 is the worst.
+    _, seconds = _max_age(monkeypatch, raw)
+    assert seconds is None
+
+
+@pytest.mark.parametrize(
+    'raw,expected',
+    [
+        ('30', 30 * 24 * 3600),
+        ('0.5', 12 * 3600),
+        (' 7 ', 7 * 24 * 3600),  # surrounding whitespace is stripped, not fatal
+        ('0', 0.0),
+    ],
+)
+def test_gc_max_age_override_converts_days_to_seconds(monkeypatch, raw, expected):
+    # '0' is legal: the collector's one-hour floor makes it safe, and refusing it here would leave
+    # the command and the sweep disagreeing about what it means.
+    _, seconds = _max_age(monkeypatch, raw)
+    assert seconds == expected
+
+
+@pytest.mark.parametrize('raw', ['-1', '-0.5'])
+def test_gc_max_age_override_ignores_a_negative_value(monkeypatch, raw):
+    # The floor would catch it anyway; the log line is what tells the operator the value was junk.
+    ts, seconds = _max_age(monkeypatch, raw)
+    assert seconds is None
+    assert ts.debug_message.called, 'a rejected override must be visible in the log'
+
+
+@pytest.mark.parametrize('raw', ['soon', '30d', '1,5', ''.join(['3', '0', ' ', 'days'])])
+def test_gc_max_age_override_ignores_junk(monkeypatch, raw):
+    ts, seconds = _max_age(monkeypatch, raw)
+    assert seconds is None
+    assert ts.debug_message.called
+
+
+@pytest.mark.parametrize('raw', ['nan', 'NaN', 'inf', '-inf', 'Infinity'])
+def test_gc_max_age_override_ignores_non_finite_values(monkeypatch, raw):
+    """Measured: these reach `collect_stale` and make it raise on `int(threshold)` before it walks
+    anything -- ValueError for NaN, OverflowError for +inf -- and the loop swallows it every pass.
+    """
+    ts, seconds = _max_age(monkeypatch, raw)
+    assert seconds is None
+    assert ts.debug_message.called
+
+
+# ---------------------------------------------------------------------------
+# The collection loop against a real tree (2C-GC)
+# ---------------------------------------------------------------------------
+#
+# The two loop tests above stub the pass, so they cover control flow and nothing about disk. These
+# run the real `collect_stale` over a real tree -- the hand-run live check, minus the 15-minute wait.
+
+
+def _seed_overlay(tmp_path, project, env_id, age_seconds):
+    """An overlay whose every age signal is `age_seconds` old.
+
+    Ageing one sidecar and leaving another fresh would prove nothing: the reference time is the
+    *newest* of last_used / requirements.hash / install.lock, so one fresh file keeps it alive.
+    """
+    import venv_env
+
+    env_dir = os.path.join(str(tmp_path), 'venvs', project, env_id)
+    os.makedirs(env_dir, exist_ok=True)
+    paths = venv_env.env_paths(env_dir)
+    for path in (paths.hash_file, paths.last_used_file):
+        with open(path, 'w', encoding='utf-8') as handle:
+            handle.write('x')
+    stamp = time.time() - age_seconds
+    for path in (paths.hash_file, paths.last_used_file, env_dir):
+        os.utime(path, (stamp, stamp))
+    return env_dir
+
+
+async def _run_one_pass(ts, tmp_path, monkeypatch):
+    """Drive `_venv_gc_loop` through exactly one real pass rooted at `tmp_path`."""
+    # exe_dir is derived from sys.executable inside the loop, so the tree under test is chosen by
+    # pointing that at the temp directory rather than by parameterising the method.
+    monkeypatch.setattr(task_server_module.sys, 'executable', os.path.join(str(tmp_path), 'engine.exe'))
+
+    waits = []
+
+    async def _sleep(_seconds):
+        waits.append(1)
+        if len(waits) >= 2:  # the startup delay, then the inter-pass wait: one pass has now run
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, 'sleep', _sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await ts._venv_gc_loop()
+    assert len(waits) == 2, 'the pass under assertion never ran'
+
+
+async def test_venv_gc_loop_actually_collects_a_stale_overlay(tmp_path, monkeypatch):
+    ts = _make_server()
+    ts._venv_gc_max_age_seconds = None
+    stale = _seed_overlay(tmp_path, 'gcdemo', 'main', 60 * 24 * 3600)
+    fresh = _seed_overlay(tmp_path, 'gcdemo', 'v1', 0)
+
+    await _run_one_pass(ts, tmp_path, monkeypatch)
+
+    assert not os.path.exists(stale), 'the loop must remove what collect_stale reports collected'
+    assert os.path.isdir(fresh), 'a recently used overlay must survive the same pass'
+
+
+async def test_venv_gc_loop_honours_the_operator_threshold(tmp_path, monkeypatch):
+    # Two hours old, and the default of thirty days would keep it: the override is the only reason
+    # it goes, which is how this tells "reached collect_stale" from "read and dropped". The value
+    # sits above the one-hour floor, or the floor rather than the override would be the cause.
+    ts = _make_server()
+    ts._venv_gc_max_age_seconds = 1.5 * 3600
+    overlay = _seed_overlay(tmp_path, 'gcdemo', 'main', 2 * 3600)
+
+    await _run_one_pass(ts, tmp_path, monkeypatch)
+
+    assert not os.path.exists(overlay)
+
+
+async def test_venv_gc_loop_leaves_a_registered_projects_overlays_alone(tmp_path, monkeypatch):
+    # `has_registered_project` is the loop's only defence against unlinking a .pyd out from under a
+    # resident engine, and this sweep is unscoped -- it walks every tenant on the machine. A stale
+    # overlay of a registered project must survive on that gate alone.
+    ts = _make_server()
+    ts._venv_gc_max_age_seconds = None
+    ts._task_control['tk_1'] = _project_control('gcdemo', complete=True)
+    overlay = _seed_overlay(tmp_path, 'gcdemo', 'main', 60 * 24 * 3600)
+
+    await _run_one_pass(ts, tmp_path, monkeypatch)
+
+    assert os.path.isdir(overlay), 'presence in the registry, not an active run, is the gate'
