@@ -464,7 +464,16 @@ and `groups` (each venv's `config.environment` block, for step-7/8 logging). The
   that boundary over one socket, and the frame's `lane` header demuxes to the consumers. Each lane in
   a channel has exactly **one** producer — a node's `write*` carries no producer identity, so two
   same-lane producers on one boundary cannot be told apart downstream and are rejected with a named
-  cause; multiple consumers of a lane (in-venv fan-out) are fine. `channelId = '{srcEnv}->{dstEnv}'`
+  cause; multiple consumers of a lane (in-venv fan-out) are fine. **The consequence is a real
+  authoring limit, and nothing in the catalog softens it:** two genuinely independent producers
+  inside one environment cannot be joined before the boundary, because no merge node exists --
+  `response_text` and `text_output` are `classType: ["target"]` with an empty output lane, and the
+  only node that structurally folds many inbound writes into one outbound write is `text_revert`, a
+  test fixture that reverses its text. So the author's options are a chain (available only when the
+  nodes pass their input through, as the `vtest_*` fixtures do) or one environment per producer.
+  Worth naming because the natural shape for the feature's own motivating case -- several OCR
+  engines over the same document -- is exactly the parallel one this forbids.
+  `channelId = '{srcEnv}->{dstEnv}'`
   (the routing key; collision is only possible if an env id itself contains `->`, which is rejected),
   plus role-based, sanitized `venv_egress--…` / `venv_ingress--…` node ids (unique **per document**).
 - **Bridge placement — the round-trip splice (`remote` model; see step 7 for why).** A venv boundary is a
@@ -5006,6 +5015,116 @@ measured).
 - **`--target` does not treat base as satisfying — VERIFIED** and now pinned by a test (see the
   pin-beats-base entry above): `uv pip install --target <empty dir> requests==2.32.3` plans the full
   tree although base holds 2.34.2. [2A]
+
+**2C-GC live acceptance — RUN 2026-09-04, all three switch positions, one server at a time.**
+Everything below is measured off `<saas root>/dist/server`, with the server started from `dist/`
+rather than the extension's engine directory, and driven through the TypeScript CLI. Every check
+that is not a background-loop check ran with `--venv-gc-disabled`, so what was collected is
+unambiguously the command's doing.
+
+| position | check | result |
+| --- | --- | --- |
+| `=0` | flat document that would otherwise scope | no overlay; the `venvs/` listing is byte-identical before and after |
+| `=0` | `gc` against a tree with nothing to collect | dry-run **and** real run both succeed, empty report, `maxAgeSeconds: 2592000` |
+| `=1` | same flat document | `venvs/venvdemo-5a23b9ec/main` appears carrying `last_used`, `requirements.hash`, `install.lock`, `combined.txt`, `constraints.txt`, `site-packages` |
+| `=1` | second run of it | `last_used` 1788534354.822 → **1788534379.149**; `requirements.hash` 1788534354.818 → **unchanged** |
+| auto | flat document (no isolated group) | no overlay — the position users get by default does not scope on its own |
+| auto | document **with** isolated groups | scopes: `main`, `v1`, `v2`, each with its own `last_used` |
+
+**The headline conflict proof reproduces from a canvas document, not only from the test's
+programmatic one.** `webhook(main) → [v1: vtest_alpha] → [v2: vtest_beta] → response_text(main)`
+under **auto**, with the fixtures registered through `--node_path`:
+`v1/site-packages` holds `tabulate.py` + `tabulate-0.8.10.dist-info`, `v2/site-packages` holds the
+`tabulate/` **package** + `tabulate-0.9.0.dist-info`, and `main/site-packages` holds **no tabulate at
+all**. The differing file shapes corroborate two distributions rather than one reported twice, as
+in the automated acceptance above.
+
+**The conflict as a *shared-environment* failure, not only as a scoped success — MEASURED.** The
+counter-proof this document has carried since 2A was the pre-gating one (node requirements in the
+startup glob killed `depends()` at import, so the engine could not start at all). That shape is no
+longer reachable: the fixtures live outside the glob. The reachable modern counter-proof is to put
+both fixtures in **one** isolated environment, which is what a pipeline looked like before there was
+anywhere else to put them. Measured: the environment's `combined.txt` carries both pins, `uv`
+refuses, and the run aborts carrying the resolver's own words —
+
+```text
+Failed to compile constraints: x No solution found when resolving dependencies:
+  |_ Because you require tabulate==0.8.10 and tabulate==0.9.0,
+     we can conclude that your requirements are unsatisfiable.
+```
+
+The client sees a truncated form (`venv "shared" (v1) failed to start: venv child exited during
+start...`); the full text reaches the server console and the task's `apaevt_status_error`. Worth
+recording because it is the one demonstration that makes the feature's *purpose* legible in a single
+screen, and because it settles which failure the `=0` path actually produces: **not** this one.
+Under `=0` with the same document the run fails with `No module named 'tabulate'` — the legacy path
+never installs those requirements anywhere, since the fixtures sit outside the glob by construction.
+An audience reads that as a missing install, not as a version conflict, so `=0` is the wrong vehicle
+for showing what scoping buys. Base was verified clean after both runs: no `tabulate` in
+`site-packages`, none in `cache/combined.txt`.
+
+**A third route to the same conflict, and the one whose error is legible to a client — MEASURED.**
+A document with **no** container at all, run under `=1`: scoping is forced, every node lands in
+`venvs/<project>/main`, both pins meet there, and the compile fails with the same resolver text. The
+difference is where the failure happens. In `main` it reaches the CLI in full
+(`Failed to compile constraints: x No solution found...`); in a child environment the client sees only
+`venv "<name>" (<id>) failed to start: venv child exited during start...` and the resolver's words stay
+in the server console. Two consequences worth carrying: a demo or a bug report wants the `main` form,
+and the truncation is a client-side gap rather than a missing message. This is also the closest
+reachable model of the pre-feature world — no containers anywhere, one environment for the whole
+pipeline — since the historical shape (both pins in the *global* compile, engine refusing to start)
+is unreachable now that node requirement files leave the startup glob under `=1` (§4.9).
+
+**Isolation is paid for per environment, and the price is measurable on a two-node pipeline.**
+`venv list --sizes` over the two-environment document: `main` 196,200,506 bytes, `v1` 97,996,604,
+`v2` 98,045,484 — **392 MB for two working nodes**, because each environment carries the baseline
+its nodes import. The failed shared environment from the counter-proof lists as `empty / 0 bytes`,
+a compiled shell with no `site-packages`. This is the number that makes §4.10's collector a
+requirement rather than housekeeping, and it is why the deferred size-pressure LRU has a second
+trigger waiting for it.
+
+**Collection, by command.** Two overlays seeded at 60 days (both sidecars aged — ageing one proves
+nothing): dry-run reports both with `ageSeconds: 5184005` and removes nothing; the real run collects
+both **and** removes the childless `venvs/gcdemo/`; `venv list` agrees. `--max-age-days 0` returns
+`maxAgeSeconds: 3600`, so the floor is visible to the operator who wondered why the report was
+empty. `--max-age-days -1` is refused (`maxAgeDays must not be negative`).
+
+**The two contracts, side by side on the same live project** — the point most easily misread:
+
+```
+venv gc   venvdemo-flat --max-age-days 0  ->  skipped: [{projectId: venvdemo-5a23b9ec, reason: live}], call SUCCEEDS
+venv purge venvdemo-flat main             ->  Error: project venvdemo-flat has an active run; stop it before reclaiming
+```
+
+**Background loop — VERIFIED, and its cost measured.** Started with the loop enabled and
+`ROCKETRIDE_VENV_GC_MAX_AGE_DAYS=0.05` (72 min, just above the floor), one overlay seeded at 60 days
+*before* the server started. The first pass fired on its own after the 15-minute constant delay and
+logged `venv gc: collected 8, failed 0, skipped 0 of 11 scanned`. **8, not 1**: the sweep is unscoped
+by design, so it took every overlay on the machine older than 72 minutes — the seeded one plus the
+seven that predated the session, `nodes:test`'s three among them, which that suite then reinstalls
+cold. The three survivors were the conflict document's, used minutes earlier. Nothing malfunctioned;
+this is what the threshold means, and it is the strongest available demonstration that the loop is
+not a no-op. It is also why the threshold override is not a knob to lower casually on a shared
+machine.
+
+**`EnvBusy` was NOT demonstrated, and the reason is the design working rather than a gap in the
+run.** `collect_stale` consults the liveness gate **per project, before touching any environment**,
+and `has_registered_project` is true for every project in the task registry including completed,
+ttl-resident ones — so while an engine holds an overlay's `.pyd`, that project is skipped and no
+unlink is attempted. Terminating the task tears its venv children down with it. The window in which
+files are held while the project is unregistered is a teardown race, not a state that can be
+arranged. The busy error is therefore a **backstop behind the gate**, not the first line of defence.
+Recorded this way on purpose: the earlier plan for this acceptance assumed `EnvBusy` could be staged
+on demand, and it cannot. POSIX remains reasoned rather than run — `unlink` on an open `.so`
+succeeds silently there, which is exactly why the gate, not the busy error, is what protects a
+resident engine.
+
+*Three things the run corrected in the operator-facing story, none of them behavioural:* `venv gc`
+with no `projectId` is refused by the **CLI** before the server sees it, so the live error message is
+`missing required argument 'projectId'` and the tenancy argument has to be made from the design
+rather than from that string; report rows name a project in its **on-disk** form
+(`venvdemo-5a23b9ec`) while the command accepts the document's id (`venvdemo-flat`); and `--json` is
+required for `maxAgeSeconds` and the `skipped` rows to be printed at all.
 
 ### 8.4 Test matrix for venv increments
 
