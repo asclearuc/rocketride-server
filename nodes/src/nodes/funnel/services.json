@@ -1,0 +1,88 @@
+{
+	//
+	// Required:
+	//		The displayable name of this node
+	//
+	"title": "Funnel",
+	//
+	// Required:
+	//		The protocol; the logical type (`funnel`) is derived from it and is the
+	//		`provider` used in a pipeline document.
+	//
+	"protocol": "funnel://",
+	//
+	// Required:
+	//		Class type of the node - plumbing, not a transform.
+	//
+	"classType": ["infrastructure"],
+	//
+	// Required:
+	//		No special capabilities.
+	//
+	"capabilities": [],
+	//
+	// Optional:
+	//		Description of this driver.
+	//
+	"description": [
+		"Collects several same-lane producers into one, so their output can leave a virtual environment.",
+		"A boundary carries at most one producer per lane, because a write carries no producer identity; parallel nodes inside an environment therefore cannot all reach out on the same lane. Feeding them into a funnel makes the funnel the single producer, leaving the nodes parallel and the environment shared.",
+		"Data is not transformed and not combined: every write is passed through in arrival order. Downstream can no longer tell which node produced what."
+	],
+	//
+	// Optional:
+	//		Register a python filter factory for this node.
+	//
+	"register": "filter",
+	//
+	// Optional:
+	//		The node is a python node.
+	//
+	"node": "python",
+	//
+	// Optional:
+	//		The python package implementing the node.
+	//
+	"path": "nodes.funnel",
+	//
+	// Required:
+	//		The prefix map when added/removed when converting URLs <=> paths.
+	//
+	"prefix": "funnel",
+	//
+	//	Optional:
+	//		Every bridgeable engine lane, each passed through unchanged -- the set in
+	//		`nodes/venv/base/lanes.py`, less three.
+	//
+	//		`words` has no landing method anywhere in `rocketlib`, so the bridge itself
+	//		carries it as explicitly not bridgeable.
+	//
+	//		`classifications` and `classificationContext` are dropped for a different
+	//		reason: no node in the catalog declares either as a lane, so a funnel offering
+	//		them would put two ports on the canvas that nothing can ever connect to. They
+	//		belong here the moment a node does.
+	//
+	"lanes": {
+		"tags": ["tags"],
+		"text": ["text"],
+		"table": ["table"],
+		"json": ["json"],
+		"audio": ["audio"],
+		"video": ["video"],
+		"image": ["image"],
+		"questions": ["questions"],
+		"answers": ["answers"],
+		"documents": ["documents"]
+	},
+	//
+	//	Optional:
+	//		No configurable properties - the node's whole behaviour is its topology.
+	//
+	"shape": [
+		{
+			"section": "Pipe",
+			"title": "Funnel",
+			"properties": []
+		}
+	]
+}

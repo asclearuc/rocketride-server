@@ -464,15 +464,31 @@ and `groups` (each venv's `config.environment` block, for step-7/8 logging). The
   that boundary over one socket, and the frame's `lane` header demuxes to the consumers. Each lane in
   a channel has exactly **one** producer — a node's `write*` carries no producer identity, so two
   same-lane producers on one boundary cannot be told apart downstream and are rejected with a named
-  cause; multiple consumers of a lane (in-venv fan-out) are fine. **The consequence is a real
-  authoring limit, and nothing in the catalog softens it:** two genuinely independent producers
-  inside one environment cannot be joined before the boundary, because no merge node exists --
-  `response_text` and `text_output` are `classType: ["target"]` with an empty output lane, and the
-  only node that structurally folds many inbound writes into one outbound write is `text_revert`, a
-  test fixture that reverses its text. So the author's options are a chain (available only when the
-  nodes pass their input through, as the `vtest_*` fixtures do) or one environment per producer.
-  Worth naming because the natural shape for the feature's own motivating case -- several OCR
-  engines over the same document -- is exactly the parallel one this forbids.
+  cause; multiple consumers of a lane (in-venv fan-out) are fine. **The rule is about attribution
+  across the splice, not about corrupting a stream, and the difference decides what fixes it.** An
+  ordinary graph carries three same-lane producers into one consumer without complaint -- each
+  arrives on its own edge. A boundary collapses every lane onto one socket with one bridge node on
+  main's side, so a second producer leaves main with nothing to route by. **The answer is the
+  `funnel` node** (`nodes/src/nodes/funnel`): the parallel producers write to it, it becomes the
+  single producer the boundary requires, and they stay parallel inside a shared environment. It
+  holds almost no code, because *returning from the handler is the forward* -- `Binder::callMethods`
+  walks the instances bound to a lane and continues unless one returns `PreventDefault`, so a funnel
+  that neither suppresses nor re-emits is a pass-through by construction; calling
+  `self.instance.write*` there would duplicate every frame. Two things it costs, both worth stating
+  before someone reaches for it: **producer identity is gone** downstream, so it fits only where the
+  consumer does not need to know who produced what (an environment per producer is the alternative,
+  and preserves it); and **no concurrency is gained** -- nodes in an environment run on one engine
+  thread either way. What the funnel changes is what is expressible, not what is parallel.
+  **Media lanes are where it gets interesting, and the guard is the node's only real logic.**
+  `writeImage`/`writeAudio`/`writeVideo` are `BEGIN`/`WRITE`/`END` streams carrying no stream id, so
+  two overlapping producers splice into one unreadable object that nothing downstream can separate.
+  Measured both ways: producers that emit a whole stream inside one callback -- the ordinary shape,
+  and why an ordinary graph fans three of them into one consumer without trouble -- pass through a
+  funnel as two distinct streams (`stream_index` 0 and 1); producers that span callbacks really do
+  interleave, and the funnel refuses with the lane named rather than emitting a spliced buffer.
+  Without a funnel this shape is refused at partition time, so the guard is what keeps the trade
+  from being "a rejected pipeline becomes a corrupt payload". Both cases run in
+  `nodes/test/venv_runtime/test_venv_funnel_e2e.py`.
   `channelId = '{srcEnv}->{dstEnv}'`
   (the routing key; collision is only possible if an env id itself contains `->`, which is rejected),
   plus role-based, sanitized `venv_egress--…` / `venv_ingress--…` node ids (unique **per document**).
