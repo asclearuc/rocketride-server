@@ -11,7 +11,14 @@ from types import SimpleNamespace
 
 import pytest
 
-import depends
+try:
+    import depends
+
+    _HAVE_ENGLIB = True
+except ImportError:  # engLib is built into engine.exe
+    _HAVE_ENGLIB = False
+
+pytestmark = pytest.mark.skipif(not _HAVE_ENGLIB, reason='depends needs engLib (engine interpreter)')
 
 
 @pytest.fixture
@@ -131,25 +138,27 @@ class TestCacheDirs:
 
 
 class TestWriteExcludesFile:
-    # ``_write_excludes_file`` assumes the cache directory already exists: in
-    # production ``depends()`` takes the install lock (which creates it) first.
+    # The path is derived from the content (`excludes-<digest>.txt`), so two callers computing
+    # different exclusion sets cannot overwrite each other's file. The set stopped being a
+    # constant when a family install gained the right to add its own members to it. The
+    # directory is created by the writer rather than assumed, which is why these no longer
+    # take the install lock first.
 
     def test_always_excludes_uv(self, exe_dir, monkeypatch):
-        depends.engine_cache_dir(create=True)
         monkeypatch.setattr(depends.platform, 'system', lambda: 'Darwin')
 
         path = depends._write_excludes_file()
 
-        assert path == str(exe_dir / 'cache' / 'excludes.txt')
-        assert (exe_dir / 'cache' / 'excludes.txt').read_text(encoding='utf-8') == 'uv\n'
+        assert os.path.dirname(path) == str(exe_dir / 'cache')
+        assert os.path.basename(path).startswith('excludes-')
+        with open(path, encoding='utf-8') as fh:
+            assert fh.read() == 'uv\n'
 
-    def test_excludes_plain_onnxruntime_off_darwin(self, exe_dir, monkeypatch):
-        depends.engine_cache_dir(create=True)
-        monkeypatch.setattr(depends.platform, 'system', lambda: 'Linux')
-
-        depends._write_excludes_file()
-
-        assert (exe_dir / 'cache' / 'excludes.txt').read_text(encoding='utf-8') == 'uv\nonnxruntime\n'
+    # There is deliberately no onnxruntime case here any more. That exclusion was a
+    # hand-written family rule and now comes from pkg_families.excluded(); re-adding it to
+    # the base set would disarm the family, since the base set is what the trigger dry-run
+    # is given. Pinned in test_depends_families.py instead:
+    # test_the_base_exclusion_set_is_uv_alone_on_every_platform.
 
 
 class TestEnsureConstraints:
@@ -231,7 +240,7 @@ class TestSatisfiedVerdict:
 
         resolves = []
 
-        def fake_dry_run(requirements_path, constraints_path):
+        def fake_dry_run(requirements_path, constraints_path, excludes_path):
             resolves.append(requirements_path)
             return []  # everything already installed
 
@@ -394,7 +403,7 @@ class TestSatisfiedVerdict:
     def test_failed_resolve_records_no_verdict(self, exe_dir, env, monkeypatch):
         """A resolve that raises leaves nothing behind, so the next process resolves again."""
 
-        def failing_dry_run(requirements_path, constraints_path):
+        def failing_dry_run(requirements_path, constraints_path, excludes_path):
             env.resolves.append(requirements_path)
             raise RuntimeError('Dependency resolution failed')
 
@@ -421,7 +430,7 @@ class TestSatisfiedVerdict:
         """A verdict written after an install must key on the post-install site-packages."""
         pending = ['httpx']
 
-        def dry_run_then_satisfied(requirements_path, constraints_path):
+        def dry_run_then_satisfied(requirements_path, constraints_path, excludes_path):
             env.resolves.append(requirements_path)
             return list(pending)
 

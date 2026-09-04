@@ -1176,7 +1176,11 @@ def _verdict_key(requirements_path: str, constraints_path: str) -> Optional[str]
         [
             _file_digest(constraints_path),
             _file_digest(_get_overrides_path()),
-            _excludes_content(),
+            '\n'.join(_base_excludes()),
+            # The exclusions are no longer a constant: they are composed per install, and a
+            # family declaration is one of the things that composes them. A key blind to the
+            # declarations would keep reporting "satisfied" across the edit that changed them.
+            pkg_families.hash_contribution(constraints_path),
             installed,
         ]
     )
