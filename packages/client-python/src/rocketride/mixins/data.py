@@ -60,6 +60,32 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from ..core import DAPClient, PipeException
 from ..types import PIPELINE_RESULT, UPLOAD_RESULT
 
+# WebSocket close codes mean the transport gave up, not that the caller got something wrong.
+# Matched as text because the message is all that crosses back from the server.
+_TRANSPORT_CLOSE = ('sent 100', 'received 100', 'sent 101', 'received 101')
+
+
+def _open_failure_hint(message: str) -> str:
+    """Troubleshooting text for a failed pipe open, chosen by what the failure was.
+
+    A transport close is never a wrong token or a wrong MIME type, and offering that checklist
+    against one sends the reader looking in the wrong place.
+    """
+    if any(marker in message for marker in _TRANSPORT_CLOSE):
+        return (
+            'The connection was closed by one side, so this is not a token, source or MIME type '
+            'problem. The close code says which:\n'
+            "- 1009: a frame was larger than the receiver's limit\n"
+            '- 1011: keepalive expired -- the peer was busy and did not answer a ping\n'
+            'The full reason is in the server log; this message is what crossed back.\n'
+        )
+    return (
+        'Common causes:\n'
+        "- Pipeline isn't running (wrong token or task terminated)\n"
+        '- Pipeline source must be chat, webhook, or dropper\n'
+        '- MIME type doesn\'t match the source lane (try `mime_type="text/plain"`)\n'
+    )
+
 
 class DataMixin(DAPClient):
     """
@@ -187,13 +213,9 @@ class DataMixin(DAPClient):
                 # it to an end user. The developer checklist rides along as `hint`
                 # (PipeException.hint), and `code` classifies the failure.
                 response = dict(response)
-                response['message'] = response.get('message') or 'Failed to open a data pipe.'
-                response['hint'] = (
-                    'Common causes:\n'
-                    "- Pipeline isn't running (wrong token or task terminated)\n"
-                    '- Pipeline source must be chat, webhook, or dropper\n'
-                    '- MIME type doesn\'t match the source lane (try `mime_type="text/plain"`)\n'
-                )
+                message = response.get('message') or 'Failed to open a data pipe.'
+                response['message'] = message
+                response['hint'] = _open_failure_hint(message)
                 raise PipeException(response)
 
             self._pipe_id = response.get('body', {}).get('pipe_id')

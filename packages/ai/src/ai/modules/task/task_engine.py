@@ -1545,7 +1545,7 @@ class Task(DAPBase):
             else:
                 self._status.status = 'Stopped'
                 self._status.state = TASK_STATE.CANCELLED.value
-                self.debug_message('Task stopped by user request')
+                self.debug_message(f'Task stopped, reason={self._stop_reason or "user"}')
         elif self._status.exitCode == 0:
             self._status.status = 'Completed'
             self._status.state = TASK_STATE.COMPLETED.value
