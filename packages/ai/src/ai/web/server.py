@@ -442,6 +442,9 @@ class WebServer:
         port = self.config.get('port', CONST_DEFAULT_WEB_PORT)
         host = self.config.get('host', CONST_DEFAULT_WEB_HOST)
 
+        # Set by a task subprocess, never by the public server.
+        internal = bool(self.config.get('internal', False))
+
         # Save the port
         self._port = port
 
@@ -472,8 +475,12 @@ class WebServer:
             ssl_keyfile=ssl_keyfile,
             ssl_certfile=ssl_certfile,
             ws_max_size=CONST_WEB_WS_MAX_SIZE,
-            ws_ping_interval=CONST_WS_PING_INTERVAL,
-            ws_ping_timeout=CONST_WS_PING_TIMEOUT,
+            # A loopback server for a child process turns keepalive off: its peer blocks for
+            # the whole of a node's work and cannot pong, so a ping would kill the bridge of
+            # anything slower than the timeout. A public server keeps it -- there a missing
+            # pong is the only evidence the client is gone.
+            ws_ping_interval=None if internal else CONST_WS_PING_INTERVAL,
+            ws_ping_timeout=None if internal else CONST_WS_PING_TIMEOUT,
         )
 
         # Return the configured server instance

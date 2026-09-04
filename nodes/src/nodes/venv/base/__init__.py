@@ -21,4 +21,5 @@
 # SOFTWARE.
 # =============================================================================
 
+from .IInstance import MAX_FRAME_SIZE  # noqa: F401
 from .IInstance import IInstance as IInstanceBase  # noqa: F401

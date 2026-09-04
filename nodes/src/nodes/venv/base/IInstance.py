@@ -59,6 +59,11 @@ from rocketlib import APERR, Ec, Entry, IInstanceBase, Lvl, debug, error
 
 from . import lanes, merge
 
+# `websockets` defaults to 1 MiB while the child's uvicorn accepts `CONST_WEB_WS_MAX_SIZE`
+# (250 MB), so a boundary had two ceilings and an image crossed *to* the child fine, then died
+# coming back. Does not make AV chunked -- one `write*` is still one frame (`lanes.py`, step 7).
+MAX_FRAME_SIZE = 250 * 1024 * 1024
+
 # Enable running the async coroutines in a synchronous context
 nest_asyncio.apply()
 

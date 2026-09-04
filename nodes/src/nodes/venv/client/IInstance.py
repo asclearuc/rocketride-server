@@ -27,7 +27,7 @@ from websockets.sync.client import connect
 from rocketlib import Entry, Lvl, debug
 
 from .IGlobal import IGlobal
-from ..base import IInstanceBase
+from ..base import MAX_FRAME_SIZE, IInstanceBase
 
 
 class IInstance(IInstanceBase):
@@ -63,7 +63,14 @@ class IInstance(IInstanceBase):
 
         # Dial the child's /venv/pipe once and keep it open for the node's lifetime.
         webSocket = connect(
-            self.IGlobal.urlProcess, additional_headers=self.IGlobal.headers, open_timeout=None, close_timeout=None
+            self.IGlobal.urlProcess,
+            additional_headers=self.IGlobal.headers,
+            open_timeout=None,
+            close_timeout=None,
+            max_size=MAX_FRAME_SIZE,
+            # The child cannot pong while it is inside a call, so the library's 20s default
+            # kills the bridge of any node slower than that. Liveness is the process, not a ping.
+            ping_interval=None,
         )
 
         self.connect(webSocket)

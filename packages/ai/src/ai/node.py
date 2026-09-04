@@ -136,7 +136,9 @@ def _setup_shared_web_server() -> Tuple[Optional[Any], Optional[Any]]:
         startup_ready.set()
 
     server = WebServer(
-        config={'host': data_host, 'port': data_port},
+        # `internal`: loopback only, serving `/task/data` and `/venv/pipe` to this
+        # subprocess's parent. No websocket keepalive -- see WebServer._configure_server.
+        config={'host': data_host, 'port': data_port, 'internal': True},
         on_startup=_on_startup,
     )
     # Mount `/task/data` — the WebSocket EaaS uses to send DAP traffic
