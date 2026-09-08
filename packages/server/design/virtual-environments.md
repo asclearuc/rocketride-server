@@ -1,8 +1,8 @@
 # Design: Virtual Environments for RocketRide Pipelines
 
 **Status:** Living document — largely implemented. Phase 2A (per-environment scoping) and Phase 2B
-(the venv runtime, steps 4–8.7) are shipped and live-verified; what remains open is named where it
-lives — §4.9's base shrink, §4.10's second-run-collision question, and Phase 2C. **The client
+(the venv runtime, steps 4–8.7) are shipped and live-verified; **everything still open is listed in
+§10 and tagged `OQ-n` where it lives**, so a question can be found from either end. **The client
 half of `rrext_venv` closed in 2B** (§7): both SDKs, both CLIs, and operations A/B/C on the
 canvas in both hosts. **2A-4 closed with 6b** (§4.16), which ended in a measurement rather than the
 version move it was scoped as; the one thing it carries forward is the barrel import named at the
@@ -612,8 +612,8 @@ the rejected `venvEgress`/`venvIngress` reinvention; it is a sibling of `remote`
   the table-driven `callLocal`) is introduced **under `venv` only**; `remote/base` is not moved onto it.
   This costs a little transport duplication but removes all regression risk to network-remote. The true
   DRY refactor — moving `remote/base` onto the shared base with its current 3-lane `callLocal` preserved
-  byte-identically (**A1**) — is **deferred to 2C**, alongside the transport seam that §4.5 already
-  defers there.
+  byte-identically (**A1**) — is **deferred to 2C** (`OQ-9`, §10), alongside the transport seam that
+  §4.5 already defers there.
 - **AV multi-arg framing = metadata in the header, body is raw bytes (B1).** `image`/`audio`/`video`
   carry `(action, mime:str, buffer:bytes)`, which the single-scalar `_send` cannot express. *That
   first argument reads as an `int` and is not one* — it is an `AVI_ACTION` member, which is what made
@@ -643,8 +643,8 @@ the rejected `venvEgress`/`venvIngress` reinvention; it is a sibling of `remote`
   and its `_write`/`_begin`/`_end` are methods bound to a `DataConn`/`pipe`, not standalone. For step 6 the
   `venv` table mirrors the serialization vocabulary with `data_conn` as the reference, adding `table`/
   `classificationContext` itself. Extracting a shared `write_lane` dispatch in `packages/ai` that both
-  `data_conn` and `venv_server` call (**D1**) is the real-DRY move and is **deferred to 2C together with
-  the A1 base unification** — both are behavior-preserving refactors best done under the green test
+  `data_conn` and `venv_server` call (**D1**) is the real-DRY move and is **deferred to 2C together
+  with the A1 base unification** (`OQ-9`, §10) — both are behavior-preserving refactors best done under the green test
   baseline rather than mixed into the feature.
 - **The 12 data `write*` egress overrides live in the shared base, inherited by BOTH nodes (verified).**
   `remote/server/IInstance` *also* overrides `writeText`/`writeDocuments` → `callRemote(...)`: that is the
@@ -766,7 +766,7 @@ env/handle, never argv.
   `dict(os.environ)` deliberately, to pin the prefix allowlist and the `AWS_*` redaction. That is
   the harness, not the production wiring — and it is the first file to check if anyone ever
   changes what the resolve is handed.
-- **Hardening (deferred to 2C):** OS-access-controlled local IPC so the kernel rejects other-user
+- **Hardening (deferred to 2C; `OQ-8`, §10):** OS-access-controlled local IPC so the kernel rejects other-user
   processes *before* any token check — **named pipe + user-SID ACL** (Windows), **Unix domain socket**
   `0700` + `SO_PEERCRED`/`LOCAL_PEERCRED` (Linux/macOS). Matters for **multi-tenant** hosts (Linux
   cloud especially); single-tenant is fine on loopback + token (same-user child). This is **not
@@ -925,6 +925,872 @@ legacy path is a supported mode, not a transitional flag.
 **Upside:** eliminates "all shipped nodes must be compatible" entirely (conflicts only *within* an env →
 resolved by the venv split); shrinks the overlay-can't-hide-a-base-package limit to only packages the
 **engine runtime itself** needs.
+
+#### 4.7.1 Forced requirements per environment
+
+**Requested 2026-09-08 and answered with the requester the same day. This section replaced its own
+nine open questions with the decisions below; the numbering is kept so the questions map onto the
+answers. Nothing is implemented yet; the order in which it is to be built is §7's `2C-FR` entry.**
+
+A Virtual Environment container gains a **Forced Python requirements** field — multi-line free
+text, alongside the isolated-dependencies setting in the same settings panel (§4.1) and marked
+**advanced**. What it lists takes priority over whatever the environment's requirements resolve to,
+package by package. As stated, with the examples given:
+
+| the environment computes | forced says | result |
+| --- | --- | --- |
+| `tabulate==0.8.10` | `tabulate==0.9.0` | `0.9.0` |
+| `tabulate==0.8.10` | `tabulate` | no pin — uv resolves it at install time |
+| `numpy==1.*` | `numpy==2.*` | `2.*` |
+| two marker-scoped `torch` lines (`==2.10.0` for arm64 Darwin, `==2.10.0+cu128` elsewhere) | `torch` | `torch`, unpinned |
+| the same two lines | two forced lines at `2.12.0` / `2.12.0+cu128` | the forced pair |
+
+**The mechanism already exists and is already wired into every compile.** `depends.py` discovers
+`overrides.txt` by `OVERRIDES_GLOBS` and passes the combined file to `uv pip compile` as
+`--override`, whose documented behaviour is the one asked for: *unlike constraints, an override
+replaces what packages declare*. Rows 4 and 5 — one unmarked forced line displacing two
+marker-scoped ones, and a forced pair displacing a computed pair — are uv override semantics
+exactly. The work is therefore **exposing a per-environment override list from the document**, not
+writing a resolution rule.
+
+**Where it lives in the document.** `config.environment` gains a third key beside `name` and
+`isolated` — `forced`, the raw multi-line string, absent or empty when unused. The SDK type is
+`PipelineEnvironment` in `packages/client-typescript/src/client/types/pipeline.ts`, which today
+declares exactly `{ name: string; isolated: boolean }`, and §4.1's rule that the schema field is
+added there applies unchanged. The key is additive, so the document keeps the shape §4.2 describes.
+
+**Whether an editor preserved the key across a save was measured before anything was built, and
+the answer was no** (`OQ-17`, §10 — now closed by this increment)**.** `NodeConfigPanel` wrote the
+container back as `environment: { name: envName, isolated: envIsolated }` — an object literal
+rebuilt from exactly two pieces of component state. The outer `config` was spread; `environment`
+was not. So any third key on it was dropped the moment someone opened the panel and saved, and
+*that was the editor this field is being added to*: it would have erased itself on the first save
+through the very panel that offers it.
+
+That is fixed here rather than deferred, and by the *general* repair rather than the specific one.
+The write-back is now `buildEnvironmentWriteBack`, which **spreads** the existing environment, so
+the key after `forced` survives by construction instead of by being enumerated. Teaching the panel
+one key by name would have left the next one meeting the same literal — and the whole reason this
+was worth measuring is that nothing fails when it happens.
+
+**When the field has no environment to act on — two routes to the same silence, both refused.**
+Forced belongs to an *environment*, and a container only becomes one when the run is scoped. Two
+ways that fails, both reachable without anything going wrong:
+
+- **The run is not scoped.** `scoping_enabled()` returns `False` unconditionally under the `off`
+  switch and, under the default `auto`, whenever the document contains no isolated group at all.
+  Either way `partition_pipeline` flattens every container into one document and the legacy
+  single-process path runs: no `env_dir`, no child, no `build_child_env()` — so nothing carries the
+  text and nothing applies it. The fact to test is the `scoped` flag, not the mode behind it.
+- **The container is not isolated — and "not isolated" is wider than "isolated: false".** The
+  predicate is `is_isolated()`, which is `bool(environment and environment.get('isolated'))`: a
+  **missing** key is not isolated either. `has_isolated_group()` counts only what that accepts, and
+  `_env_of()` attributes a component to its **nearest isolated-container ancestor**, so such a
+  container is not an environment at all whatever its settings panel holds. Under `auto` — the
+  default — a document whose only container is un-isolated is not even scoped, so this route
+  reaches the same silence through the UI alone, with no environment variable involved.
+
+Both are **refused at partition time**, with the container named, rather than allowed to run
+quietly. The refusal is cheap and lands where it belongs: `scoped` is computed immediately before
+`partition_pipeline()` is called, so the partitioner already knows whether the environment this
+text belongs to is going to exist. Refusing costs nothing in compatibility either — no document
+carries forced text until someone types it, so there is no existing pipeline to break, and the
+alternative is the exact defect answer 5 exists to prevent: a field the user filled in that changes
+nothing and says nothing.
+
+**But a refusal is the backstop, not the mechanism, and the difference is a UX trap if it is
+forgotten.** The un-isolated route is reachable in one click: a user with a working container
+un-ticks isolation to debug the pipeline in a single process, and a field they are not thinking
+about now stops the run. Answering that with a hard error and nothing else would be technically
+right and practically hostile — the toggle is *in the same panel* as the text it invalidates. So
+the field is **disabled in the UI while isolation is off**, greyed rather than hidden, which keeps
+the text visible and un-lost.
+
+Greying alone does not close the case, and it is worth being exact about why. Disabling the input
+stops someone *typing* forced text into an un-isolated container; it does nothing about the
+sequence that actually happens — a container that already has forced text, and a user who clears
+the isolation checkbox. The field greys out, the text stays in the document, and the run is refused
+on the next launch. That is precisely the scenario this paragraph was written to prevent, so the
+disabled state has to carry the consequence rather than merely the fact: its inline reason names
+what will happen and what to do — the requirements will not apply, the run will be refused, clear
+the field or re-enable isolation. A greyed box that says only "isolation is off" would leave the
+trap intact and look like it had been handled.
+
+The partition-time refusal then covers what the UI cannot: hand-authored documents, documents from
+an older editor, and the unscoped route, which no UI state can predict. Prevent the state where it
+is authored, explain it where it is entered, refuse it where neither was in play.
+
+**Both surfaces must ask the engine's question, not their own — because one of them already does
+not** (`OQ-16`, §10)**.** `NodeVirtualEnv` renders the "isolated" badge when
+`environment?.isolated !== false`, so a hand-authored container carrying `{ name: "x" }` and no
+`isolated` key is badged **isolated** on the canvas while `is_isolated()` reads it as **not**
+isolated. That disagreement is shipped and predates this section; it is recorded here rather than
+fixed here because this increment adds a second surface — the disabled/enabled state of the forced
+field — that would otherwise inherit the same bug and produce the worst version of it: a field
+that looks live, accepts text, and is then refused at launch. The UI condition for enabling the
+field is therefore the engine's predicate (`environment?.isolated` truthy), not the badge's.
+
+**1. The unit of replacement is the package name.** One unmarked forced `torch` displaces both
+marker-scoped lines rather than adding a third (row 4). That is uv's rule, and adopting it is what
+makes the existing mechanism fit.
+
+**2. Forced overrides; it never adds — and this is the security decision, not an ergonomic one.**
+A forced line for a package nothing in the environment requires installs nothing. This was first
+answered the other way (override *and* requirement) and reversed once the consequence was traced:
+an override can only rewrite what something already declared, so override-only means a document
+can never name a package the tree does not already pull. Adding would have made an arbitrary
+tenant-supplied string install an arbitrary distribution, and installation executes package code —
+`--no-build-isolation` is passed on both the compile (`_run_uv_compile`) and the install,
+`--only-binary` is never on the uv command line, and `_ensure_wheel()`/`_ensure_setuptools()`
+exist precisely because legacy `setup.py` sdists are expected. Override-only keeps the field to
+*version selection over packages the environment already installs*, which is why this section
+needs no SaaS/OSS mode switch (answer 9).
+
+The cost is the case the reversal creates: a forced line that matches nothing is inert. It must
+therefore **warn** rather than pass silently — a forced name absent from the environment's
+resolution is reported, not ignored.
+
+**3. Names match under PEP 503 normalisation** (`opencv_contrib_python` ≡ `opencv-contrib-python`,
+case-insensitive). **Extras are not part of the match**: a forced `torch` displaces a computed
+`torch[cuda]` and the extras are lost, because merging them back would mean parsing and re-emitting
+requirements ourselves — the resolution rule this design exists to avoid — and because silently
+appending `[cuda]` to a line the user typed by hand is the opposite surprise. The loss is warned
+about, detected by comparing the forced name against the environment's **direct** requirement files
+(`req_files`). Extras dragged in transitively are deliberately not covered, and the check runs on
+the child side rather than at partition time — see *Where the warnings go* below for why it cannot
+run earlier.
+
+**4. Forced outranks the shared-namespace family machinery (§4.16), with a warning.** Under
+override-only the dangerous half of this is inert: forcing a *different* family member cannot
+install it, because nothing requires it. What remains in reach is the version of a member the
+environment already resolves, which is the useful case. Where a forced version contradicts a
+family's declared `namespace_version`, forced wins and the contradiction is reported.
+
+**5. The forced text feeds the environment key — by content digest, not by file.** It is
+materialised as `<exe_dir>/cache/forced/<digest>.txt` — the name carries the digest, for the
+reason the SaaS paragraph below gives, and the *directory* is the engine cache rather than the
+environment overlay, for the reason the parent-side paragraph below gives — and passed to uv as
+`--override`, merged with the tree-level override files. But what enters the key is the **digest
+of the text**, folded in through `pkg_families.combine_hash()` the way a family declaration
+already is — not the file, and not its metadata. Without a contribution of some kind, editing the
+field changes nothing until something else invalidates the overlay, and the first symptom is a
+user editing a version and watching the old one install.
+
+**What the digest is taken over, because "the text" is not precise enough.** Normalised text, not
+raw bytes: line endings folded to `\n`, trailing whitespace stripped per line, and a trailing
+newline made canonical. The reason is the same one that put the digest here in the first place. A
+raw digest moves when a browser textarea round-trips `\n` into `\r\n`, or when an editor trims a
+line — cosmetic events that change no requirement and would rebuild the overlay anyway. Having
+argued the mtime out of the key for exactly that reason, leaving line endings in it would reinstate
+the trap one layer up. Normalise once, in the parent, and digest what was normalised; the file it
+writes holds that same normalised text and is *named* by that digest, so the child never normalises
+and never compares — it opens the one name it was given, or it does not.
+
+**`combine_hash()` is the right helper for a second reason**, read from its own contract rather
+than assumed: an **empty** digest leaves the hash untouched, which its docstring calls the
+load-bearing half — an environment holding no family member keeps the bytes it stored before the
+mechanism existed and does not rebuild once for nothing. Forced inherits that property free:
+environments with no forced text — every one of them on the day this ships — keep their keys
+unchanged.
+
+**The merge unit is the name, on both sides.** For a normalised name the forced lines replace *all*
+tree-level override lines for it — not one of them, and not joined to them — while names forced does
+not mention keep whatever the tree said. That is answer 1 applied to the merge rather than to the
+resolution, and row 5 is why the plural matters on the forced side too: forced may legitimately
+supply two marker-scoped lines for one package.
+
+**The merge is mandatory, and that is measured rather than argued.** The obvious way to avoid
+writing it is to hand uv both files and let it sort them out — `--override tree.txt --override
+forced.txt`. uv accepts the two flags and then treats their entries as **conjunctive**: a
+requirement of `tabulate==0.8.10` with `0.9.0` in one override file and `0.10.0` in the other fails
+outright with *"Because you require tabulate==0.9.0 and tabulate==0.10.0, we can conclude that your
+requirements are unsatisfiable"*. There is no last-wins. So the name-level replacement has to
+happen before uv sees anything, which in turn means the tree override lines have to be parsed for
+their names too — they cannot stay opaque text the way `write_combined()` treats them, and that
+concatenating combiner is therefore not the tool for this merge. The failure this avoids is
+particularly unkind: a user who typed one version reads an error naming two.
+
+**But `write_combined()` does a second job, and a replacement that forgets it breaks quietly.**
+Besides concatenating it rewrites every `-r` include to an absolute path *with forward slashes*,
+for a reason its docstring records: uv resolves an include relative to the file holding the line,
+and the combined file lives elsewhere, so a relative include would be looked for beside the combined
+file; and a requirement file treats `\` as an escape, so `-r C:\x\y.txt` reaches uv as
+`C:xy.txt`. The forced side cannot carry an include at all — answer 7 refuses `-r` — but the
+**tree** side can, and a merger that copies tree lines verbatim inherits both traps. Today no
+override file in the repository has a flag line, so this is latent rather than live; it is written
+down because latent-and-silent is the combination that gets found months later on Windows.
+
+**The merged file is a third artifact, and it wants none of the ceremony the first two got.**
+Forced text is one input, the tree's `overrides.txt` files are another, and what `--override`
+actually receives is the merge of them — a file this section described without ever naming. It is
+`<env_dir>/overrides-combined.txt`, deliberately the same name the shared one carries in the
+engine cache so that the two read as one artifact at two scopes. What it does **not** get is a
+digest in its name or a write-if-absent rule, and the reason is a boundary rather than a
+preference: the forced file crosses one — a different process writes it than reads it, and neither
+can see what the other saw — while the merged file is written and consumed by the same process
+inside a single lock hold. `_compile_and_install()` takes `FileLock(plan.paths.lock_file)` and
+performs the compile *and* both installs inside it, so all three `_override_args()` readers see a
+file that was regenerated a few lines earlier by the only writer that can be running.
+
+So: regenerate it unconditionally under the lock and overwrite freely. Caching it would raise a
+question that regeneration never asks — a name keyed on the forced digest alone would go stale
+across an engine upgrade, where the tree's override files change and the forced text does not, and
+write-if-absent would then keep yesterday's merge. It is derived, it is small, and it costs one file
+write per install.
+
+**Why the digest and not the file, given that `plan_install()` already walks a file set.** Because
+that walk is `requirements_hash`, which is `path:size:mtime_ns` — *metadata, not content*. Adding
+the forced file to it makes the key sensitive to when it was written rather than to what it says,
+so an unconditional rewrite on every partition run rebuilds **every** overlay **every** run, and
+the failure presents as slowness rather than as an error. The design would then have to carry
+write-if-different as a load-bearing invariant purely to defend a hash that was never asked to
+measure content. The digest is already computed for the parent/child handshake below, so reusing
+it costs nothing and removes the trap outright: the key moves when, and only when, the text moves.
+Writing becomes write-*if-absent* rather than write-if-different, which is the naming paying for
+itself a second time: a file whose name is its content's digest either exists with that content or
+does not exist. The regression test is that a second run with unchanged text reuses the overlay
+and any edit rebuilds it. Note what is *not* claimed: editing back to a previous text does **not**
+reuse an earlier build. There is one overlay directory per environment holding one stored hash,
+not a cache keyed by content, so returning to an old text is simply another change.
+
+**A defect this design sits on top of, found while writing it.** The per-environment plan is
+**blind to the tree's own override files**. `plan_install()` hashes the requirement files and
+their includes plus the family contribution and nothing else, while the base path in
+`ensure_constraints()` hashes `req_files + override_files` in one walk. So editing
+`ai/**/overrides.txt` today invalidates the base compile and leaves every scoped overlay untouched
+— the same class of silence answer 5 is about, one layer down and already shipped. It matters here
+because forced is merged *with* those files: without the repair, a forced edit would rebuild and a
+tree-override edit beside it would not, from one merged input. It belongs in this increment
+because this increment is what makes the inconsistency observable, and it reintroduces no timing
+trap — those files change when the repository changes, and the forced file deliberately stays out
+of it (answer 5).
+
+Two things about that repair are not obvious from the sentence above, and both were missed on a
+first reading of it.
+
+- **It is not a one-line change, because `venv_env` may not reach the discovery.** The override
+  globs live in `depends.py`, and `venv_env.py` deliberately mirrors the hash and combine helpers
+  rather than importing it. The reason is worth quoting rather than paraphrasing, because it is not
+  the circularity one would guess: the header says importing `depends` "would pull in `engLib`",
+  and the file's whole claim is to be stdlib-only and therefore testable in isolation. Reaching for
+  the discovery would forfeit that. So the override file list has to be *passed in*, the way the
+  requirement list already is, which means the planning signature changes and every caller with it.
+  Small, but not invisible.
+- **It rebuilds every existing overlay exactly once**, and this is the half of the increment that
+  does. Adding a file to the walked set moves `current_hash` for every environment in whose scope an
+  `overrides.txt` falls, and at least one does — `packages/ai/src/ai/overrides.txt` is the file the
+  glob was written for. The first run after this ships therefore recompiles and reinstalls those
+  overlays. Read it against answer 5's opposite promise rather than as a contradiction of it: the
+  *forced digest* changes no key on day one, because no document carries forced text yet, while the
+  *override-walk repair* changes many, because the files it starts watching were always there. Two
+  contributions, two different day-one answers. The cost is one-time and it corrects a stale key
+  rather than regressing anything, but it is the kind of blast radius §4.16 learned to state up
+  front rather than let someone discover as a slow morning.
+
+**How the text reaches `depends.py` — no new document section, no new engine argument, one new
+environment variable.** The three plausible carriers for the *text* were weighed and two are
+unusable. A section in the runtime sub-document is unreadable at the moment it is needed: the
+engine reads only top-level `components[]` and ignores `config.pipeline` (§4.2), and
+`ensure_env_scoped()` is invoked from **C++** before the document is in play. A new engine
+parameter means a C++ change, because that function's only caller is the C++ hook passing three
+positional arguments — which is why its `has_isolated_group` parameter is always `False` on the
+live path. What remains is the carrier the feature already uses for per-run venv facts: the parent
+writes a file and announces it in the environment. What crosses is the **digest**, not the path —
+both sides derive the path from it, which is the same arrangement the child already has for its
+overlay (`venv_spawn.py`: "the child resolves its own overlay path from this; it is never told the
+path"). A glob would be wrong here — `OVERRIDES_GLOBS` is rooted at the executable dir, and it is
+a discovery mechanism for files that ship with the tree, not for one written per run.
+
+**And the path has a constraint on it that is easy to miss and expensive to discover.**
+`_override_args()` does not pass the shared file's absolute path; it passes
+`os.path.relpath(overrides_path, exe_dir)` with uv run at `cwd=exe_dir`, and its docstring gives
+the reason: **uv splits the value on whitespace**. An absolute path on Windows routinely contains
+a space — `C:\Users\First Last\...` — so any home for the forced file that is not under the
+executable directory would break the moment a real user profile got involved, and break in a way
+no developer machine with a space-free path would ever show. That rules out the system temp
+directory, which is otherwise the obvious place for a per-run file the parent already knows how to
+write. `<exe_dir>/cache/forced/<digest>.txt` relativises to `cache/forced/<digest>.txt` —
+space-free by construction, since the only variable part is hex.
+
+**"No engine argument" is not the same claim as "no C++ change", and the second one needs its own
+evidence — a new key in the document is exactly the shape a strict parser rejects.** Three
+independent reasons say it does not, and they were checked rather than assumed.
+
+- **The key never reaches C++.** `config.environment` lives on the *container*, and the partitioner
+  builds its output from leaves only: `_bucket_components()` and `_validate_source_placement()` both
+  open with `if is_container(component): continue`. Containers are dropped on both paths, scoped and
+  flattened alike, so `forced` is gone before a task file exists.
+- **The validator does not reject unknown members.** `PipelineConfig::validate()` is twelve
+  presence-and-type rules over named keys, and `validateComponent()` checks `id`, `provider`,
+  `config` and conditionally `profile` / `input` / `control`. Nothing in `engLib/store/pipeline`
+  resembles `additionalProperties: false`; the only errors carrying the word *unknown* are about an
+  unknown lane name and an unresolved component id — referential integrity, not schema shape.
+- **A container could not survive anyway, for a reason that predates this field.** Rule 6 requires
+  every component to carry a non-empty string `provider`, and a group has none. Were a container
+  ever handed to C++, it would be refused *as a container*.
+
+The third point also bounds the claim honestly: any path that gives C++ an **authoring** document
+without going through the Python partitioner already fails on the container itself. Forced adds no
+exposure there and removes none.
+
+**The other trip the document takes is into SaaS, and it survives that one too.** A deployment
+writes an **immutable artifact JSON** to org storage
+(`orgs/<org>/files/.deployments/<project>/v000N.json`) with the database row holding its sha256
+and size; nothing on that path maps the document through a typed model, so an added key travels as
+bytes. Two consequences follow and both are the ones wanted. A deployed pipeline's forced text is
+frozen with the rest of the artifact, so it cannot drift under a tenant between runs. And rolling
+a deployment back restores the older text, which changes the digest, which changes the environment
+key — the overlay rebuilds, which is what a rollback should mean. Worth establishing rather than
+assuming, because answer 9 is entirely about the SaaS path and this is the leg of it the section
+had not looked at.
+
+**`--override` is passed in three places, not one, and every one of them serves two paths.**
+`_override_args()` is read by `_run_uv_compile`, `_install_dry_run` and
+`_install_requirements_inner`, all three currently pointing at the one shared
+`overrides-combined.txt`. The part that makes this more than an argument-threading exercise is
+that none of the three belongs to the scoped path alone: `_compile_constraints_at` has two callers
+— the base compile reached from `ensure_constraints()` and the scoped one in `ensure_env_scoped` —
+and the install functions serve the runtime `depends()` path into base as well as the overlay. So
+an environment-aware `_override_args()` must learn which environment it is serving at each of the
+three, and **the base path must keep receiving the shared file**. *Told* is right for only one of
+them, which implementation made obvious and this paragraph originally got wrong: the compile is
+reached through `_compile_constraints_at`, whose caller knows the environment, so it takes the
+path as an argument. The two install readers are inside `depends()`, which **node code calls at
+runtime** -- there is no caller with an environment to hand over and no way for one to learn it.
+They read the *active* context instead (`_active_overrides_path()`): an overlay uses its own
+merged file, base keeps the shared one, and there is no third case. Same rule, two mechanisms, and
+picking the wrong mechanism for the install half would have meant adding a parameter no caller
+could fill. Getting that half wrong is silent in the worst way: the tree's own
+`ai/**/overrides.txt` would stop reaching the base compile, which is the compile that governs the
+engine runtime and the whole legacy path, and nothing would fail — the resolution would simply
+stop honouring an override that has been honoured since it was written.
+
+**"Base" here is not "main", and conflating them is the third way to get this wrong.** Base is the
+engine runtime's own `site-packages`, compiled by `ensure_constraints()` and shared by every
+process. `main` under `=1` is an ordinary environment with an overlay of its own at
+`venvs/<project>/main`, reached through `ensure_env_scoped` exactly like an isolated group — so it
+takes a per-environment merged file too, holding the tree's overrides and nothing forced, because
+answer 6 gives `main` no field to fill in. The rule is about the *caller*, not the name: whoever
+arrived through `ensure_constraints()` gets the shared file, whoever arrived through
+`ensure_env_scoped()` gets that environment's.
+
+**And "three places" was the wrong count — it counted readers, not needs, which the live run
+proved on the first real pipeline.** `_install_target`, the *scoped* install, read
+`_override_args()` nowhere, so it never appeared in any survey of call sites. It still needed the
+override, and the reason is the same thing that makes an override an override: this install is
+handed the environment's requirement file with `-r` and its compiled resolution with `-c`, and the
+whole point of forced is to make those two disagree — the requirements say what a node declared,
+the constraints say what forced turned it into. Without the same `--override` the compile ran
+with, uv re-resolves one against the other and refuses:
+
+> Because you require tabulate==0.9.0 and tabulate==0.10.0, we can conclude that your requirements
+> are unsatisfiable.
+
+Nothing revealed this earlier, and nothing could have: before forced existed an environment's
+requirement file and its own resolution never disagreed, so the missing flag changed no outcome.
+The failure is at least loud — the run dies rather than installing the wrong thing — but it dies on
+every forced pipeline, which is as bad as this feature gets. **The rule is therefore about the
+resolution, not about the reader list: wherever a scoped `-r` meets a scoped `-c`, the override
+that produced the `-c` goes with them.** Compile-only would still produce a `constraints.txt` that
+honours the forced lines, which is exactly why the gap reads as "mostly works" right up until an
+install has to re-resolve.
+
+**Figure C — the whole path, because the prose around it is six paragraphs and the branch that
+matters sits in the last one.** Everything below this figure explains a segment of it; nothing
+below shows it end to end, which is how a reader ends up holding the parent's write, the
+environment variable and the child's two cases as separate facts rather than as one path. Read it
+for two things the prose states but a picture makes unmissable: no lock is taken on the parent's
+side of the spawn at all, and the digest crosses the boundary while the text does not.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Panel (NodeConfigPanel)
+    participant D as .pipe document
+    participant T as Parent (task engine)
+    participant F as engine cache and env_dir
+    participant C as Child engine
+    participant U as uv
+
+    P->>D: config.environment.forced
+    D->>T: container and its forced text
+    Note over T: scoped = _venv_scoping_enabled(...)
+    alt inadmissible line, un-isolated container, or not scoped
+        T-->>P: ValueError naming the container - run refused
+    end
+    Note over T: normalise, then digest the normalised text
+    T->>F: write cache/forced/DIGEST.txt if absent, temp + os.replace, no lock
+    T->>C: spawn with ROCKETRIDE_VENV_FORCED_SHA
+    Note over C: before the lock: combine_hash decides rebuild
+    C->>F: under the lock, open cache/forced/DIGEST.txt
+    alt the named file is there
+        C->>C: merge tree overrides and forced, by normalised name
+    else non-empty digest, named file missing
+        C-->>T: refuse by name, run repeatable
+    end
+    C->>U: --override, at all three call sites
+```
+
+**What it deliberately leaves out.** The three warnings, because they happen *after* the compile
+and belong to an outcome rather than to the path; the tree-override walk repair, which changes when
+an overlay rebuilds and not how the text arrives; and the residual risks, which are properties of
+what gets installed. The refusal branches are drawn because they are the common failure and the
+prose spends more words on them than on the success path.
+
+So the parent — the process that holds the document and runs the partitioner — writes
+`<exe_dir>/cache/forced/<digest>.txt` before spawning the child, and announces it. Four
+mechanics of that sentence are load-bearing and easy to read past, and the first two both reverse
+what an earlier draft of this section said:
+
+- **The parent takes no lock, because neither lock is available to it.** The draft had it writing
+  "under the same `FileLock(paths.lock_file)` the install takes", which the partitioner's process
+  cannot do: `FileLock` lives in `depends.py`, and importing that from `packages/ai` pulls in
+  `engLib` — the dependency `venv_env.py` refuses in its own header for exactly this reason. The
+  lock that *is* reachable, `venv_env._EnvLock`, is private and **non-blocking**: it raises
+  `EnvBusy` the moment anyone else holds it, so a parent using it would fail an ordinary run
+  whenever an install of the same project happened to be under way. The third option is better
+  than both. The file is named by its content digest, so two parents that write it write identical
+  bytes and the only hazard left is a child reading a half-written one: write to a temporary name
+  in the same directory and `os.replace()` it into place — atomic on both platforms, no lock, no
+  `EnvBusy`, and nothing that can be held across the spawn by mistake.
+- **Against a purge a lock would have bought less than it looks like**, which is worth knowing
+  before someone reintroduces one. `_delete_env_dir()` holds `_EnvLock` while it empties the
+  directory and then **unlinks `install.lock` itself**. A lock whose file is removed by the very
+  operation it would exclude is not durable across that operation — a holder from before the
+  unlink and an acquirer from after hold different inodes. So a lock was never going to be what
+  closed the purge window; the next bullet is, by moving the file out of what purge empties.
+- **The file does not live in `env_dir`, because the parent cannot work out where `env_dir` is.**
+  An earlier draft put it at `<env_dir>/forced-<digest>.txt` and had the parent derive that
+  through `venv_env.env_dir()` / `env_paths()`, calling it "a new `ai` → `rocketlib` dependency,
+  small". It is not small and it is not available: `venv_spawn.py` already mirrors two of
+  `venv_env`'s constants by hand rather than importing them, and says why in a comment on the line
+  — *"Mirrors `venv_env.VENV_ENV_ID_ENV`, which this module cannot import (engine sys.path only) --
+  keep in sync."* `depends.py` reaches `venv_env` as a bare top-level `import venv_env`, which
+  resolves only when `rocketlib-python/lib` is on `sys.path`; `packages/ai` runs under `ai:test`'s
+  plain interpreter as well as inside the engine, so a module-scope import there would break the
+  suite outright. Reconstructing the path instead would mean mirroring `short_id()`'s truncation
+  and sanitisation across that same boundary, and a divergence would put the file where the child
+  does not look — which the digest check turns into a refusal rather than a wrong build, so it
+  fails loudly, but it fails.
+
+  **What the parent does know is `exe_dir`.** It computes `os.path.dirname(sys.executable)` today,
+  a few lines before the spawn, and hands it to the child as `cwd`; the child is literally
+  `sys.executable` — the same engine binary — so the child's `_get_executable_dir()` returns that
+  same directory by construction, not by convention (the child's helper wraps it in `abspath`,
+  which changes nothing: `sys.executable` is absolute on both sides).
+  `<exe_dir>/cache/forced/<digest>.txt` is therefore derivable identically on both sides from two
+  things each already has: the executable directory and the digest. The only thing mirrored across
+  the boundary is the literal `cache/forced`, which is the same class of duplication as the two
+  environment-variable names next to it and gets the same "keep in sync" comment — pointing at
+  `engine_cache_dir()`, whose docstring calls itself "single source of truth for the cache
+  location".
+
+  **The parent creates the directory, and that is the one thing the `env_dir` plan got right which
+  is easy to drop along with the rest of it.** `engine_cache_dir()` takes `create=False` by default
+  and `cache/forced/` has never existed, so a parent that writes into it blind fails on precisely
+  the first run anyone tries the feature on. `os.makedirs(..., exist_ok=True)` before the write,
+  and on the parent side only: the child opens a file and never needs the directory to have been
+  made by anyone but its writer.
+
+- **Putting it in the engine cache rather than under `venvs/` is a choice, and three things fall
+  out of it.** The cache is where the *other* override input already lives:
+  `_get_overrides_path()` is `engine_cache_dir()/overrides-combined.txt`, so the two files uv
+  merges now sit side by side. It is outside the tree the venv GC walks — `gc_envs` and
+  `list_envs` both `scandir(venv_root(exe_dir))` and treat **every** directory under it as a
+  project, so a `.forced` directory there would be enumerated as a project named `.forced` and
+  offered to `is_project_live`, which would not vouch for it. And it is outside what purge wipes:
+  `_delete_env_dir()` and `purge_env()` empty `env_dir`, which no longer holds this file at all.
+  That last one closes the purge window this section used to have to name — see below.
+
+`build_child_env()` already carries per-run venv facts as environment variables —
+`ROCKETRIDE_VENV_TOKEN`, `ROCKETRIDE_VENV_ENV_ID`, `ROCKETRIDE_VENV_ISOLATED` — so one more joins
+them: `ROCKETRIDE_VENV_FORCED_SHA`, a digest of the forced text, empty when the document has none.
+The *text* deliberately does not travel that way: it is unbounded multi-line free text and the
+Windows environment block is not.
+
+**Clearing the field needs no unlink, and that is worth saying because an earlier draft required
+one.** The danger was real: a `forced.txt` left from an earlier version would keep being passed as
+`--override`, so clearing the box would change nothing — answer 5's defect in a mirror. Naming the
+file by its digest closes it without a delete. An empty field is an empty digest, the child looks
+for no file at all, and yesterday's file is inert because nothing names it. The parent therefore
+writes when there is text and does nothing when there is not; it never removes, which is also what
+keeps one document from deleting another's file.
+
+**And the child trusts the digest, not the directory — two cases and a non-case.** The file
+lives in a directory every document on the host shares, so "whatever is on disk" is not an input
+the child may take on faith:
+
+- **Digest non-empty and `cache/forced/<digest>.txt` is there** — merge it into the overrides
+  and fold the digest into the key. The ordinary path.
+- **Digest non-empty and that file is missing** — refuse, by name, saying the run is repeatable.
+  Compiling without the overrides would install versions the document does not ask for, silently,
+  and the child cannot re-create what it never had. With the file out of `env_dir` no routine
+  operation produces this any more; what is left is an operator clearing the cache directory
+  between the write and the read.
+- **Digest empty** — merge nothing. The other files in `cache/forced/` belong to other documents
+  and are not this run's business; they are neither read nor removed. The naming is what makes
+  this a non-case rather than a rule.
+
+**The cases split across the lock, and the split is not arbitrary.** Folding the digest into
+the key is a pure function of the environment variable — no file is touched — so it belongs in the
+drift check, *before* the lock, with the rest of the key. It has to: the key is what decides whether
+the lock is taken at all, and a contribution computed inside it could never influence that decision.
+The child's file work — opening the named file, refusing when it is missing — goes **under** the
+lock, and gets there for free: it sits inside `_compile_and_install()`, which already holds
+`FileLock(plan.paths.lock_file)` across the compile and both installs.
+
+**That split is also a split between two modules, and getting it the other way round would cost a
+third copy of one literal.** `venv_env.py` is stdlib-only on purpose and cannot reach
+`depends.engine_cache_dir()`, so if it opened the file it would need its own `cache` path helper —
+a third place spelling out where the engine cache is, after `depends.py` and the parent. It needs
+none: the pre-lock half is a **pure function of the environment variable**, so `venv_env` reads
+`ROCKETRIDE_VENV_FORCED_SHA` — the way it already owns `VENV_ENV_ID_ENV` and `VENV_ISOLATED_ENV` —
+and folds the digest into the key without touching a path at all. The under-lock half lives in
+`depends.py`, which already has `engine_cache_dir()`. One module holds the digest, the other holds
+the file.
+
+**The line between them moved once during implementation, for a testing reason rather than a
+taste.** The merge itself — `requirement_name()` and `merge_override_lines()` — was written into
+`depends.py` first, next to the file access, and that put the most delicate logic in this
+increment behind an `engLib` import: every test touching it skips under a bare interpreter, which
+is exactly where it would be iterated on. Moving the two pure functions to `venv_env` cost
+nothing — they are text over requirement lines, like `write_combined`, and the module already
+imports `pkg_families` for `normalize()`. So the split is sharper than "digest here, file there":
+**`venv_env` holds everything pure, `depends` holds everything that touches the cache directory.**
+
+The parent's write is on the other side of the spawn and takes no lock at all, for the reasons
+above. So the lock's job is smaller than an earlier draft gave it: with digest-named files two
+runs of one project no longer contend for one path, and what it still guards is the
+compile-and-install critical section it was always guarding — not the forced file.
+
+The digest earns its place twice over, which is why it is worth naming what it is *not* doing any
+more. An overlay is keyed by `project_id` and shared across every per-source run of that project
+(§4.7), so two runs write the same `env_dir`. An earlier draft leaned on the digest to police that
+sharing — same document, same file, a no-op; different documents, a named failure — and the section
+below is why that was the wrong job to give it: differing documents for one project are routine in
+SaaS, not a race, so failing on them punishes the innocent. With the file named by its digest the
+sharing needs no policing at all. What the digest still does is the job it was introduced for:
+putting the forced text into the environment key (answer 5), and telling the child which file is
+its own.
+
+**In SaaS "two differing documents for one project" is not a race — it is the deployment model,
+and that changes what this rule costs.** The `deployments` table is unique on **(team_id,
+project_id)** and each row carries its own `version`: "the registry version this team currently
+points at". One project therefore runs at several versions at once, one per team, each from its
+own immutable artifact and so with its own forced text. The overlay directory is
+`venvs/<project_id>/<env_id>` and knows nothing about teams, so on a pod serving two such teams
+the two runs land in one directory. Under a single fixed filename the rule above would do what it
+was written to do — refuse rather than build the wrong thing — but it would refuse a team that did
+nothing wrong, intermittently, as a function of which pod took the request.
+
+Nothing here is created by forced: any requirement difference between two deployed versions of one
+project already shares that directory. What forced changes is reachability — the difference is now
+a text box rather than a node change — and severity, because the digest check would turn what used
+to be a redundant rebuild into a failed run.
+
+**The scoping that would have made this moot does not exist — checked, and checked again after
+the first check was too narrow.** `endpoint.cpp` reads `pipe["project_id"]` straight out of the
+document and hands that to `ensure_env_scoped(projectId, "main", providers)`. An earlier draft said
+"nothing rewrites the document's `project_id`", having searched only the SaaS extension, where
+every occurrence is a database-row constructor. One place does assign it: `task_engine.py`'s restart
+path sets `self._pipeline['project_id'] = project_id`, and its own docstring bounds that — the
+argument "must match existing", so it re-stamps the value the document already carries rather than
+substituting a run- or team-scoped one. The conclusion is therefore unchanged, and now it is the
+conclusion rather than the search that carries it: the engine keys the overlay by the pipeline's own
+project id, which two teams on two versions share by design.
+
+**So the file is named by its digest: `<exe_dir>/cache/forced/<digest>.txt`.** This is the whole
+fix, and it stays inside this section rather than reopening §4.9's keying. Two documents for one
+project no longer contend for one filename — indeed no two documents anywhere on the host do,
+since the name is a pure function of the content: each writes its own, all of them may sit in the
+directory, and the child opens exactly the one its `ROCKETRIDE_VENV_FORCED_SHA` names. The
+cross-version case becomes what it always should have been — a rebuild, because the environment
+key differs — instead of one team's run refusing because another team's run wrote first. The
+overlay's *contents* still alternate between versions, which is the pre-existing cost of a
+project-keyed directory. That is recorded as an open question at the end of §4.9 (`OQ-2`, §10),
+with the three shapes it could take and the circularity that makes the best of them more than a
+rename; what this section removes is the failure, not the churn.
+
+**The name carries the whole digest, and an earlier draft's reason for truncating it went away
+with the move.** That draft put the file under `venvs/<proj>/<env>/` and shortened the name to
+sixteen hex characters on `short_id()`'s argument — the tree budgets path length on purpose because
+a GUID nested above `site-packages` plus deep torch/nvidia paths already threatens Windows' 260, and
+a 64-character component is a lot to add to that. In `<exe_dir>/cache/forced/` the budget is not
+under pressure: the whole relative path is `cache/forced/` plus a 68-character leaf, and nothing
+nests below it.
+
+Dropping the truncation removes a hazard rather than merely a rule. Two lengths in one design means
+two spellings of one identity — the name uses sixteen, `ROCKETRIDE_VENV_FORCED_SHA` and the key
+contribution use sixty-four — and a parent writing one while a child opens the other would agree
+with every word of this section and still never find the file. One form removes the possibility:
+`<digest>` means the full sha256 hex everywhere it appears, in the file name and in the variable
+alike.
+
+**The naming deletes a case rather than adding one.** With a digest in the name there is no such
+thing as "a file present that no digest vouches for": a stale file from another document is simply
+not the one this run is looking for, and an empty digest looks for nothing at all. So the three
+cases become two — *the named file is there* and *the named file is missing* — and the second
+keeps its refusal. Leftovers are not swept by the run that finds them, on purpose: sweeping is how
+one document would delete another's file.
+
+**The purge window an earlier draft had to name is closed by the move, not by an argument.** With
+the file at `<env_dir>/forced-<digest>.txt` an explicit purge (§4.10) — which drops
+`requirements.hash` and then empties the directory — could land between the parent's write and the
+child's read and leave a non-empty digest with no file. In the engine cache it cannot: purge and
+GC both operate on `venvs/`, and neither touches `cache/`. The refusal case above survives as a
+backstop for an operator who clears the cache by hand, and it still has to name the cause and say
+the run is repeatable, but it stops being a window the design opens and becomes one an operator
+would have to open deliberately.
+
+**What the move does open is a reclamation question, and it is genuinely open** (`OQ-18`, §10)**.**
+Nothing collects `cache/forced/`. Each file is a few hundred bytes of text, the names are
+content-addressed so edits accumulate rather than replace, and the venv GC deliberately does not
+walk the cache. Age is the same signal `gc_envs` already uses and the same argument applies — a
+collected file is rebuildable, since the parent rewrites it on the next run of that document — so
+this is a small addition to an existing pass rather than a new mechanism. It is left out of this
+increment because unbounded growth of small text files is not a failure anyone will hit before the
+increment ships, and pulling GC into a text-box feature is how increments stop landing.
+
+**6. `main` gets no equivalent.** The field lives on the container; a pipeline without an isolated
+group has nowhere to type it and gains nothing document-level. Tree-level `overrides.txt` remains
+the operator's instrument for `main`.
+
+**7. The field admits PEP 508 requirement lines, comments and blank lines — nothing else.**
+`-r`, `-c`, `-e`, `--index-url`, `--extra-index-url`, filesystem paths and URLs are refused. `-r`
+would make a user-supplied string read a path off the server. An index flag is worse than it looks:
+the compile already runs with `--index-strategy unsafe-best-match`, so uv checks *every* index and
+takes the best version — an added index publishing a higher version of any package wins, which is
+dependency confusion — and `--emit-index-url` writes the index into `constraints.txt`, where later
+installs read it. Strict is also the tightenable direction: relaxing the grammar later breaks
+nothing, tightening it breaks documents.
+
+**"Strict PEP 508" names a standard this tree has no implementation of, so the gate declares one**
+(`OQ-19`, §10 — closed)**.** Nothing here imports `packaging`, nothing declares it, and the
+requirement-line handling that exists is deliberately hand-rolled for a narrow input:
+`parse_resolution()` splits on `==` over uv's own compiled output and skips anything without an
+exact pin, and `version_key()`'s docstring says outright that it is "**not** a PEP 440
+implementation, and it does not need to be". Two places in this design need more than that — this
+gate, and the name-level merge in answer 5, which has to pull a name out of an arbitrary *tree*
+override line rather than out of a compiled one. `packaging==26.3` does appear in
+`dist/server/cache/constraints.txt`, so it is installed in base today, but transitively, through
+somebody else's dependency: relying on that without declaring it is the kind of unstated
+assumption this section keeps catching elsewhere.
+
+**The answer splits by job rather than picking one parser.** This gate — the partitioner's, over
+text a tenant typed — declares `packaging` and refuses on `InvalidRequirement`, because it is the
+security boundary of the whole feature and a wrong accept hands a document `-r`. A boundary should
+rest on a standard someone else maintains, not on a regex we wrote. The name-level merge in answer
+5 gets a hand-rolled extractor instead: it needs a *name* and nothing more, its input is the
+tree's own `overrides.txt` files rather than tenant text, and `depends.py`'s neighbourhood guards
+its imports on purpose. What keeps the two from drifting is that both end in
+`pkg_families.normalize()`, so they cannot disagree about what a name *is* — only about what a
+line is, and only one of them is asked that question.
+
+**Measured 2026-09-08, because "`parse_resolution()` is not enough" deserves better than an
+assertion.** Ten lines through it, and the failure is not that it errs — it is that its *silence*
+is ambiguous:
+
+| line | `parse_resolution()` |
+| --- | --- |
+| `tabulate==0.9.0` | `{'tabulate': '0.9.0'}` |
+| `torch==2.10.0+cu128 ; sys_platform != 'darwin'` | `{'torch': '2.10.0+cu128'}` |
+| `requests[socks] == 2.32.3  # comment` | `{'requests': '2.32.3'}` |
+| `torch[cuda]>=2.1,<3.0` | `{}` |
+| `opencv_contrib_python ~= 4.10` | `{}` |
+| `numpy` | `{}` |
+| `-r other.txt` | `{}` |
+| `--index-url https://evil.example/simple` | `{}` |
+| `./local/pkg-1.0-py3-none-any.whl` | `{}` |
+| `pkg @ https://example.com/pkg.tar.gz` | `{}` |
+
+Five of the ten come back empty, and they are not the same five as the dangerous ones. A bare
+`numpy` is row 2 of this section's own table — the case the requester asked for by name — and it
+reads identically to `-r other.txt`. So "empty" can be neither the rejection signal for the gate
+nor an answer for the merge: a tree override line of `opencv_contrib_python ~= 4.10` yields no
+name, the merge therefore does not know it names the same package as a forced
+`opencv-contrib-python==4.11.0.86`, keeps both, and hands uv the conjunctive pair this section
+measured resolving to *"your requirements are unsatisfiable"*. That is the concrete damage, and it
+is why the answer sizes two steps rather than one.
+
+What the gate does **not** police is duplication: two forced lines for one package are admissible
+here, because row 5 needs exactly that, and two *contradictory* unmarked lines are a resolution
+problem rather than a syntax one — so they take answer 8's second road and come back in uv's words.
+Those words are now known rather than assumed: overrides are conjunctive, so the message is
+*"Because you require X==a and X==b, we can conclude that your requirements are unsatisfiable"*.
+Serviceable — it names the package and both versions — which is why the gate reads lines, not
+intent.
+
+**What `Requirement()` admits and refuses, measured 2026-09-08 rather than assumed.** The gate
+is only as good as the parser's refusals, so they were run rather than trusted. `Requirement`
+raises `InvalidRequirement` on every shape answer 7 names — `-r other.txt`, `-c constraints.txt`,
+`-e .`, `--index-url …`, `--extra-index-url …`, a relative path, a Windows absolute path, and a
+truncated `tabulate==` — and accepts every shape the five examples need, the marker-scoped pair
+included. **One shape it accepts that this field must not** is the PEP 508 *direct reference*:
+`pkg @ https://example.com/x.tar.gz` parses cleanly and yields `url='https://example.com/x.tar.gz'`.
+That is "forced never adds" in reverse — a document naming a distribution to fetch from anywhere —
+so the gate checks `requirement.url is not None` explicitly on top of the parse. Leaning on the
+parser alone would have left exactly one hole, and it is the one that matters.
+
+**And the two "no environment" refusals are ordered, which is a decision rather than an
+accident.** Isolation is reported **before** scoping. Under `auto` an un-isolated lone container
+produces both conditions at once — it is not an environment, *and* the run is therefore not scoped
+— so whichever is checked first is the message the author reads. "Enable isolated dependencies or
+clear the field" is something they can act on in the panel they are already in; "this run is not
+scoped" sends them looking at a server switch that is not their problem. The scoping message
+survives for the case that genuinely is it: an isolated container under
+`ROCKETRIDE_SERVER_USE_VENV=0`.
+
+**8. Syntax fails at partition time; semantics fail in uv.** A refused flag or an unparseable
+PEP 508 line is rejected during partitioning with a named cause carrying the container and the
+line.
+
+**"Early enough for the canvas to show it" was wrong, and the live run showed why** — the
+sentence assumed that being early was the same as being visible. It is not. The canvas renders a
+startup failure out of `taskStatus`: `NodeStatus` shows *"✕ Failed to start"* when a task
+completed with zero done and a recorded error. A partition-time refusal happens **before the task
+exists** — the server logs *"Task creation failed, cleaned up"* — so there is no status object to
+carry it, and the node keeps showing its previous idle line. Measured with a single `=`
+(`tabulate=0.10.0`): the message reached the log and nothing reached the canvas, while the *later*
+install failure from the same feature rendered on the node correctly, because by then a task
+existed. This is not specific to forced — it is how every one of the partitioner's dozen refusals
+behaves, and it belongs with `OQ-11`.
+
+What this increment does about it is bound its own case rather than fix the general one: the
+settings panel checks the shapes people actually type — a single `=`, a flag, a path, a URL — when
+the container is saved, and shows the message in the panel's own error banner. The panel is where
+the text was typed, which makes it a better place than the canvas anyway. **That check is
+ergonomic, not the boundary**: `packaging` on the server still decides, because a document can be
+hand-authored, imported or deployed without ever passing through this panel, and a second parser
+that grew into the first would drift from it. The client changes *when* the author finds out, not
+*whether* the run is refused. A version that does not exist, or a requirement that cannot be
+satisfied, comes from uv at install time in uv's own words. Two places, but two distinguishable
+classes: *your line is not admissible* versus *your requirement does not resolve*. Putting
+everything in uv is not cheaper — the admissibility gate has to exist regardless, or `-r` reaches
+uv.
+
+The early half needs no new machinery either: the partitioner already refuses with a plain
+`ValueError` whose message *is* the explanation — twelve of them today, from "the source/root must
+stay in main" to the cross-environment cycle report — so a forced refusal is one more of those, not
+an exception hierarchy to design.
+
+**Where the warnings go, and what that costs.** Three answers above promise a warning: an inert
+forced line (2), lost extras (3), a contradicted family declaration (4). The channel that exists is
+`updateProgress()`, which calls `monitorStatus()` and is the same path already reporting
+`Downloading torch (2.7GiB)` to the client. The install-lock sidecar beside it is *not* a second
+channel: it is inter-process, read by a process waiting on the lock, and reaches no user. Two
+consequences, both accepted here rather than solved:
+
+- **Timing, and why all three sit on the child side.** The inert-line and family warnings can only
+  be computed once a resolution exists, so they are emitted after the compile, comparing forced
+  names against `_read_resolution(constraints_path)` — the reader `_shadowing_check()` already
+  uses. No new normalisation is needed for that comparison and none should be written:
+  `parse_resolution()` already returns `{normalised dist: version}`, stripping extras from the
+  name, and `pkg_families.normalize()` is the PEP 503 rule answer 3 names. Normalise the forced
+  name with that same helper and the keys meet. A partition-time check against direct requirements
+  alone would over-warn, because a package appearing only transitively is still overridden
+  successfully. The lost-extras warning *reads* as though it could be earlier, since it only needs
+  the direct requirement files — but those come from `ast_deps.discover_for_providers()`, called
+  nowhere but `ensure_env_scoped()` in the child. At partition time the set does not exist yet. So
+  the warnings are one group in one place, and the partitioner emits refusals only (answer 8).
+- **They fire on a rebuild, and that is complete rather than a compromise** — a question the
+  design left open until the code answered it. Every input the three warnings read is in the
+  environment key: the forced text enters by digest, the requirement files by the walk, the
+  family declarations through `combine_hash`. So any edit that could change a warning also
+  rebuilds, and an overlay whose hash matched is one whose warnings were emitted on the run that
+  built it. Note that this reasoning deliberately does **not** transfer to `_shadowing_check`,
+  which sits outside every gate for the opposite reason: it depends on what *this process* has
+  imported, which no key can see.
+- **Durability.** `monitorStatus()` is a *progress* channel, so a warning sent through it scrolls
+  past. No durable per-container diagnostic surface exists today and building one is out of scope
+  for this increment. It is named because answer 2 leans on the warning: override-only makes an
+  unmatched line inert, and a warning that scrolls past is only just better than silence.
+
+**9. Tenancy: one mode everywhere, no gate, no deny-list.** Answer 2 is what permits this. Had
+forced been able to add, a tenant-supplied document could install an arbitrary distribution into a
+process whose overlay precedes base on `sys.path` (§4.11), and the design would have needed a
+SaaS-only restricted mode — for which there is **no usable discriminator in the process that would
+enforce it**: `--saas` selects the SaaS `Account` implementation from `sys.argv`
+(`ai/account/__init__.py`) and is passed by `k8s/alb/deployment.yaml`, but *not* by
+`k8s/eaas/deployment.yaml`, and EAAS is the pod that spawns the pipeline subprocess and therefore
+runs the partitioner. A gate on `--saas` would have been open in exactly the process that executes
+tenant documents. Override-only removes the need for the gate rather than solving it.
+
+One near-miss is worth closing before someone offers it: §4.9 records that `ROCKETRIDE_CLIENT_ID`
+*does* reach the child, so identity of a sort crosses the boundary. It is not the identity this
+answer needed. What a SaaS-only mode has to tell apart is **deployment shape**, SaaS from OSS, and
+account context is present on both paths — its presence discriminates nothing, and `--saas`, which
+would, is on the wrong pod. The client id is useful to §4.9's keying question and useless to this
+one. The hazard and the two bounds that contain it are carried in §6's register, so a reader
+asking "what could go wrong with venvs" meets this without having to be in this section already.
+
+**Residual risks, recorded rather than designed away.**
+
+- **sdist build execution** (`OQ-5`, §10)**.** A forced version that resolves to an sdist is built
+  in the engine's own environment: `--no-build-isolation` is passed on both the compile and the
+  install, and `--only-binary` never reaches the uv command line. Under override-only the choice is
+  confined to published versions of packages the tree already installs, so this is version
+  selection rather than code injection — but it is not nothing.
+
+  **The instrument is finer than it first looks, and the tree already uses it.** The blunt form is
+  `--only-binary=:all:` for environments with non-empty forced, which nothing passes today and which
+  would fail any package with no wheel at the chosen version. The form actually in use here is *per
+  package, inside a requirement file*: `requirements_kokoro.txt` and `audio_tts/requirements.txt`
+  both carry `--only-binary docopt` and `--only-binary num2words`, commented "so the embedded engine
+  installs them without building any source distribution" — the very reason this risk exists. The
+  merged override file is ours to generate rather than the user's to write (answer 7 governs the
+  *field*, not the file), so emitting one such line per forced package is the shape to try first.
+  **Half measured, and the half that is matters.** uv *accepts* an override file carrying an
+  `--only-binary <name>` line — no error, and the override still applies (a requirement of
+  `tabulate==0.9.0` against an override of `--only-binary tabulate` plus `tabulate==0.8.10` resolves
+  to `0.8.10`). So the file is parsed as a requirements file there, which is the part that could
+  have killed the idea outright. What is *not* shown is that the constraint binds: proving that
+  needs a package with no wheel at the chosen version, so that the resolve fails with the line and
+  succeeds without it. That is the one measurement left if this is picked up.
+
+- **Transitive drag past the runtime** (`OQ-6`, §10)**.** Forcing an older version pulls older
+  transitive dependencies, and the overlay precedes base on `sys.path` in the child.
+  `_shadowing_check()` does **not** cover this: it walks only registered families and only reports
+  a namespace already imported in this process at another version.
+
+**Measured 2026-09-08, not inferred.** Ten `uv pip compile` runs over small fixtures — seven cases
+and three controls, the controls being what make the marker, transitive and extras cases
+measurements rather than assertions:
+
+- **`--override` reaches top-level requirements**, not only transitive ones. `tabulate==0.8.10` as
+  the direct requirement, overridden by `tabulate==0.9.0`, resolves to `0.9.0`, attributed to both
+  `--override` and `-r`. So a forced line can move a pin a node declares directly — which is what
+  the five examples assume and what nothing in the engine previously demonstrated.
+- **An override for a package nothing requires installs nothing.** Requirement `tabulate==0.9.0`
+  with an override of `six==1.16.0` resolves to `tabulate` alone; `six` does not appear. Answer 2's
+  "never adds" is therefore *uv's own behaviour*, not a rule this design has to enforce — which is
+  what makes it dependable as the security boundary rather than one validation away from failing
+  open.
+- **One unmarked forced line displaces two marker-scoped ones** (row 4). Requirements pinned
+  `0.8.10` under `sys_platform == "win32"` and `0.8.9` otherwise, overridden by a bare `tabulate`,
+  resolve to a single unpinned `0.10.0`; the same requirements without the override resolve to
+  `0.8.10`. Rows 2 and 4 of the table are uv semantics verbatim.
+- **Markers work inside the override file, so row 5 is measured and not merely claimed.** A
+  requirement of `tabulate==0.8.10` against an override file holding `==0.9.0 ; sys_platform ==
+  "win32"` and `==0.8.9 ; sys_platform != "win32"` resolves to `0.9.0` on this machine, attributed
+  to the override. The opening paragraph asserted rows 4 *and* 5 as uv semantics; only row 4 had
+  been shown, and a forced *pair* is the shape the requester asked for by name.
+- **A purely transitive package is overridden successfully.** `requests==2.32.3` alone resolves
+  `idna==3.19`; with an override of `idna==3.6` it resolves `3.6`, credited to the override. This
+  is the fact the warning design rests on — it is why an inert forced line has to be detected
+  against the compiled *resolution* rather than against the direct requirement files, which would
+  call this successful override "inert" and warn about it.
+- **Extras really are lost, and something real disappears with them.** `requests[socks]==2.32.3`
+  resolves `PySocks`; the same requirement under an override of a bare `requests==2.32.3` resolves
+  without it. Answer 3 reasoned its way to this; here it is on a package anyone can check, and it
+  is what makes the lost-extras warning necessary rather than fastidious — the user moves a version
+  and a dependency they never mentioned stops being installed.
+- **Two `--override` files naming one package are conjunctive, not last-wins.** `tabulate==0.9.0`
+  in one and `==0.10.0` in the other, over a requirement of `==0.8.10`, resolves to nothing at all:
+  *"Because you require tabulate==0.9.0 and tabulate==0.10.0, we can conclude that your
+  requirements are unsatisfiable"*. This is the measurement that makes the name-level merge a
+  requirement rather than a preference, and it also fixes what answer 7's unpoliced duplicate looks
+  like when it reaches the user.
+
 
 ### 4.8 AST discovery of `ai/**` requirements
 Run **once per pipeline init**, cached by node-set hash.
@@ -1377,7 +2243,7 @@ imports live **exclusively in the local (no-model-server) branch**. Implications
 
 ### 4.9 Directory layout, identity & keying
 
-**Figure C — the layout, and which process writes each entry.**
+**Figure D — the layout, and which process writes each entry.**
 
 ```text
  <exe>/
@@ -1654,6 +2520,60 @@ Findings behind the cost estimate, to re-verify when the question is reopened:
   shortened id segment** (e.g. first 8 hex of the `project_id` GUID; likewise `group_id`). Point all
   venv installs at **one shared `uv` download cache** so common wheels aren't re-downloaded.
 
+**Open, and deliberately left open (`OQ-2`, §10): what the overlay directory should be keyed by
+once SaaS is the main consumer.** Raised 2026-09-08 out of §4.7.1 and parked there and then — the
+decision is *do the minimum now and think when the SaaS path actually needs it*, so what follows
+is the state of the question, not a design.
+
+The directory is `venvs/<project_id>/<env_id>` and knows nothing about who is running. In SaaS one
+project runs at several versions **at the same time**: the `deployments` table is unique on
+`(team_id, project_id)` and each row carries the registry version its team points at. So two runs of
+one project can legitimately want different installs, and they land in one directory — the second
+rebuilds what the first just built, back and forth, for as long as both stay live.
+
+What that costs today is **churn, not failure**. The failure it used to cause is gone: §4.7.1 names
+its forced file by the digest of its contents, so two documents no longer contend for one path.
+Nothing is broken while this stays open; overlays are simply rebuilt more often than their contents
+require.
+
+Three shapes, with what each actually buys:
+
+- **Leave it.** Correct results, redundant rebuilds when versions alternate. Costs nothing to keep.
+- **Put the team or the version in the path** (`venvs/<team>/<project>/<version>/...`). The obvious
+  move and the wrong axis. An overlay is a *cache*, and its honest key is whatever determines the
+  installed set — requirement files, tree overrides, family declarations, forced text, platform.
+  Team is not in that list: two teams on one version install byte-identical trees, so keying by team
+  buys N copies of a several-hundred-megabyte tree for zero difference in content, on a path where
+  `venvs/` is charged to `ephemeral-storage` and breaching it evicts the pod. Version is in the list
+  only by proxy — two versions differing in a prompt string install the same thing. Both also *miss*
+  what the hash catches, such as a `nodes:sync` that changed a requirement file.
+
+  **On the plumbing, an earlier draft of this entry was wrong and the correction cuts both ways.**
+  It said neither identity reaches the engine. One does: `build_child_env()` copies the parent
+  environment wholesale and sets `ROCKETRIDE_CLIENT_ID` to the task's `client_id`, which is
+  authenticated client identity — the same value the hosted path keys per-tenant DSN resolution on.
+  So a tenant-shaped discriminator is already at the child's elbow and this shape would need no new
+  channel. What is **not** established here is its granularity: whether `client_id` separates teams
+  inside one organisation, or only organisations, is unmeasured, and the whole argument for putting
+  a *team* in the path turns on that. Version identity genuinely does not reach the engine. The
+  objection that survives untouched is the one above — team is the wrong axis for a cache key
+  whatever its plumbing costs, because two teams on one version install byte-identical trees.
+- **Content-address the leaf** (`venvs/<project>/<env>/<hash>/`). The key becomes what already
+  decides a rebuild. Identical content is shared once, versions coexist without alternating, a
+  rollback reuses its old tree instead of rebuilding it, and no new identity has to reach the engine
+  because the hash is computed there already. Project and environment stay in the path so
+  purge-by-project still maps to a subtree.
+
+**The obstacle to the third one is real and worth writing down before someone estimates it as a
+rename.** The hash would have to be known *before* the directory is chosen, and today part of it is
+read *from* that directory: `plan_install()` folds in the family contribution
+`pkg_families.hash_contribution(paths.constraints)`, taken from the environment's previous
+resolution. That circularity is the
+work, not the path change.
+
+**Revisit when** version alternation is observed to cost real time or real disk on a SaaS pod —
+that is the trigger, and until it fires this stays a note.
+
 ### 4.10 Lifecycle: process model, per-run process, install lock, purge/GC
 
 **Five figures before the policy, because the process model has never been drawn in §4.** Until
@@ -1666,7 +2586,7 @@ what order the guard is driven** (F), **what one child's spawn actually does, fa
 it:* **figure I**, how one overlay is judged for collection, sits with the reclamation policy at the
 end because it is about a directory's life, not a process's.
 
-**Figure D — the process tree of a scoped run.** Every box is the *same* `engine` binary in a
+**Figure E — the process tree of a scoped run.** Every box is the *same* `engine` binary in a
 different role: the server runs `ai/eaas.py`, every task subprocess runs `ai/node.py`
 (`CONST_AI_NODE_SCRIPT`) against a task file.
 
@@ -1704,7 +2624,7 @@ only the children** — under `=0` that same `ffmpeg`/`uv`/model-server load run
 engine, so excluding it would leave the commonest case uncovered. And **grandchildren hang off the
 engines, never off the server**, which is exactly why F1's obvious test proves nothing (figure E).
 
-**Figure E — what actually bounds a process's life.** Three mechanisms, three different coverages;
+**Figure F — what actually bounds a process's life.** Three mechanisms, three different coverages;
 the document states them in three separate places and never crosses them, which is what makes the
 one uncovered cell easy to miss.
 
@@ -1723,7 +2643,7 @@ nothing — while **column 2 was covered by nothing at all** until 8.5B. That is
 the increment, and it is invisible in any one row. The residual cell is argued below (`PR_SET_PDEATHSIG`
 is refused, not overlooked), and the honest-coverage bullet says which cells CI has ever executed.
 
-**Figure F — the order the guard is driven in, and the two orderings that are correctness.**
+**Figure G — the order the guard is driven in, and the two orderings that are correctness.**
 
 ```mermaid
 sequenceDiagram
@@ -1772,7 +2692,7 @@ invalidates the handle — a "create if `None`" guard would assign a restarted t
 handle, every `assign` would fail into its deliberate no-op degradation, and orphan safety would
 disappear without a symptom.
 
-**Figure G — one child's spawn, failure path included.** Figure F is the guard's view across the
+**Figure H — one child's spawn, failure path included.** Figure G is the guard's view across the
 whole run; this is one child end to end. Drawn because the failure branch is the half that only
 exists as prose in §7, and it is the branch that runs on someone's first `=1` pipeline.
 
@@ -1815,7 +2735,7 @@ finish, which would truncate exactly the lines the error is about to quote. And 
 not a failure** — it is the pre-8.5 behaviour kept deliberately, so a reworded status line on the node
 side costs latency rather than the run.
 
-**Figure H — the readiness budget is a ceiling on silence, not on elapsed time.**
+**Figure I — the readiness budget is a ceiling on silence, not on elapsed time.**
 
 ```text
    t=0        10s        20s        30s        40s        50s        60s
@@ -1855,7 +2775,7 @@ drawn in **§3.1, view 1**.*
   and until 2C-GC it outlived everything else too. Its end is now age: the reclamation policy at the
   end of this section collects an overlay nothing activates.
 - **Orphan safety is OS-level, and the two platforms do NOT deliver the same guarantee (8.5B).**
-  Written as two claims on purpose; one sentence covering both would be false. *Figure E is the map
+  Written as two claims on purpose; one sentence covering both would be false. *Figure F is the map
   and these two bullets are the detail — the platform split is the bottom two rows of it.*
   - **Windows: kernel-enforced, whole tree, unconditional.** The server holds an **anonymous** Job
     Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; every venv child *and* the main engine are
@@ -1929,7 +2849,7 @@ drawn in **§3.1, view 1**.*
   the moment environments got distinct directories, which is what 8.7A delivered under `=1` (and
   8.7B extends to `auto`). The item was never blocked on locking; the code was written for it and
   then starved of distinct overlays. It was blocked on F6.
-  **Second half still OPEN**, and it is a separate question: the behaviour today is `FileLock`
+  **Second half still OPEN** (`OQ-3`, §10), and it is a separate question: the behaviour today is `FileLock`
   polling until the holder releases — **wait, never fail** — and nothing has revisited whether that
   is the right answer. Claiming this bullet whole is the easy error, and one that only surfaces
   when two runs of one project collide months later.
@@ -2032,7 +2952,7 @@ drawn in **§3.1, view 1**.*
     pod. Age-based collection provably cannot help there: a pod's writable layer starts empty, so
     nothing in it is ever old. `last_used` ships now as LRU's ready input.
 
-**Figure I — how one overlay is judged, and the two places the answer is deliberately asymmetric.**
+**Figure J — how one overlay is judged, and the two places the answer is deliberately asymmetric.**
 
 ```mermaid
 flowchart TD
@@ -2065,7 +2985,7 @@ The venv child runs the **original `engine.exe`, unmoved**; the overlay's `site-
 **ahead of base** on `sys.path` for **overlay precedence** (venv `torch` wins; appending would let
 base shadow it). **`PYTHONPATH` won't work** (isolated `PyConfig`); use the runtime insert.
 
-**Figure J — the precedence stack, and the two ways to get it wrong.**
+**Figure K — the precedence stack, and the two ways to get it wrong.**
 
 ```text
   sys.path inside a venv child engine
@@ -2245,7 +3165,8 @@ asymmetry in §4.13).
   document** (§4.7). **Process-count note:** each source is its own task/process today, so a pipeline
   with N sources and M venvs spawns **N × (1 + M)** processes (children are per-run, never shared across
   source-tasks, §4.10). The per-env install lock covers the shared *disk* env; the process count itself
-  is the accepted v1 cost — revisit (shared children per pipeline) only if real pipelines hit limits.
+  is the accepted v1 cost — revisit (shared children per pipeline) only if real pipelines hit limits
+  (`OQ-4`, §10).
 
 ### 4.14 Non-pipeline entry points (engtest, CLI, ad-hoc, test harnesses)
 These have **no `project_id`**, so the scoping must degrade gracefully. **Where that degradation
@@ -2386,7 +3307,7 @@ an environment variable at all — the collector is switched off with the server
 `--venv-gc-disabled`, deliberately, since an operator killing a background sweep should be doing it
 where the process is launched rather than through the environment a run inherits.
 
-**Figure K — who sets each variable, who strips it, and who freezes it.** The prose above makes the
+**Figure L — who sets each variable, who strips it, and who freezes it.** The prose above makes the
 argument; the figure is what an auditor reads. Drawn because "assigned to a child, popped from main"
 is stated in three places (§3.1, here, and 8.7A) and still lands as an oddity rather than a rule.
 
@@ -2427,7 +3348,7 @@ resolution it would govern and silently has no effect. Putting the switch there 
 today. Closing this properly means moving the engine's `load_dotenv` ahead of dependency resolution, not
 teaching `venv_env` to parse the file.
 
-**Figure L — the gate, in full.** Two inputs, one function (`scoping_enabled`), six cases.
+**Figure M — the gate, in full.** Two inputs, one function (`scoping_enabled`), six cases.
 
 | `ROCKETRIDE_SERVER_USE_VENV` | mode | isolated group in the document? | `scoping_enabled` | what actually runs |
 | --- | --- | :---: | :---: | --- |
@@ -3156,7 +4077,7 @@ reproduce the build's index configuration (an earlier attempt died on an unrelat
    `ai.common.models` barrel `__init__` re-exporting every submodule, so barrel-importing nodes
    over-included the whole ML stack — is **DONE**: Option A moved the four barrel importers to
    full-path imports, and 2A-R's self-describing-directory rule closed the within-family half
-   (§4.8, §6). Second axis, still open: the walk (or a model-server-aware pruning of it) must account for
+   (§4.8, §6). Second axis, still open (`OQ-7`, §10): the walk (or a model-server-aware pruning of it) must account for
    `--modelserver` mode, where the heavy `ai/**` deps aren't imported at all (§4.8 Model-server
    dimension).
 3. **Non-isolated grouped pipelines — RESOLVED: they do NOT run today (verified).** `getProjectComponents`
@@ -3177,7 +4098,7 @@ reproduce the build's index configuration (an earlier attempt died on an unrelat
    `--debug_port` from the existing port broker (`assign_port`), exactly as the main engine does today.
    The client attaches to **main**, which **advertises/multiplexes the child DAP endpoints** (it already
    owns the per-child sockets as the hub, §4.6). Cross-cut single-stepping and unified breakpoint UX are
-   the genuinely open part → 2C.
+   the genuinely open part → 2C (`OQ-12`, §10).
 
 ## 6. Risks & gating requirements
 - 🟢 **Metrics/billing multi-PID rollup (money bug) — driver-feasibility DE-RISKED, and the grouping
@@ -3253,6 +4174,19 @@ reproduce the build's index configuration (an earlier attempt died on an unrelat
   crosses these lanes and must meet a throughput target on the loopback WS bridge (2-hop hub multiplies
   buffer copies), with UI warning on a heavy-lane boundary and shared-memory zero-copy as the v2
   fallback. Store-fetch in the child needs account context (secrets/`ROCKETRIDE_CLIENT_ID` propagation).
+- 🟠 **Tenant text reaching the dependency resolver — bounded by design, two residuals named
+  (§4.7.1, not yet implemented: 2C-FR).** The *Forced Python requirements* field puts a string
+  from the document into `uv pip compile --override`. What bounds it is that forced **overrides
+  and never adds** — measured, not assumed: an override rewrites what something already declared
+  and installs nothing that nothing requires, so a document cannot name a distribution the tree
+  does not already pull. Without that bound the field would install arbitrary packages, and
+  installing executes their code (`--no-build-isolation` on both the compile and the install;
+  `--only-binary` never on the uv command line). Admissibility is the second bound: PEP 508 lines,
+  comments and blanks only — no `-r`, which would be a file-read primitive over a user-supplied
+  string, and no index flags, because the compile already runs `--index-strategy
+  unsafe-best-match` and an added index is then dependency confusion. Two residuals survive both
+  bounds and are indexed: `OQ-5` (a forced version resolving to an sdist is still built here) and
+  `OQ-6` (older transitive dependencies dragged in ahead of base on `sys.path`).
 - **Cross-env cyclic deadlock** — v1: detect env-cycles at partition and reject.
 - **Secrets scoping (a win):** partition runs on the *resolved* pipeline, so each child sub-document
   carries only the secrets its own nodes reference (the `ocr` venv never sees the LLM key). Document how
@@ -3265,10 +4199,13 @@ reproduce the build's index configuration (an earlier attempt died on an unrelat
 
 ## 7. Phased implementation plan
 
-**Figure M — what unblocked what.** This section is long and written as a running log, so the
+**Figure N — what unblocked what.** This section is long and written as a running log, so the
 *order* is visible while the *dependencies* are not; the edges below are the ones the entries state
 about themselves, not inferred ones.
 
+> The deferred box carries the rest of the 2C backlog — LRU under disk pressure, a direct
+> venv-to-venv mesh, shared memory for large AV buffers (`OQ-14`, §10).
+>
 > **This figure dates faster than anything else in the document.** It is a map of a phase plan that
 > is still moving. Where it and a §7 entry disagree, **the entry is authoritative** — and the figure
 > is the thing to fix.
@@ -3337,7 +4274,7 @@ readiness is proved by an event the stdio pump delivers, so the pump had to exis
    both paths — now including the ordered package-family passes, which install explicit specs rather
    than a requirements file and can force a re-lay (§4.16); a second builder is exactly the drift it
    exists to prevent. `-r` includes are handled when combining (§4.8).
-   *Still open:* **base = engine runtime only**, deferred with its reasoning in §4.9 — it needs the
+   *Still open (`OQ-1`, §10):* **base = engine runtime only**, deferred with its reasoning in §4.9 — it needs the
    non-pipeline entry points (saas model server first) to get environments, or it degrades into the
    rejected half shrink.
 2. **AST `ai/**` discovery** — once per init, cached; config-driven-variant + dynamic-import handling;
@@ -3701,7 +4638,7 @@ catches `ValueError` into `ModelType.UNKNOWN`, for which `get_loader_class` retu
 handler raises `No loader for model type: <str>`. A stale `'trocr'` therefore fails earlier and more
 clearly than before, rather than importing a module that no longer exists.
 
-**Left open, deliberately:** the real defect is the all-or-nothing barrel import — one `from
+**Left open, deliberately (`OQ-10`, §10):** the real defect is the all-or-nothing barrel import — one `from
 ai.common.models import (...)` naming fourteen loaders (fifteen before this step), so deleting any
 one of them is a cross-repo blocker. This repository already forbids that shape for nodes
 (`test_a_node_imports_a_model_module_never_a_model_package`); saas is outside its reach. These five
@@ -4448,7 +5385,7 @@ mode the engine loads `ai` from **`packages/ai/src`, not `dist/server/ai`** — 
      prune, so it judged boundaries over branches that would have been discarded. `_cut_pipeline`
      now prunes by reachability first (see the withdrawn rejection above), so that error class no
      longer exists — a venv nothing routes into is dropped exactly as it is outside a container.
-     **What remains open is the general shape**, and it is narrower than it looked: the *other*
+     **What remains open is the general shape** (`OQ-11`, §10), and it is narrower than it looked: the *other*
      rejections in that list still fire only at Run. Making them visible earlier needs a whole-graph
      validation call, which does not exist — the canvas's only validate call
      (`NodeConfigPanel.tsx:443`) sends a *single component*, never the graph, so teaching
@@ -4594,8 +5531,480 @@ quietly.
 
 ---
 
+### 2C-FR — Forced Python requirements per environment (DONE)
+
+**The one entry in §7 written forward rather than back, and now half of each.** Everything above
+it is a record of what was done; the steps below were the order in which §4.7.1's design is to be
+built, written down so the first session to pick it up would not re-derive it. **Steps 1 to 6
+landed 2026-09-08** — the tail at the end of this entry records what they cost and what the
+implementation changed about the design, which on this increment was a great deal. Read
+§4.7.1 first — it holds the decisions, the measurements behind them and the two residual risks
+this plan deliberately leaves alone (`OQ-5` and `OQ-6`, §10).
+
+**Engine first, UI last, and that is not arbitrary.** §4.1 records that every container operation
+was reachable only on a hand-authored document until 2B added the toolbar button, and that the
+deferral outlived its own precondition. The same shape is useful on purpose here: the risky half —
+override merging, the environment key, the parent/child handshake — is provable on a hand-written
+`.pipe` before a text box exists for anyone to mistype into. One honest qualifier: with the
+handshake split across two processes, step 1 alone is provable at *unit* level — a temp cache
+directory, a hand-placed `forced/<digest>.txt`, a set variable — and the first end-to-end proof
+is step 7. Steps 1 and 2 are therefore a pair; landing one without the other leaves nothing
+observable.
+
+**Step 0 is closed, and its answer changed step 5.** The question was whether an editor preserves
+an unknown `config.environment` key across a save. Measured: it did not (`OQ-17`, §10 — closed by
+step 5). `NodeConfigPanel` reconstructed the object as `{ name: envName, isolated: envIsolated }`
+from two state variables — the outer `config` spread, `environment` not — so a `forced` key would
+have survived only if that panel were taught about it. This is why step 5 was never "add a text
+box": it is a state field, a write-back key and a checkbox interaction, and getting only the text
+box would have shipped a field that erases itself. What landed spreads the environment instead of
+rebuilding it, which answers the general case and not just this key.
+
+**And that is the only surface that loses it — checked, so the work stays one file wide.** Three
+other places touch `config.environment` and all three are safe: the loader classifies a group as a
+container by the *presence* of the key (`nodeTypeFromComponent`) without rebuilding it; the
+serialiser writes `config: data.config ?? {}`, passing the object through whole; and creation
+(`FlowCanvas`) builds a fresh environment for a container that has no forced text yet. So a
+document round-trips through load and save intact, and the damage is done by one literal in one
+panel. Worth stating because the alternative reading — "the client drops unknown keys" — would send
+someone to spread defensive merges through the serialiser, which needs none.
+
+**The handshake spans two steps and two test suites — which half is where.** The parent side
+(write, environment variable) is `packages/ai` and gates on `ai:test`; the child side (open by
+name, refusal, key contribution) is `rocketlib-python/lib` and gates on
+`server:run-rocketlib-test`. Splitting one invariant across two suites is the shape most likely to
+be half-implemented, so each step states its own half rather than leaving it to be inferred.
+
+**Step 1 — the child side: read, merge, key.** Four separate pieces of work in `venv_env.py` and
+`depends.py`, listed rather than run together because each has its own way of being got wrong.
+
+- **The two cases from §4.7.1, in full — and they land in different modules.** `venv_env.py`
+  reads `ROCKETRIDE_VENV_FORCED_SHA` (owning the name the way it owns `VENV_ENV_ID_ENV`) and folds
+  the digest into the key through `pkg_families.combine_hash()`. That is all it does: it is
+  stdlib-only and must not learn where the engine cache is, or the literal gets a third copy.
+  `depends.py` does the file half, under the lock, from `engine_cache_dir()`: it opens
+  `<exe_dir>/cache/forced/<digest>.txt` — the **engine cache**, not the overlay, and §4.7.1 gives
+  three reasons that is not cosmetic: the parent cannot resolve `env_dir` at all, the venv GC
+  treats every directory under `venvs/` as a project, and purge empties `env_dir`. Present, it is
+  merged; absent while the digest is non-empty, the run refuses by name, saying it is repeatable.
+  An empty digest opens nothing, and the other documents' files in that directory are neither read
+  nor removed — **do not add a sweep**, that is how one deployed version would delete another's
+  file. Mind where each half sits: the key contribution is in the drift check that *precedes* the
+  lock, because that key is what decides whether the lock is taken at all, while the file work sits
+  **inside** it.
+- **An override path, and only an override path.** Forced never joins the combined *requirements*.
+  Repeated here rather than left to §4.7.1's answer 2 because it is the security boundary and this
+  is the document the work is done from: emitting a forced line as a requirement is what would let
+  a tenant-supplied string install an arbitrary distribution, and it is a two-line mistake to make
+  in `write_combined()`.
+- **A real merge, not a concatenation — and not a plain rewrite either.** This is the second half
+  of `OQ-19` (§10), and it is the half that stays **hand-rolled**: it needs the *name* out of an
+  arbitrary tree override line and nothing else, and its input is our own files, not tenant text.
+  `parse_resolution()` cannot stand in — it only reads `name==version` off uv's compiled output,
+  so `opencv_contrib_python ~= 4.10` yields no name at all. End the extractor in
+  `pkg_families.normalize()`, which is what keeps it and step 3's `packaging` from disagreeing
+  about what a name is. **Do not reach for `packaging` here**: this module's neighbourhood guards
+  its imports deliberately, and the reason the gate gets a real parser — tenant text at a security
+  boundary — does not apply to the tree's own override files. For a PEP 503-normalised name the
+  forced lines replace **every** tree-level override line rather than one of them or joining them;
+  the unit is the name on both sides and both sides may hold several lines for it.
+  `write_combined()` will not do: it concatenates, and concatenation is what §4.7.1 measured
+  failing — two overrides for one package are conjunctive and resolve to nothing at all. **Carry
+  over its second job**, though: it rewrites `-r` includes to absolute paths with forward slashes,
+  because uv resolves an include relative to the file holding the line and because a backslash is
+  an escape in a requirement file. Forced lines can never contain one (answer 7), tree override
+  lines can, and none does today — so this is the part a replacement drops without anything
+  failing until someone adds an include on Windows.
+- **Four call sites, and the fourth is the one a survey misses.** `_install_target` — the scoped
+  install — reads `_override_args()` nowhere today, so counting readers does not find it, and it
+  is the site whose omission fails *every* forced pipeline (§4.7.1). Then the three that do read
+  it, each serving two paths: `_run_uv_compile`, `_install_dry_run` and
+  `_install_requirements_inner` all read `_override_args()`, and none of them is scoped-only — the
+  compile is shared with `ensure_constraints()`'s base path and the installs with runtime
+  `depends()` into base. So each needs to be told *which* environment it is serving, and **base
+  keeps the shared `overrides-combined.txt`**. §4.7.1 spells out both failure shapes: stopping at
+  the compile mostly works and diverges occasionally, while handing base the environment's file
+  silently drops the tree's own overrides from the runtime compile. The path they are threaded
+  with is `<env_dir>/overrides-combined.txt`, the merge's output: **regenerated unconditionally
+  inside the install lock, never digest-named and never write-if-absent**. It is not the forced
+  file and must not inherit its rules — that one crosses a process boundary, this one is written
+  and read by the same process inside one `FileLock` hold.
+
+Two rules about the walked file set go with them, and they point opposite ways. **The forced file
+does not join it** — the walk is `path:size:mtime_ns`, so keying on it would make rebuilds depend on
+write timing rather than on content. **The tree-level override files do**: they are absent from it
+today, which is the shipped defect §4.7.1 records, and repairing it here is what keeps one merged
+input from having two different invalidation rules. Budget for the two consequences §4.7.1 spells
+out — the planning signature grows a parameter, because importing the discovery from `depends`
+would pull `engLib` into a module whose point is to be stdlib-only; and the first run after this
+ships rebuilds every overlay whose scope contains an `overrides.txt`, once.
+
+Gate: `server:run-rocketlib-test`, baseline **326 passed / 1 skipped** — run after
+`server:setup-python`, which is what syncs `rocketlib-python/lib` into `dist/server`; a rocketlib
+edit is invisible to a running engine until it does.
+
+**Step 2 — the parent side: write and announce.** The partitioner's process builds
+`<exe_dir>/cache/forced/<digest>.txt` from `os.path.dirname(sys.executable)`, which it already
+computes a few lines before the spawn, plus the digest it already has. **It must not import
+`venv_env`**: that module is reachable only when `rocketlib-python/lib` is on `sys.path`, which is
+the engine's arrangement and not `ai:test`'s, and `venv_spawn.py` next door already mirrors two of
+its constants by hand with a "keep in sync" comment saying exactly this. Mirroring `short_id()` to
+reconstruct `env_dir` is the other tempting wrong turn — §4.7.1 has both, and why the engine cache
+is the right home rather than a fallback. The one literal duplicated across the boundary is
+`cache/forced`, and it gets the same "keep in sync" comment as its neighbours, pointing at
+`engine_cache_dir()`. It `makedirs` that directory first — `engine_cache_dir()` is `create=False`
+by default and `cache/forced/` has never existed, so the first run of the feature is exactly the
+run a blind write would fail on. It then writes that file **if it is not already there** — the
+name is the content's digest, so an existing one is by construction the right one — **taking no
+lock**, through a temporary name in the same directory and `os.replace()`. That is not a shortcut
+taken for speed: `depends.FileLock` is unreachable from `packages/ai`, since importing `depends`
+pulls in `engLib`, and `venv_env._EnvLock` is private and non-blocking, so it would raise
+`EnvBusy` on an ordinary concurrent install. §4.7.1 carries the full argument, including why a
+lock would not have closed the purge window the old location had — moving the file out of
+`env_dir` is what closed it. There is no unlink: an emptied field is an empty digest, which names
+nothing, and removing files is how one document would clobber another's.
+
+Then `build_child_env()` gains `ROCKETRIDE_VENV_FORCED_SHA` beside the three venv variables it
+already sets, empty when the document carries no forced text. The parent is also where §4.7.1's
+normalisation happens — line endings folded, trailing whitespace stripped — before the digest,
+which is also the file's name, so the child neither normalises nor compares: it opens the file it
+was named, or refuses. Gate: `ai:test`, baseline **2874 / 124**.
+
+**Step 3 — the partitioner: admissibility and the early refusal.** **Declare `packaging` here and
+use `Requirement(line)`** — `OQ-19` (§10) is closed that way, and only here: this is the boundary
+over tenant text, so it rests on a standard rather than on a regex, while step 1's merge keeps a
+hand-rolled name extractor over the tree's own files. Nothing in the repository imports or
+declares `packaging` today, so this is a new dependency line, and §4.7.1 measures why the existing
+`parse_resolution()` cannot stand in: five of ten sample lines come back empty and they are not
+the same five as the dangerous ones — a bare `numpy` reads exactly like `-r other.txt`. Then:
+strict PEP 508 plus comments and blank lines; `-r`, `-c`, `-e`, `--index-url`,
+`--extra-index-url`, filesystem paths and URLs refused with a named cause carrying the container
+and the line (answers 7 and 8). It also refuses the two cases where forced has no environment to
+act on. **The first is an unscoped run**, and the condition to test is `not scoped`, not the mode:
+`scoped` is already False under the `off` switch *and* under `auto` when nothing is isolated, so
+reading the mode would be one branch narrower than the fact. **The second is forced text on a
+container that is not isolated**, which the walk over components answers directly. Both facts are
+on hand — `scoped` is computed immediately before `partition_pipeline()` is called. Refusals only
+— **no warnings here**: all three warnings need data the partitioner does not have (step 4). Same
+gate as step 2.
+
+**Step 4 — the three warnings, all on the child side.** After discovery and the compile: an inert
+forced line and a contradicted family declaration, compared against
+`_read_resolution(constraints_path)` — the reader `_shadowing_check()` already uses — plus the
+lost-extras warning, which needs `req_files` from `ast_deps.discover_for_providers()` and
+therefore cannot run any earlier than this. Out through `updateProgress()` / `monitorStatus()`.
+Gate: step 1's.
+
+**Step 5 — schema, then UI.** `PipelineEnvironment` in
+`packages/client-typescript/src/client/types/pipeline.ts` gains `forced?: string`; **client-python
+is not touched**, and the reason matters more than the conclusion because an earlier draft of this
+plan got it right for the wrong evidence. It cited `types/venv.py`, which describes on-disk
+overlays and has nothing to do with the document. The package *does* mirror the document — in
+`types/pipeline.py`, with `PipelineComponent` and `PipelineConfig` carrying `id`, `provider`,
+`config`, `ui`, `input`, `control`, `components`, `source`. What it does not do is model the
+*inside* of `config`: that field is `dict[str, Any]`, so neither `name` nor `isolated` is typed
+there today and there is no `PipelineEnvironment` to extend. The asymmetry is the fact to carry
+forward — TypeScript names the environment object, Python leaves it opaque — because the day
+someone types it in Python, `forced` belongs in that change and this paragraph stops being true.
+
+The field is **optional** in the type, and no `client-typescript:freeze` is needed for it — checked
+rather than assumed: `PipelineEnvironment` appears nowhere in `contract-check.generated.ts` or in
+`src/contract/versions/`, so the accumulated SDK floor has no opinion about it.
+
+**One edit reaches the panel, because the type travels by re-export.** `packages/shell` and
+`apps/shared` both do `export type { PipelineEnvironment as IEnvironment } from 'rocketride'` — the
+alias the panel and the canvas node already read. An added optional member flows through an alias
+re-export with no second declaration to update, so there is no `IEnvironment` to widen and no third
+package to touch. Worth stating because the alias hides the origin: someone looking at
+`NodeConfigPanel.tsx` sees `IEnvironment` and has no reason to guess it is defined two packages
+away.
+
+Then the field itself, and the file is **`NodeConfigPanel.tsx`, not `NodeVirtualEnv.tsx`** — the
+latter draws the container on the canvas (header, drop area, the `isolated` badge at its line 102)
+and holds no settings; the settings panel is where `rr-env-isolated`, the "Isolated dependencies"
+checkbox, lives, and §4.7.1 puts the forced text beside it. Three edits there, not one: the
+`envForced` state beside `envIsolated`, the textarea itself marked advanced, and the write-back
+literal at line 402 — which is also the fix for step 0. **Do not take the checkbox's word for
+isolation.** `envIsolated` is initialised — at line 247 and again at 282 — from
+`environment?.isolated !== false`, so a container whose document omits the key opens with the box
+**ticked** while the engine's `is_isolated()` reads it as not isolated; saving then writes
+`isolated: true` and quietly promotes it. Three client surfaces use `!== false` (badge, panel
+init, panel save) against one engine predicate that uses truthiness — `OQ-16`, §10. This increment
+neither inherits that nor silently repairs it: the forced field's enabled state keys on the
+engine's question, and if the wider disagreement is to be fixed it is its own change with its own
+note, because "saving a container now changes whether it is isolated" is not a side effect to bury
+in a text-box commit.
+
+The field is **disabled whenever the container is not isolated by the engine's predicate**, greyed
+rather than hidden so the text stays visible and survives the round trip — and its inline reason
+states the *consequence*, not just the state: the requirements will not apply, the run will be
+refused, clear the field or re-enable isolation. That wording is the part that matters, because
+disabling an input does nothing for the sequence that actually bites: text already present, then
+the checkbox cleared. Without it, step 3's refusal stops being a backstop for hand-authored
+documents and becomes a trap for anyone who un-ticks a checkbox to debug.
+
+**The two halves of this step gate differently, and the second one's lane has a shape worth
+knowing.** The schema change is `packages/client-typescript` and gates on
+`client-typescript:build` then `client-typescript:test`, baseline **250 passed / 8 skipped**. The
+panel is `apps/shared`, and it does have a lane: **`builder shared:test`**, `node --test` under
+`tsx`, baseline **113** (§8.4) — measured when step 5 landed, and *not* the 109 an earlier draft
+of this entry carried: that number predates work in other areas of `apps/shared` and had gone
+stale without anyone noticing, which is the ordinary fate of a baseline nobody re-reads. An
+earlier draft of this plan claimed that package had no suite at all. It has seven files' worth,
+`canvas/util/graph.test.tsx` among them; the search behind that claim looked for a `ui:test` task
+and a `scripts` section in `apps/shared/package.json`, and the lane is called `shared:test` and
+lives in the package's own `scripts/tasks.js`.
+
+**What the lane cannot do is render, and that is what shapes the work.** `shared:test` preloads
+`stub-shell.cjs`, which intercepts `shell` and `rocketride` and returns a module whose only real
+export is `commonStyles`; every other named import comes back `undefined`, so a rendering test
+renders `undefined` as a component. Widening that stub is a change to the harness, not to a
+feature. The house answer is already written down — §9 keeps helpers "as plain functions because
+`shared:test` can render nothing" — so this step follows it. Two decisions come out of the
+component as plain functions: one maps a container's environment plus panel state to the object
+written back, which is where `forced` is kept or lost; the other maps the environment to whether
+the field is enabled, which is where the engine's predicate must be used rather than the checkbox's
+`!== false`. Both become `shared:test` cases. Only the rendered appearance stays manual in step 7.
+
+**Step 6 — sixteen tests in Python and two in `shared:test`, one per decision rather than one per
+function.** The two canvas decisions ride the lane as pure functions (step 5); only the rendered
+appearance stays manual. A second run with unchanged text reuses the overlay and any edit rebuilds
+it (the digest in the key, whose failure is a user changing a version and watching the old one
+install); a cleared field stops applying, because the digest goes empty and names no file; a
+non-empty digest whose named file is missing refuses by name rather than compiling without the
+overrides; a leftover file from another document in `cache/forced/` is neither read nor removed —
+the test asserts it is **still there** afterwards, because a sweep is the plausible wrong instinct
+and it is how one deployed version would delete another's file; **two documents with different
+forced text for one `project_id` both run**, which is the multi-team deployment case §4.7.1
+establishes and the one test that would catch a regression to a single fixed filename; the same
+text with `\r\n` line endings produces the same digest and does not rebuild; `-r` / `--index-url`
+/ a path / a URL are refused at partition time with a named cause; forced replaces *every*
+tree-level override line for a name, not merely one; an inert forced line warns; lost extras warn;
+and — for the shipped defect this increment repairs — editing a tree-level `overrides.txt`
+invalidates a scoped overlay, which today it does not; forced text on an un-isolated container is
+refused by name; and forced text under an unscoped run is refused the same way rather than
+flattened away in silence; every `_override_args()` caller — `_run_uv_compile`,
+`_install_dry_run`, `_install_requirements_inner` — receives the environment's path on the scoped
+path; and **the same three still receive the shared `overrides-combined.txt` on the base path**;
+and the parent's write succeeds **while another process holds that environment's `install.lock`**,
+the regression guard for the lock question §4.7.1 reversed — a parent that starts taking the lock
+again fails this and nothing else. The two `_override_args()` cases are call-site assertions
+rather than behavioural ones, and they are here deliberately and as a pair: step 1 names
+compile-only as the dangerous shape precisely because it *mostly works*, and the mirror mistake —
+handing base the environment's file — is worse, because it would drop the tree's own overrides out
+of the runtime compile without failing anything. Nothing that merely checks a resolved version
+notices either. The family-contradiction warning rides the existing family tests rather than a
+seventeenth of its own. The two canvas cases are the write-back preserving `forced` — the trap
+step 0 measured — and the enabled-state function answering the engine's predicate rather than the
+checkbox's, both against `shared:test`'s baseline of **113**. Each is then mutation-checked, per
+the standard the previous increment set: *the tests pass* and *the tests would notice* are
+different claims.
+
+**And they get registered, which is work this list does not perform by existing.** §8 is the
+document's test register — §8.1 catalogues unit tests per increment with a phase tag, §8.3 the
+integration ones — and §7 is a log of what was done, not a substitute for it. So the sixteen
+Python cases are entered in §8.1, the two `shared:test` cases beside the canvas suites §8.1
+already lists, the one manual check of step 7 in §8.3, and the legend at the head of §8 is
+extended: it currently reads "**[2C]** = needs something a 2C increment introduced, so far only
+the overlay collector", and forced requirements becomes the second. Left undone, nothing breaks
+and nobody notices — which is exactly why it is written down as a step rather than assumed as
+hygiene.
+
+**And §9 gains two entries, but only once the work exists.** That section lists the files an
+implementer must not misread, and it already carries `depends.py`, `venv_env.py`, `pipeline.py`,
+`task_engine.py` and `graph.ts`. Two more qualify by the time this lands and are absent today:
+`NodeConfigPanel.tsx`, where a write-back literal rebuilt from two state variables silently drops
+any third key — the trap step 0 measured — and `venv_spawn.py`, where `build_child_env()` becomes
+the only channel the forced digest crosses on. They are named here rather than added now on purpose:
+§9 describes what is built, and putting unbuilt files in it would make the register lie in the other
+direction.
+
+**Step 7 — the live run**, which needs the engine started and therefore explicit permission, asked
+as one list. Every staging task the increment touched is part of it, not just one:
+`server:setup-python` for the rocketlib half (steps 1 and 4), `ai:build` for the parent half
+(steps 2 and 3), `client-typescript:build` for the schema and `ui:build` for the panel (step 5) —
+then a restart, because the registry is read at startup. This is also the first point at which the
+handshake is exercised end to end rather than in halves, and the only point at which the panel is
+exercised as a *rendered* thing rather than as the two functions behind it. One check here is
+manual, and only because `shared:test` cannot render (step 5): that the field appears **greyed
+rather than hidden** when isolation is cleared, with its reason on screen, checked on a container
+that already holds forced text — the sequence the wording exists for. The two decisions underneath
+it, the write-back and the enabled-state rule, are `shared:test` cases rather than eyeball work.
+
+**Suites this increment does not touch**, stated so a later drift in them is not blamed here:
+`nodes:test` (**4435 / 230**) and `client-python:test` (**163 / 6**). No node changes, and
+client-python gains nothing to test — it *does* mirror the document, but only down to
+`config: dict[str, Any]`, so there is no typed environment object for `forced` to join (step 5).
+
+**Out of scope on purpose.** `--only-binary=:all:` and the transitive-drag exposure are recorded
+in §4.7.1 as residual risks — `OQ-5` and `OQ-6` in §10. So is reclamation of `cache/forced/`
+(`OQ-18`): the directory this increment creates is never collected, which is a line on an existing
+GC pass rather than a mechanism, and not one anybody hits before this ships. Pulling any of the
+three into this increment changes its size and its argument.
+
+**Steps 1 to 6 — DONE 2026-09-08, and the numbers.** The child half (`venv_env.py`, `depends.py`)
+and the parent half (`venv_spawn.py`, `task_engine.py`) landed together, as the preamble says they
+must: neither is observable alone. Step 3 followed in `pipeline.py`, with `packaging` newly
+declared in `ai/requirements.txt` — the first place in this repository to name it, since it had
+only ever arrived transitively. Step 4 put the three warnings in `venv_env.py` as one pure
+function over (forced lines, resolution, requirement files), with `depends.py` owning only the
+read and the channel. Step 5 added the optional `forced?: string` to `PipelineEnvironment` and the
+field to `NodeConfigPanel.tsx`, with both of the panel's decisions lifted into
+`canvas/util/envSettings.ts` so the lane that cannot render can still test them. Step 6 closed the
+two debts the earlier steps left: the call-site pair, and registration in §8 and §9.
+
+*Tests added, per file:* `test_venv_env.py` **+14** — the digest entering the key and an edit
+rebuilding, an empty digest leaving the key byte-identical, a cleared field returning to the bare
+key, a tree `overrides.txt` edit invalidating a scoped overlay (the shipped defect this repairs),
+override files hashed but never written into `combined.txt`, the digest consumed once and frozen,
+and seven over `requirement_name` / `merge_override_lines` / `absolutise_include`.
+`test_depends_scoping.py` **+10** — `_override_args`'s default being the *base answer* and not a
+fallback, the environment's file when given one, `_active_overrides_path` following the active
+context, the merge writing forced over the tree, regeneration rather than caching, the refusal by
+name for a missing forced file, a leftover neither read nor removed, and tree includes
+absolutised. `test_venv_spawn.py` **+13** — line-ending folding, blank text as the one no-forced
+value, the whole sha256 as the name, first-run directory creation, write-if-absent, no temporary
+left behind, two documents for one project each getting their own file, no sweeping, the write
+succeeding while an `install.lock` is held, and the digest reaching the child env.
+
+`test_partition.py` **+22** (parametrised) — forced on an un-isolated container refused by name,
+forced under an unscoped run refused rather than flattened away, isolation reported before
+scoping, eight inadmissible line shapes each carrying the offending line, a direct URL reference
+refused although PEP 508 accepts it, eight admissible shapes passing (every row of §4.7.1's table,
+the marker-scoped pair included), a container without forced text untouched on both paths, and
+blank text not counting as forced text.
+
+`test_venv_env.py` **+11** and `test_depends_scoping.py` **+3** for step 4 — an inert line
+warning and a matching one staying silent, inertness judged against the *resolution* so a
+successfully overridden transitive package is not called inert, lost extras warned with the line
+to type instead, extras read through a `-r` include, a forced version contradicting a declared
+`namespace_version`, the same version staying silent, an unpinned line claiming no contradiction,
+comments and blanks producing nothing, `req_files` carried on the plan, and the channel itself:
+warnings reaching `updateProgress`, silence with no forced text, and a missing forced file not
+raising out of a *reporting* helper.
+
+`test_depends_scoping.py` **+4 more** for step 6's call-site pair — the compile told its
+environment and keeping the shared file on base, and both install readers following the active
+overlay and both keeping base's file. Written last and deliberately: §4.7.1 names this pair as the
+one nothing else notices, and until they existed the increment's own tests proved the *function's*
+contract without proving that its three callers pass the right thing.
+
+`envSettings.test.ts` **+14** in `apps/shared` (new file), against a `shared:test` baseline that
+turned out to be **113** rather than the 109 this entry had carried since 2B — measured, not
+assumed, and corrected in three places.
+
+**Step 7, partial — and it earned its place on the first real pipeline.** The live run found a
+defect nothing above it could: the scoped install (`_install_target`) passed no `--override` at
+all, so the compile honoured forced and the install re-resolved without it and uv refused the run
+outright. §4.7.1 now carries the correction and the reason a survey of `_override_args` readers
+could never have found it. Three tests came out of it — the install carrying the override, its base
+default, and, once the closure inside `ensure_env_scoped` was lifted to a module-level
+`_scoped_compile_and_install`, the **wiring**: that the compile and the install receive the *same*
+file. That last one closed a hole the mutation check exposed and the earlier tests did not — every
+one of them called a function directly with a path of its own, so no test could reach the seam
+between them.
+
+The manual check passed on 2026-09-09: on a container already holding forced text, clearing the
+isolation checkbox greys the field rather than hiding it, with the consequence on screen. That was
+the last thing only a person could answer, and it is what closes the increment.
+
+**What step 7 leaves behind, named rather than quietly dropped.** The VS Code host still renders no
+startup refusal on its canvas: its webview forwards the run action to the extension, which owns the
+`use()` call and therefore the rejection, so `startupFailureStatus` has to be written on that side
+too. Carried in `OQ-11` rather than here, because it is that question's territory and not forced's.
+
+The same run found a second thing, and it was a claim rather than a defect: answer 8 said a
+partition-time refusal was "early enough for the canvas to show it", and it is not — the canvas
+renders a startup failure out of `taskStatus`, and a partition refusal happens before the task
+exists. Log only. The panel now checks the shapes people type when the container is saved and
+shows the message in its own banner (six more `shared:test` cases), which is a better place than
+the canvas anyway.
+
+**And the canvas half got fixed rather than only recorded**, because the answer to "why can't it
+show this the way it shows an install failure" turned out to be that it can. The message was never
+lost — the host's `client.use()` rejects with it and raises a dialog — it just never reached the
+`statusMap` the canvas reads. `startupFailureStatus` builds the entry `NodeStatus` wants and
+`rocket-ui` writes it under the armed source, so every refused run renders on its node now, not
+only forced's. That is wider than this increment and deliberately so: it is the half of `OQ-11`
+that had no surface at all. Five more `shared:test` cases pin the shape, because getting any one
+of `completed` / `state` / `completedCount` / `errors` wrong renders a different block and the
+refusal is invisible again. The VS Code host still needs the same and does not have it.
+
+*Suites afterwards:* `server:run-rocketlib-test` **371 passed / 1 skipped** (from 326/1, +45);
+`ai:run-pytest` **2909 passed / 124 skipped** (from 2874/124, +35); `shared:test` **132** (from
+113, +19); `client-typescript:test` **250 passed / 8 skipped**, unchanged, since an optional member
+adds no case. `ruff check` and `ruff format --check` clean on every changed Python file, and
+`tsc --noEmit` clean on `apps/shared`.
+
+*What the mutation check caught:* thirty-five mutations, thirty-five noticed — and one of them
+only after the code moved. Dropping `--override` from the scoped install failed a test
+immediately; *the caller ceasing to thread the file into it* failed nothing, which is what turned
+the closure into `_scoped_compile_and_install`. Worth keeping as the shape of the lesson: a test
+per function proves each function, and proves nothing about the wire between them. Dropping the
+override files from the walk, dropping the forced digest from the key, folding the digest
+unconditionally so an empty one stops being neutral, and merging by concatenation instead of by
+name — all four fail a `venv_env` case. Ignoring the environment path in `_override_args`, pinning
+`_active_overrides_path` to base, letting a missing forced file compile silently, and dropping the
+include rewriting from the merge — all four fail a `depends` case. Overwriting instead of
+write-if-absent, not folding CRLF before digesting, setting the child digest only when truthy (so
+an inherited value survives), and skipping `makedirs` — all four fail a `venv_spawn` case.
+Accepting a direct URL reference, reporting scoping before isolation, letting an unscoped run
+through, never calling the validator at all, and not stripping trailing comments — all five fail a
+`test_partition` case, the fourth taking twelve of them down. Judging inertness against the direct
+requirements instead of the resolution, dropping the lost-extras warning, dropping the
+family-contradiction warning, claiming a contradiction for an unpinned line, not carrying
+`req_files` on the plan, and reporting nothing at all — all six fail a step-4 case. And the four
+that matter most, because they are the ones §4.7.1 says nothing else would catch: the dry-run or
+the install reading base instead of the active overlay, the compile ignoring the environment it
+was told, and the compile handing base an environment's file — each fails a step-6 call-site case.
+Then the three from step 7: the scoped install dropping the override, the caller not threading it
+into the install, and the caller handing the compile base instead of the environment. And five
+over the synthetic status the canvas reads — not completed, a running state, a completion count
+that never happened, no error recorded, and the failure painted on the wrong node — each of which
+would put the refusal back out of sight.
+
+*What implementation changed about the design*, both recorded in §4.7.1 rather than only here: the
+merge's pure half moved from `depends.py` to `venv_env.py`, because behind an `engLib` import the
+most delicate logic in this increment would skip under the bare interpreter it gets iterated on;
+and only **one** of the three `_override_args` readers can be *told* its environment — the two
+inside `depends()` are called by node code at runtime and read the active context instead. Step 3
+added a third: `Requirement()` alone is not the whole gate, because it accepts the one shape
+answer 7 forbids — a direct URL reference — which now takes an explicit check. Step 4 settled
+one the design had left open: the warnings fire on a rebuild only, and that is *complete*, because
+every input they read is already in the environment key. And step 5 settled one more: `OQ-17`
+closes here rather than surviving the increment. The plan had the panel taught about `forced` by
+name, leaving the rebuilt-literal shape for a later change — but the field-specific fix and the
+general one turned out to be the same edit, so `buildEnvironmentWriteBack` spreads the existing
+environment and any key after this one survives by construction. `OQ-16` is deliberately untouched:
+flipping the checkbox's default changes whether saving a container makes it isolated.
+
+**What this increment is worth carrying past its own subject.** Three of its findings were about
+how to look rather than about forced requirements, and each cost a real defect before it was
+learned.
+
+*Counting readers is not counting needs.* The design surveyed `_override_args`'s three call sites
+and treated that as the set of places an override belongs. `_install_target` read it nowhere, so it
+was never counted — and it was the one whose omission failed every forced pipeline. A survey of
+who currently does something cannot find who currently should.
+
+*A test per function proves no wiring.* Every early test called a function directly with a path of
+its own, so the seam between the compile and the install was the one thing none of them could
+reach. The mutation that dropped the flag failed a test immediately; the mutation that stopped the
+*caller* passing it failed nothing. That is what turned a closure into `_scoped_compile_and_install`
+— code moved so a test could exist, not the other way round.
+
+*Early is not the same as visible.* Answer 8 claimed a partition-time refusal was "early enough for
+the canvas to show it". It was early and it was invisible, because the canvas renders failures out
+of a task status and the refusal happens before a task exists. The claim survived every review in
+this document and died on the first real pipeline.
+
+None of the three would have been found by more re-reading. They needed the code to run.
+
+---
+
 ## 8. Verification & testing
 Three layers; each test is tagged with the phase that first makes it runnable (**[2A]** = scoping only,
+**[2C-FR]** = needs the forced-requirements field (§4.7.1),
 **[2B]** = needs the venv runtime, **[2C]** = needs something a 2C increment introduced, so far only
 the overlay collector).
 
@@ -4766,6 +6175,45 @@ the overlay collector).
   the id-collision case still guards a live mechanism but its colliding node was input-less, so it
   would now be pruned before the id was minted and the test would pass while checking nothing. Its
   fixture was fixed, not its expectation. [2B]
+- **Forced Python requirements** (§4.7.1) — the field whose lines outrank, per package, whatever the
+  environment resolves. Four files, and the split between them is the design's own: everything pure
+  is in `venv_env`, everything that touches the cache directory is in `depends`. [2C-FR]
+  **`test_venv_env.py` (+25).** The environment key: the digest entering it and an edit rebuilding,
+  an **empty** digest leaving the key byte-identical (the day-one promise — no environment shipping
+  today may rebuild for this), a cleared field returning to the bare key, and a tree `overrides.txt`
+  edit invalidating a **scoped** overlay, which is the shipped defect this increment repairs rather
+  than a new feature. The merge: forced replacing *every* tree line for a name (a bare `torch`
+  displacing two marker-scoped ones), names forced does not mention surviving, a forced *pair*
+  displacing a computed pair, PEP 503 matching, comments and flag lines preserved, and `-r` includes
+  absolutised on the way out. The warnings: an inert line reported, inertness judged against the
+  **resolution** so a successfully overridden transitive package is not called inert, lost extras
+  reported *with the line to type instead*, extras read through an include, and a forced version
+  contradicting a declared `namespace_version`.
+  **`test_depends_scoping.py` (+17).** The file half: the merge written over the tree, regeneration
+  rather than caching, a refusal **by name** when a non-empty digest names no file, another
+  document's file neither read nor removed (asserted *still present* afterwards, because sweeping is
+  the plausible wrong instinct), and the warning channel reaching `updateProgress`. Then the pair
+  §4.7.1 calls out as the one nothing else notices: **all three `_override_args` readers** — the
+  compile told its environment, the dry-run and the install reading the active one — carrying the
+  environment's file on the scoped path, and the same three still carrying the shared cache file on
+  base.
+  **`test_venv_spawn.py` (+13).** The parent half: line endings folded so a textarea round trip does
+  not rebuild, blank text as the single no-forced value, the whole sha256 as the file name,
+  first-run directory creation, write-if-absent, no temporary left behind, two documents for one
+  project each getting their own file (the multi-team deployment case), nothing swept, and the write
+  succeeding **while an environment's `install.lock` is held** — the guard against reintroducing a
+  lock the parent must not take.
+  **`test_partition.py` (+22, parametrised).** The refusals: forced on an un-isolated container and
+  forced under an unscoped run, each named; isolation reported before scoping, because under `auto`
+  both hold at once and only one of them is actionable; eight inadmissible line shapes each carrying
+  the offending line; a direct URL reference refused *although PEP 508 accepts it*; and eight
+  admissible shapes passing, every row of §4.7.1's table included.
+  **`envSettings.test.ts` (+8, `shared:test`).** The panel's two decisions as plain functions,
+  because the lane cannot render: the write-back keeping `forced`, storing it exactly as typed,
+  removing the key when the box is emptied, and **preserving a key it has never heard of** — the
+  general repair for the literal that dropped any third key; plus the enabled-state rule answering
+  the engine's truthiness rather than the client's `!== false`, and its disabled reason stating the
+  consequence rather than the state.
 
 ### 8.2 Test-fixture nodes (purpose-built, lightweight, decoupled from `ai/**`)
 A pair of **trivial pure-Python nodes** under the node-test tree at
@@ -5148,6 +6596,16 @@ rather than from that string; report rows name a project in its **on-disk** form
 (`venvdemo-5a23b9ec`) while the command accepts the document's id (`venvdemo-flat`); and `--json` is
 required for `maxAgeSeconds` and the `skipped` rows to be printed at all.
 
+**Forced Python requirements — one manual check, and only one** (§4.7.1, §7 2C-FR step 7). Every
+other decision in that increment is a unit test; this one is here because `shared:test` cannot
+render. On a container that **already holds forced text**, clear the isolation checkbox and confirm
+the field goes **grey rather than disappearing**, with its reason on screen naming the consequence
+(the requirements will not apply and the run will be refused) rather than the state. Checked in
+that order on purpose: typing into a disabled box is not the sequence that bites — text already
+present and then isolation cleared is, and a field that vanished would take the text out of sight
+while leaving it in the document. The same run is the first end-to-end exercise of the parent/child
+handshake, which until then has only been proved in halves. [2C-FR]
+
 ### 8.3.1 Live transport findings, 2026-09-04/05 — what a real dataset broke
 
 A user pipeline — `dropper → [venv: parse ×3 + funnel] → response_image` — was run over 62 mixed
@@ -5228,7 +6686,7 @@ SDK's generic hint — "Pipeline isn't running / source must be chat, webhook or
 doesn't match". None of those was ever the cause. The real line was in the server console each time,
 and the hint sent two separate investigations in the wrong direction before the close code was read.
 
-**Open items, in the order they are worth doing.** Ordered by what unblocks the rest, not by
+**Open items, in the order they are worth doing** (`OQ-13`, §10)**.** Ordered by what unblocks the rest, not by
 severity. Closed items keep their place rather than being deleted, so the order stays readable and
 a reader can see what was already tried.
 
@@ -5459,7 +6917,24 @@ ROCKETRIDE_INCLUDE_SKIP=ocr,ner,detect,detect_segment,caption,background_removal
   pass, and `_start_venv_gc`, extracted so the decision is testable with `__init__` bypassed.
 - `packages/server/engine-lib/rocketlib-python/lib/venv_env.py` — besides the layout and the
   reclamation primitives, `touch_last_used` (the activation signal, called from `depends._overlay`)
-  and `collect_stale` (the age rule and the walk). Stdlib-only, hence testable under bare `pytest`.
+  and `collect_stale` (the age rule and the walk). Stdlib-only, hence testable under bare `pytest`
+  — which is *why* the forced-requirements merge and warnings live here rather than beside the file
+  access in `depends`: behind an `engLib` import the most delicate logic in that increment would
+  skip under the interpreter it gets iterated on.
+- `apps/shared/src/components/canvas/components/panels/node-config/NodeConfigPanel.tsx` — the
+  container's settings panel, and the one surface that can silently lose a document key. Its
+  write-back used to rebuild `config.environment` as an object literal from two state variables
+  while the outer `config` was spread, so any third key vanished on the next save through this
+  panel. That is now `buildEnvironmentWriteBack` in `canvas/util/envSettings.ts`, which spreads —
+  put a new key in the state and in that function, never in the JSX alone. The isolation checkbox
+  still initialises from `environment?.isolated !== false` while the engine reads truthiness
+  (`OQ-16`); the forced field deliberately does **not** inherit that.
+- `packages/ai/src/ai/modules/task/venv_spawn.py` — the only channel a forced-requirements digest
+  crosses on. It mirrors four things from `venv_env`/`depends` by hand because it cannot import
+  them (engine `sys.path` only): three environment-variable names and the literal `cache/forced`.
+  Each carries a "keep in sync" comment, and the last one is the one that would fail silently —
+  a parent writing where the child does not look turns into a refusal by name, which is loud, but
+  still a failed run.
 - `packages/ai/src/ai/modules/task/commands/cmd_venv.py` — the `rrext_venv` mixin (`list` / `purge` /
   `delete_env` / `delete_project` / `gc`; `gc` **requires** `projectId` — see 2C-GC in §7). Wiring it into `TaskConn` is **three** edits: the import, the base
   class list, and an explicit `VenvCommands.__init__` call — omit the third and the class still
@@ -5524,3 +6999,47 @@ ROCKETRIDE_INCLUDE_SKIP=ocr,ner,detect,detect_segment,caption,background_removal
   proxy/local branch the AST walk / model-server-aware pruning must model (§4.8 Model-server dimension);
   `.../common/torch/__init__.py` and `ai/common/models/**/requirements_*.txt` — where the heavy `ai/**`
   stack actually lives.
+
+
+## 10. Open questions — index
+
+Every question still open in this document appears **twice**: once here, and once where it is
+actually needed. This section is the way in when you do not yet know which section owns the problem;
+the entry beside the work is the way in when you do. Neither is a summary of the other — the local
+text carries the reasoning and stays authoritative, and this list carries only enough to recognise
+the question and jump to it.
+
+**Each has a tag, `OQ-n`, written in both places**, so either end is one `grep OQ-n` from the other.
+Tags are permanent: when a question is answered its entry moves to *Closed* at the bottom rather
+than being deleted, because a reader who followed a tag here from old notes should find out what
+happened rather than find nothing. §5 holds the original design-round questions, all resolved; this
+section holds what is still open, wherever it arose.
+
+### Still open
+
+| tag | question | lives in |
+| --- | --- | --- |
+| **OQ-1** | **Base = engine runtime only.** The base shrink is deferred: it needs the non-pipeline entry points — the SaaS model server first — to get environments of their own, or it degrades into the half-shrink that was rejected. | §4.9, §7 step 1 |
+| **OQ-2** | **What the overlay directory is keyed by, once SaaS is the main consumer.** One project runs at several versions at once, one per team, into one project-keyed directory. Decision: do the minimum now. Revisit when version alternation costs real time or disk on a pod. | §4.9 (end) |
+| **OQ-3** | **Install lock: wait, never fail.** `FileLock` polls until the holder releases, and nothing has revisited whether that is the right answer for two runs of one project colliding. | §4.10 |
+| **OQ-4** | **Process count `N × (1 + M)`.** Children are per-run and never shared across source-tasks. Accepted as the v1 cost; revisit shared children per pipeline only if real pipelines hit limits. | §4.13 |
+| **OQ-5** | **Forced requirements: sdist build execution.** A forced version resolving to an sdist is built in the engine's own environment — `--no-build-isolation` is passed, and `--only-binary` never reaches the uv command line. Two instruments: the blunt `--only-binary=:all:`, or the per-package form the tree already uses inside requirement files. Whether the latter is honoured in an `--override` file is unmeasured. | §4.7.1 |
+| **OQ-6** | **Forced requirements: transitive drag past the runtime.** Forcing an older version pulls older transitive dependencies into an overlay that precedes base on `sys.path`; `_shadowing_check()` walks only registered families and does not cover it. | §4.7.1 |
+| **OQ-7** | **The AST walk under `--modelserver`.** In model-server mode the heavy `ai/**` dependencies are never imported, so the walk — or a model-server-aware pruning of it — has to account for a mode where including them is wrong. | §4.8, §5 item 2 |
+| **OQ-8** | **OS-access-controlled local IPC.** Named pipe + user-SID ACL on Windows, Unix domain socket `0700` + peer credentials elsewhere, so the kernel rejects other-user processes before any token check. Matters for multi-tenant hosts; deferred to 2C. | §4.5 |
+| **OQ-9** | **The A1 and D1 refactors.** Moving `remote/base` onto the shared transport base with its 3-lane `callLocal` preserved byte-identically, and extracting a shared `write_lane` dispatch that both `data_conn` and `venv_server` call. Both behaviour-preserving, both deferred to 2C to keep them off a feature's test baseline. | §4.4 |
+| **OQ-10** | **The all-or-nothing barrel import.** One `from ai.common.models import (...)` naming fourteen loaders makes deleting any one of them a cross-repo blocker. This repository forbids the shape for nodes; saas is outside its lint's reach, so the next loader deletion meets it again. | §7 (2A-4 item 6b) |
+| **OQ-11** | **Whole-graph validation on the canvas, and the refusals that reach nobody.** Partition-shaped rejections fire only at Run because the canvas's only validate call sends a single component, never the graph. A graph-shaped call brings with it a decision about when it fires — per edit is wrong, on save or on arming Run are defensible. **Sharpened 2026-09-09 by 2C-FR's live run:** even at Run they are invisible. `NodeStatus` renders a startup failure out of `taskStatus`, and a partition refusal happens before the task exists — the server logs "Task creation failed, cleaned up" and the node keeps its idle line. Measured on a forced-requirements typo: log only. So this is two problems, not one — *when* validation runs, and the fact that the refusal has no surface at all. **Second half fixed 2026-09-09, first half still open.** The message was never lost — the host's `client.use()` rejects with it and shows a "Pipeline Error" dialog — it simply never reached the `statusMap` the canvas reads. `startupFailureStatus` (`apps/shared/src/modules/project/utils.ts`) builds the synthetic entry `NodeStatus` needs, and `rocket-ui`'s run handler writes it under the armed source, so *every* refused run now renders "✕ Failed to start" on the node, not only forced's. Two caveats carried in the code: the entry is synthetic, so arming a run drops it first or a stale refusal outlives the mistake; and the **VS Code host still has none** — its webview forwards the action to the extension, which owns the `use()` call, so the same fix belongs there and is not done. What remains genuinely open is the original question: *when* whole-graph validation should run, so these are caught before Run at all. | §7 (2B canvas gaps), §4.7.1 (answer 8) |
+| **OQ-12** | **Multi-process debug UX.** Direction is set — each child gets a port, main advertises and multiplexes the child DAP endpoints. Cross-cut single-stepping and unified breakpoint UX are the genuinely open part. | §5 item 5, → 2C |
+| **OQ-13** | **The five live-transport findings.** In-flight object when its task dies; what TTL measures; where the time goes above one in-flight object; whether the bridge socket needs a lock; chunking AV across the bridge. Kept as their own ordered list because they are one investigation. | §8.3.1 |
+| **OQ-14** | **The rest of the 2C backlog.** LRU reclamation under disk pressure, a direct venv-to-venv mesh, and shared memory for large AV buffers — carried in §7's phase figure and not yet argued anywhere. | §7 (figure N) |
+| **OQ-16** | **Shipped defect, not a design question: three client surfaces disagree with the engine about isolation.** The badge, `NodeConfigPanel`'s state init (lines 247 and 282) and its write-back all read `environment?.isolated !== false`; the engine's `is_isolated()` is `bool(environment and environment.get('isolated'))`. A container whose document omits the key is badged isolated, opens with the box ticked, and is **promoted to `isolated: true` by the next save** — a document changing meaning because someone opened a panel. Found while designing forced (§4.7.1); deliberately not fixed there, because "saving a container now changes whether it is isolated" is not a side effect to bury in a text-box commit. | §4.7.1, §7 (2C-FR step 5) |
+| **OQ-18** | **Nothing reclaims `<exe_dir>/cache/forced/`.** The forced-requirements files are content-addressed, so edits accumulate rather than replace, and the venv GC walks `venvs/` only. Each file is a few hundred bytes and every one is rebuildable — the parent rewrites it on the next run of that document — so age-based collection on the existing `gc_envs` pass is the shape. Left out of 2C-FR on purpose: unbounded growth of small text files is not a failure anyone hits before the increment ships. | §4.7.1 |
+
+### Closed
+
+| tag | question | what happened |
+| --- | --- | --- |
+| **OQ-15** | **"`apps/shared` has no test suite."** | **Withdrawn — the premise was false.** The package has a lane, `builder shared:test` (`node --test` under `tsx`, baseline 113 as of 2C-FR, §8.4), and seven test files. The search that raised this looked for a `ui:test` task and a `scripts` section in `apps/shared/package.json`; the lane is named `shared:test` and lives in that package's own `scripts/tasks.js`. Kept here rather than deleted because the entry was live long enough to be read, and because the real constraint it was groping at is worth carrying: `shared:test` cannot render — `stub-shell.cjs` makes every `shell`/`rocketride` import `undefined` — so canvas logic is tested by extracting it into plain functions (§9's own note), and only appearance stays manual. |
+| **OQ-17** | **The panel rebuilds `config.environment` rather than spreading it.** | **Fixed by 2C-FR step 5, 2026-09-08.** The plan had the panel taught about `forced` by name, leaving the rebuilt-literal shape for a later change — but the field-specific fix and the general one turned out to be the same edit. `buildEnvironmentWriteBack` in `canvas/util/envSettings.ts` spreads the existing environment, so the key after this one survives by construction rather than by being enumerated. Pinned by a `shared:test` case that round-trips a key the function has never heard of. `OQ-16`, the isolation-predicate disagreement it sat next to, is deliberately still open. |
+| **OQ-19** | **Which parser reads a requirement line.** | **Decided 2026-09-08: split by job (option c).** The partitioner's admissibility gate declares and uses `packaging` — it is the feature's security boundary, a wrong accept there hands a tenant `-r`, and `Requirement(line)` in a try/except is both the smallest code and the only version of it that can be argued about from a standard. `depends.py` keeps a hand-rolled name extractor for the merge: it needs a name and nothing else, its input is the tree's own `overrides.txt` files rather than tenant text, and it stays free of a third-party import in a module that guards its imports on purpose. The two are bound by the `pkg_families.normalize()` they share, which is what stops them disagreeing about what a name is. Rejected: `packaging` on both sides (a declared dependency in a module whose whole claim is stdlib-only), and hand-rolled on both sides ("strict PEP 508" would stop being literally true at exactly the boundary where the claim matters). |

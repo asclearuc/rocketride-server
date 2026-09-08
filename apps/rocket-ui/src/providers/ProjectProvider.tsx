@@ -42,7 +42,7 @@ import { getDocs } from '../docs';
 import type { PipelineConfig } from 'shell';
 // Project module is imported via subpath (not the 'shared' barrel) so the
 // canvas bundles into THIS app, not the shell's eager shared chunk.
-import { ProjectView, parseServerEvent, isDevLiveEvent } from 'shared/modules/project';
+import { ProjectView, parseServerEvent, isDevLiveEvent, startupFailureStatus } from 'shared/modules/project';
 import { registerServiceIcons } from 'shared/components/canvas/util/Icon';
 import { foldProjectDeployRuns } from 'shared/modules/sidebar/taskFold';
 import type { DeploySnapshot, TeamDeployment } from 'shared/components/deploy-panel';
@@ -371,6 +371,18 @@ const ProjectProvider: React.FC<ProjectPageProps> = ({ uri, pipeline, isDirty, i
 			}
 
 			if (action === 'run') {
+				// Drop the previous line for this source before arming. Load-bearing for the
+				// synthetic failure written below: a refused run never becomes a task, so
+				// nothing upstream will ever clear or update that entry, and without this it
+				// would outlive the mistake it describes — a node still reading "Failed to
+				// start" from an error the user has since fixed. A real run replaces it with
+				// its own first status either way.
+				setStatusMap((prev) => {
+					if (!(source in prev)) return prev;
+					const next = { ...prev };
+					delete next[source];
+					return next;
+				});
 				// Trace level, TTL, task arguments, and debug output all come from the
 				// effective pipeline-builder settings (each already carries its manifest
 				// default). ttl:0 = no timeout; omitting ttl lets the engine apply its
@@ -392,7 +404,17 @@ const ProjectProvider: React.FC<ProjectPageProps> = ({ uri, pipeline, isDirty, i
 						...(taskArgs.length > 0 ? { args: taskArgs } : {}),
 						...(ttl !== undefined ? { ttl } : {}),
 					})
-					.catch((err: unknown) => setPipelineError(err instanceof Error ? err.message : String(err)));
+					.catch((err: unknown) => {
+						// A run the server refuses at creation never becomes a task, so nothing
+						// upstream will ever produce a status for it and the canvas would keep
+						// showing the node's previous idle line — the message reaching the log and
+						// this dialog only. Put a synthetic failure in the map so the node renders
+						// the same "Failed to start" block a mid-run failure gets. Both surfaces on
+						// purpose: the dialog catches the eye, the node says which one.
+						const message = err instanceof Error ? err.message : String(err);
+						setPipelineError(message);
+						if (source) setStatusMap((prev) => ({ ...prev, [source]: startupFailureStatus(source, message) }));
+					});
 			} else if (action === 'stop') {
 				client
 					.getTaskToken({ projectId: pid, source })

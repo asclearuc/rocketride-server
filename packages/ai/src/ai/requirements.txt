@@ -19,3 +19,11 @@ mcp>=2.0.0,<3
 # per-module: task/__init__.py imports .fetch before its own depends() runs,
 # so the package must already be present when `import ai` finishes.
 pyjwt
+
+# PEP 508 parsing for the forced-requirements admissibility gate
+# (ai/modules/task/pipeline.py). Declared rather than relied on: it already resolves
+# transitively into the base environment, and a security gate must not rest on somebody
+# else's dependency tree happening to pull it. The engine's own requirement-line
+# handling stays hand-rolled -- it reads uv output and the tree's own override files,
+# neither of which is text a tenant typed.
+packaging

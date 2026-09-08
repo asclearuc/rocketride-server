@@ -13,7 +13,7 @@ export type { IProjectViewProps } from './ProjectView';
 // hosts import from, and the venvOps object they build is typed by it.
 export type { IVenvOps } from '../../components/canvas';
 export type { IViewProps, ProjectViewMode, ViewState, TaskStatus, TraceEvent, TraceRow, TraceLevel } from './types';
-export { parseServerEvent, isDevLiveEvent, isTeamLiveEvent } from './utils';
+export { parseServerEvent, isDevLiveEvent, isTeamLiveEvent, startupFailureStatus } from './utils';
 export type { ParsedServerEvent } from './utils';
 
 // Run-log continuum delivery + projections (the source-section building

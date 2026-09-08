@@ -46,9 +46,13 @@ from ai.modules.task.venv_spawn import (
     ProcessGuard,
     VenvChild,
     await_child_ready,
+    VENV_FORCED_SHA_ENV,
     build_child_env,
     classify_child_event,
+    forced_digest,
     inject_venv_urls,
+    normalize_forced_text,
+    write_forced_file,
 )
 
 _POSIX_ONLY = pytest.mark.skipif(os.name == 'nt', reason='process groups are POSIX-only')
@@ -509,3 +513,148 @@ def test_child_env_strips_mocks_only_under_avoid_mocks():
     base = {'ROCKETRIDE_MOCK': '/mocks'}
     assert 'ROCKETRIDE_MOCK' in build_child_env(base, 'c', 't', 'v1', avoid_mocks=False)
     assert 'ROCKETRIDE_MOCK' not in build_child_env(base, 'c', 't', 'v1', avoid_mocks=True)
+
+
+# --- forced requirements: the parent's half of the handshake (§4.7.1) -------
+
+
+def test_normalize_folds_line_endings_so_a_textarea_round_trip_does_not_rebuild():
+    """A browser textarea turning \\n into \\r\\n changes no requirement and must not rebuild.
+
+    Having argued file mtime out of the environment key for exactly that reason, leaving line
+    endings in the digest would reinstate the trap one layer up.
+    """
+    lf = normalize_forced_text('tabulate==0.9.0\nnumpy\n')
+    crlf = normalize_forced_text('tabulate==0.9.0\r\nnumpy\r\n')
+    cr = normalize_forced_text('tabulate==0.9.0\rnumpy\r')
+    assert lf == crlf == cr
+    assert forced_digest(lf) == forced_digest(crlf) == forced_digest(cr)
+
+
+def test_normalize_strips_trailing_whitespace_and_canonicalises_the_last_newline():
+    assert normalize_forced_text('tabulate==0.9.0   \n\n\n') == 'tabulate==0.9.0\n'
+    assert normalize_forced_text('tabulate==0.9.0') == 'tabulate==0.9.0\n'
+
+
+def test_blank_forced_text_is_the_no_forced_value_all_the_way_down():
+    # Absent, empty and whitespace-only are one case: empty digest, no file, empty variable.
+    for blank in (None, '', '   ', '\n\n', '\r\n'):
+        assert normalize_forced_text(blank) == ''
+    assert forced_digest('') == ''
+
+
+def test_digest_is_the_whole_sha256_and_is_also_the_file_name(tmp_path):
+    # Two lengths for one identity is how a parent writing sixteen hex and a child opening
+    # sixty-four would agree with every word of the design and still never find the file.
+    text = normalize_forced_text('tabulate==0.9.0\n')
+    digest = forced_digest(text)
+    assert len(digest) == 64
+    path = write_forced_file(str(tmp_path), text, digest)
+    assert os.path.basename(path) == f'{digest}.txt'
+    assert os.path.dirname(path).replace('\\', '/').endswith('cache/forced')
+
+
+def test_write_creates_the_cache_directory_on_the_very_first_run(tmp_path):
+    # engine_cache_dir() is create=False by default and cache/forced/ has never existed, so a
+    # blind write fails on precisely the run the feature is most likely to be tried on.
+    assert not (tmp_path / 'cache').exists()
+    text = normalize_forced_text('numpy\n')
+    path = write_forced_file(str(tmp_path), text, forced_digest(text))
+    assert os.path.isfile(path)
+    assert open(path, encoding='utf-8').read() == text
+
+
+def test_write_is_write_if_absent_and_leaves_an_existing_file_alone(tmp_path):
+    text = normalize_forced_text('numpy\n')
+    digest = forced_digest(text)
+    path = write_forced_file(str(tmp_path), text, digest)
+    before = os.stat(path).st_mtime_ns
+    time.sleep(0.01)
+    assert write_forced_file(str(tmp_path), text, digest) == path
+    assert os.stat(path).st_mtime_ns == before, 'the name is the digest, so an existing file is the right one'
+
+
+def test_write_leaves_no_temporary_behind(tmp_path):
+    text = normalize_forced_text('numpy\n')
+    write_forced_file(str(tmp_path), text, forced_digest(text))
+    leftovers = [n for n in os.listdir(tmp_path / 'cache' / 'forced') if n.endswith('.tmp')]
+    assert leftovers == []
+
+
+def test_empty_digest_writes_nothing(tmp_path):
+    assert write_forced_file(str(tmp_path), '', '') is None
+    assert not (tmp_path / 'cache').exists()
+
+
+def test_two_documents_for_one_project_each_get_their_own_file(tmp_path):
+    """The multi-team deployment case: one project runs at several versions at once.
+
+    ``deployments`` is unique on (team_id, project_id) and each row carries its own version, so
+    two teams' documents land on one pod. Under a single fixed filename the second would either
+    clobber the first or be refused for doing nothing wrong; the digest naming removes the case.
+    """
+    a = normalize_forced_text('tabulate==0.9.0\n')
+    b = normalize_forced_text('tabulate==0.10.0\n')
+    pa = write_forced_file(str(tmp_path), a, forced_digest(a))
+    pb = write_forced_file(str(tmp_path), b, forced_digest(b))
+    assert pa != pb
+    assert os.path.isfile(pa) and os.path.isfile(pb), 'both documents must still run'
+    assert open(pa, encoding='utf-8').read() == a
+    assert open(pb, encoding='utf-8').read() == b
+
+
+def test_writing_never_removes_another_documents_file(tmp_path):
+    # Sweeping is the plausible wrong instinct and it is how one deployed version would delete
+    # another's. Purge and GC clear venvs/, which is not where this lives.
+    stale = tmp_path / 'cache' / 'forced' / ('0' * 64 + '.txt')
+    stale.parent.mkdir(parents=True)
+    stale.write_text('six==1.16.0\n', encoding='utf-8')
+    text = normalize_forced_text('numpy\n')
+    write_forced_file(str(tmp_path), text, forced_digest(text))
+    assert stale.is_file(), "a file this run does not name is not this run's business"
+
+
+def test_write_succeeds_while_an_environments_install_lock_is_held(tmp_path):
+    """The regression guard for the lock question §4.7.1 reversed.
+
+    ``depends.FileLock`` is unreachable from this package (importing ``depends`` pulls in
+    ``engLib``) and ``venv_env._EnvLock`` is private and **non-blocking**, so a parent that
+    starts taking a lock would raise ``EnvBusy`` on an ordinary concurrent install. This holds a
+    real OS lock with the same primitive family and asserts the write is unbothered by it.
+    """
+    lock_path = tmp_path / 'venvs' / 'p' / 'main' / 'install.lock'
+    lock_path.parent.mkdir(parents=True)
+    lock_path.touch()
+    text = normalize_forced_text('numpy\n')
+
+    with open(lock_path, 'a+b') as held:
+        if os.name == 'nt':
+            import msvcrt
+
+            held.seek(0)
+            msvcrt.locking(held.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            path = write_forced_file(str(tmp_path), text, forced_digest(text))
+            assert os.path.isfile(path)
+        finally:
+            if os.name == 'nt':
+                held.seek(0)
+                msvcrt.locking(held.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+
+
+def test_child_env_carries_the_forced_digest():
+    env = build_child_env({'PATH': '/x'}, 'c', 't', 'v1', avoid_mocks=False, forced_sha='abc123')
+    assert env[VENV_FORCED_SHA_ENV] == 'abc123'
+
+
+def test_child_env_overwrites_an_inherited_forced_digest():
+    # Assigned, never conditionally set -- like the env id, and for the same reason: a child must
+    # carry exactly one answer, so a stale inherited value has to lose.
+    env = build_child_env({VENV_FORCED_SHA_ENV: 'stale'}, 'c', 't', 'v1', avoid_mocks=False)
+    assert env[VENV_FORCED_SHA_ENV] == ''

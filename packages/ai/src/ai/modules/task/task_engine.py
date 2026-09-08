@@ -92,8 +92,11 @@ from .venv_spawn import (
     await_child_ready,
     build_child_env,
     classify_child_event,
+    forced_digest,
     inject_venv_urls,
     kill_process,
+    normalize_forced_text,
+    write_forced_file,
 )
 from .types import LAUNCH_TYPE, TaskError
 from .task_conn import TaskConn
@@ -915,7 +918,14 @@ class Task(DAPBase):
         groups: Dict[str, Dict[str, Any]],
     ) -> VenvChild:
         """Spawn and ready one venv child, mirroring the main-engine spawn pattern."""
-        name = (groups.get(env_id) or {}).get('name') or env_id
+        environment = groups.get(env_id) or {}
+        name = environment.get('name') or env_id
+        # Materialise this container's forced requirements before the spawn, and hand the child
+        # only the digest. Normalising here rather than in the child is what lets the child
+        # neither normalise nor compare: it opens the one file it was named, or refuses.
+        forced_text = normalize_forced_text(environment.get('forced'))
+        forced_sha = forced_digest(forced_text)
+        write_forced_file(exec_dir, forced_text, forced_sha)
         tmpfile = await self._write_task_file(child_doc)
 
         child_args = [
@@ -958,6 +968,7 @@ class Task(DAPBase):
             run_token,
             env_id,
             avoid_mocks,
+            forced_sha,
         )
 
         process = await asyncio.create_subprocess_exec(

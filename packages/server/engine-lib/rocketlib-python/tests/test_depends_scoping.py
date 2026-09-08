@@ -346,3 +346,429 @@ def test_both_install_paths_share_one_argv_builder(tmp_path, restore_active_env)
     overlay = V.build_install_argv('uv', 'py', 'r.txt', ctx.paths.site_packages, 'c.txt', 'ex.txt')
     base = V.build_install_argv('uv', 'py', 'r.txt', None, 'c.txt', 'ex.txt')
     assert base == [a for a in overlay if a not in ('--target', ctx.paths.site_packages)]
+
+
+# --- forced requirements: the child's file half (§4.7.1) --------------------
+
+
+def _tree_overrides(tmp_path, name, body):
+    path = tmp_path / name
+    path.write_text(body, encoding='utf-8')
+    return str(path)
+
+
+def test_override_args_default_is_the_base_answer_not_a_fallback(tmp_path, monkeypatch):
+    """The shared cache file is what ``None`` *means*, and getting it wrong is silent.
+
+    Handing base an environment's file would drop the tree's own ``ai/**/overrides.txt`` out of
+    the compile that governs the engine runtime and the whole legacy path, and nothing would
+    fail -- the resolution would simply stop honouring an override honoured since it was written.
+    """
+    shared = tmp_path / 'cache' / 'overrides-combined.txt'
+    shared.parent.mkdir(parents=True)
+    shared.write_text('tabulate==0.9.0\n', encoding='utf-8')
+    monkeypatch.setattr(D, '_get_overrides_path', lambda: str(shared))
+
+    args = D._override_args(str(tmp_path))
+    assert args[0] == '--override'
+    assert args[1].replace('\\', '/') == 'cache/overrides-combined.txt'
+
+
+def test_override_args_takes_the_environments_file_when_given_one(tmp_path):
+    env_file = tmp_path / 'venvs' / 'p' / 'v1' / 'overrides-combined.txt'
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text('tabulate==0.9.0\n', encoding='utf-8')
+
+    args = D._override_args(str(tmp_path), str(env_file))
+    assert args[0] == '--override'
+    assert args[1].replace('\\', '/') == 'venvs/p/v1/overrides-combined.txt'
+
+
+def test_override_args_is_empty_for_an_absent_or_empty_file(tmp_path):
+    missing = str(tmp_path / 'nope.txt')
+    assert D._override_args(str(tmp_path), missing) == []
+    empty = tmp_path / 'empty.txt'
+    empty.touch()
+    assert D._override_args(str(tmp_path), str(empty)) == []
+
+
+def test_active_overrides_path_follows_the_active_environment(tmp_path, restore_active_env):
+    """The runtime install path cannot be passed an environment, so it reads the active one.
+
+    ``depends()`` is called by node code mid-run, which has no environment to hand over and no
+    way to learn one; the active context is the only thing that knows.
+    """
+    paths = V.env_paths(V.env_dir(str(tmp_path), 'p', 'v1'))
+    os.makedirs(paths.site_packages, exist_ok=True)
+    D.activate_env(D.register_env(paths.env_dir))
+    assert D._active_overrides_path() == os.path.join(paths.env_dir, 'overrides-combined.txt')
+
+    D.activate_env(None)
+    assert D._active_overrides_path() == D._get_overrides_path()
+
+
+def test_write_env_overrides_merges_forced_over_the_tree(tmp_path, monkeypatch):
+    env_dir = tmp_path / 'env'
+    env_dir.mkdir()
+    tree = _tree_overrides(tmp_path, 'overrides.txt', 'tabulate==0.8.10\nsix==1.16.0\n')
+
+    text = 'tabulate==0.9.0\n'
+    digest = 'a' * 64
+    forced_dir = tmp_path / 'cache' / 'forced'
+    forced_dir.mkdir(parents=True)
+    (forced_dir / f'{digest}.txt').write_text(text, encoding='utf-8')
+    monkeypatch.setattr(D, '_forced_path', lambda d: str(forced_dir / f'{d}.txt'))
+
+    out = D._write_env_overrides(str(env_dir), [tree], digest)
+    body = open(out, encoding='utf-8').read()
+    assert 'tabulate==0.9.0' in body
+    assert 'tabulate==0.8.10' not in body, 'forced replaces the tree line for that name'
+    assert 'six==1.16.0' in body, 'names forced does not mention keep what the tree said'
+
+
+def test_write_env_overrides_with_no_forced_is_just_the_tree(tmp_path):
+    env_dir = tmp_path / 'env'
+    env_dir.mkdir()
+    tree = _tree_overrides(tmp_path, 'overrides.txt', 'tabulate==0.8.10\n')
+    out = D._write_env_overrides(str(env_dir), [tree], '')
+    assert 'tabulate==0.8.10' in open(out, encoding='utf-8').read()
+
+
+def test_write_env_overrides_is_regenerated_rather_than_cached(tmp_path):
+    # No digest in the name and no write-if-absent: it is derived, and a cached one would go
+    # stale across an engine upgrade where the tree's override files move and forced does not.
+    env_dir = tmp_path / 'env'
+    env_dir.mkdir()
+    tree = _tree_overrides(tmp_path, 'overrides.txt', 'tabulate==0.8.10\n')
+    first = D._write_env_overrides(str(env_dir), [tree], '')
+    (tmp_path / 'overrides.txt').write_text('tabulate==0.10.0\n', encoding='utf-8')
+    second = D._write_env_overrides(str(env_dir), [tree], '')
+    assert first == second
+    assert 'tabulate==0.10.0' in open(second, encoding='utf-8').read()
+
+
+def test_a_non_empty_digest_whose_file_is_missing_refuses_by_name(tmp_path):
+    """Refuse rather than compile without the overrides.
+
+    Compiling anyway installs versions the document did not ask for, silently, and this process
+    cannot re-create a text it never received -- only the digest crosses the boundary.
+    """
+    env_dir = tmp_path / 'env'
+    env_dir.mkdir()
+    with pytest.raises(D.ForcedRequirementsMissing) as excinfo:
+        D._write_env_overrides(str(env_dir), [], 'b' * 64)
+    message = str(excinfo.value)
+    assert 'b' * 64 in message, 'name the file, so the cause is findable'
+    assert 'repeatable' in message, 'say the run can simply be launched again'
+
+
+def test_another_documents_forced_file_is_neither_read_nor_removed(tmp_path, monkeypatch):
+    # Sweeping is the plausible wrong instinct and it is how one deployed version would delete
+    # another's file. The digest naming makes this a non-case rather than a rule.
+    env_dir = tmp_path / 'env'
+    env_dir.mkdir()
+    forced_dir = tmp_path / 'cache' / 'forced'
+    forced_dir.mkdir(parents=True)
+    stale = forced_dir / ('c' * 64 + '.txt')
+    stale.write_text('six==1.16.0\n', encoding='utf-8')
+    monkeypatch.setattr(D, '_forced_path', lambda d: str(forced_dir / f'{d}.txt'))
+
+    out = D._write_env_overrides(str(env_dir), [], '')
+    assert stale.is_file(), 'a file this run does not name must survive'
+    assert 'six' not in open(out, encoding='utf-8').read(), 'and must not be read either'
+
+
+def test_tree_include_lines_are_absolutised_into_the_merged_file(tmp_path):
+    r"""The half of ``write_combined`` a replacement drops without anything failing.
+
+    uv resolves an include relative to the file holding it, and the merged file lives elsewhere;
+    a requirement file also treats ``\`` as an escape, so ``-r C:\x\y.txt`` reaches uv as
+    ``C:xy.txt``. No override file in the tree carries a flag line today, which is exactly what
+    would make losing this silent until someone adds one on Windows.
+    """
+    env_dir = tmp_path / 'env'
+    env_dir.mkdir()
+    (tmp_path / 'inner.txt').write_text('idna==3.6\n', encoding='utf-8')
+    tree = _tree_overrides(tmp_path, 'overrides.txt', '-r inner.txt\n')
+
+    out = D._write_env_overrides(str(env_dir), [tree], '')
+    body = open(out, encoding='utf-8').read()
+    assert '-r inner.txt' not in body
+    assert '/inner.txt' in body and '\\inner.txt' not in body
+
+
+# --- forced requirements: the warning channel (2C-FR step 4) ----------------
+
+
+def _warning_plan(tmp_path, requirements, resolution):
+    """A plan whose constraints file already holds ``resolution``, as if uv had just run."""
+    req = tmp_path / 'r.txt'
+    req.write_text(requirements, encoding='utf-8')
+    plan = V.plan_install(str(tmp_path), 'p', 'v1', [str(req)])
+    with open(plan.paths.constraints, 'w', encoding='utf-8') as fh:
+        fh.write(resolution)
+    return plan
+
+
+def _capture(monkeypatch):
+    sent = []
+    monkeypatch.setattr(D, 'updateProgress', sent.append)
+    monkeypatch.setattr(D, 'error', lambda message: None)
+    return sent
+
+
+def test_warnings_reach_the_progress_channel(tmp_path, monkeypatch):
+    """The channel is the one already reporting ``Downloading torch (2.7GiB)``.
+
+    The install-lock sidecar beside it is not a second channel: it is inter-process, read by a
+    process waiting on the lock, and reaches no user.
+    """
+    plan = _warning_plan(tmp_path, 'tabulate==0.8.10\n', 'tabulate==0.8.10\n')
+    forced_dir = tmp_path / 'cache' / 'forced'
+    forced_dir.mkdir(parents=True)
+    digest = 'd' * 64
+    (forced_dir / f'{digest}.txt').write_text('tabulaet==0.9.0\n', encoding='utf-8')
+    monkeypatch.setattr(D, '_forced_path', lambda d: str(forced_dir / f'{d}.txt'))
+
+    sent = _capture(monkeypatch)
+    D._report_forced_warnings(plan, digest)
+    assert any('tabulaet' in message for message in sent)
+
+
+def test_no_forced_text_says_nothing(tmp_path, monkeypatch):
+    # Every environment on the day this ships. Reporting has to be free for them.
+    plan = _warning_plan(tmp_path, 'tabulate==0.8.10\n', 'tabulate==0.8.10\n')
+    sent = _capture(monkeypatch)
+    D._report_forced_warnings(plan, '')
+    assert sent == []
+
+
+def test_a_missing_forced_file_does_not_raise_from_the_reporting_helper(tmp_path, monkeypatch):
+    # The install path raises ForcedRequirementsMissing for real; re-raising here would give one
+    # cause two call sites and let a *reporting* helper fail a run.
+    plan = _warning_plan(tmp_path, 'tabulate==0.8.10\n', 'tabulate==0.8.10\n')
+    sent = _capture(monkeypatch)
+    D._report_forced_warnings(plan, 'e' * 64)
+    assert sent == []
+
+
+# --- forced requirements: which environment each --override caller serves ---
+#
+# These are call-site assertions rather than behavioural ones, and they are here as a pair on
+# purpose. `_override_args` is read from three places and none of them belongs to one path
+# alone, so there are two ways to get it wrong and neither fails anything: stopping at the
+# compile *mostly works* and diverges occasionally, while handing base an environment's file
+# drops the tree's own `ai/**/overrides.txt` out of the compile that governs the engine runtime.
+# Nothing that merely checks a resolved version notices either.
+
+
+class _FakeCompleted:
+    def __init__(self, stdout='', stderr='', returncode=0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+class _FakePopen:
+    """Just enough of Popen for the install path: a stdout to drain and a zero exit."""
+
+    def __init__(self, args, **_kwargs):
+        self.args = args
+        self.stdout = iter(())
+        self.returncode = 0
+
+    def wait(self):
+        return 0
+
+
+@pytest.fixture
+def uv_argv(monkeypatch):
+    """Capture every uv argv this module builds, without running uv."""
+    seen = []
+
+    def fake_run(args, **_kwargs):
+        seen.append(list(args))
+        # The dry-run parses "+ name==version" lines to decide there is work to do.
+        return _FakeCompleted(stdout='+ somepkg==1.0\n')
+
+    def fake_popen(args, **kwargs):
+        seen.append(list(args))
+        return _FakePopen(args, **kwargs)
+
+    monkeypatch.setattr(D.subprocess, 'run', fake_run)
+    monkeypatch.setattr(D.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(D, '_uv_available', lambda: True)
+    monkeypatch.setattr(D, '_uv_abs_path', lambda: 'uv')
+    monkeypatch.setattr(D, '_start_heartbeat', lambda: None)
+    monkeypatch.setattr(D, '_stop_heartbeat', lambda: None)
+    monkeypatch.setattr(D, 'updateProgress', lambda message: None)
+    return seen
+
+
+def _override_value(argv):
+    """The path passed to ``--override`` in one argv, or ``None``."""
+    for index, token in enumerate(argv):
+        if token == '--override':
+            return argv[index + 1].replace('\\', '/')
+    return None
+
+
+def _nonempty(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write('tabulate==0.9.0\n')
+    return path
+
+
+def test_the_compile_is_told_which_environment_it_serves(tmp_path, uv_argv, monkeypatch):
+    monkeypatch.setattr(D, '_get_executable_dir', lambda: str(tmp_path))
+    combined = _nonempty(str(tmp_path / 'combined.txt'))
+    constraints = str(tmp_path / 'constraints.txt')
+    env_overrides = _nonempty(str(tmp_path / 'venvs' / 'p' / 'v1' / 'overrides-combined.txt'))
+
+    D._run_uv_compile(combined, constraints, env_overrides)
+    assert _override_value(uv_argv[-1]) == 'venvs/p/v1/overrides-combined.txt'
+
+
+def test_the_compile_keeps_the_shared_file_on_the_base_path(tmp_path, uv_argv, monkeypatch):
+    monkeypatch.setattr(D, '_get_executable_dir', lambda: str(tmp_path))
+    shared = _nonempty(str(tmp_path / 'cache' / 'overrides-combined.txt'))
+    monkeypatch.setattr(D, '_get_overrides_path', lambda: shared)
+    combined = _nonempty(str(tmp_path / 'combined.txt'))
+
+    D._run_uv_compile(combined, str(tmp_path / 'constraints.txt'))
+    assert _override_value(uv_argv[-1]) == 'cache/overrides-combined.txt'
+
+
+def test_both_install_readers_follow_the_active_overlay(tmp_path, uv_argv, monkeypatch, restore_active_env):
+    """`_install_dry_run` and `_install_requirements_inner`, in one run of the install path.
+
+    They cannot be *told* an environment: ``depends()`` is called by node code at runtime,
+    which has no environment to hand over. They read the active context instead.
+    """
+    monkeypatch.setattr(D, '_get_executable_dir', lambda: str(tmp_path))
+    paths = V.env_paths(V.env_dir(str(tmp_path), 'p', 'v1'))
+    os.makedirs(paths.site_packages, exist_ok=True)
+    env_overrides = _nonempty(os.path.join(paths.env_dir, 'overrides-combined.txt'))
+    D.activate_env(D.register_env(paths.env_dir))
+
+    requirements = _nonempty(str(tmp_path / 'r.txt'))
+    constraints = str(tmp_path / 'constraints.txt')
+    with open(constraints, 'w', encoding='utf-8') as fh:
+        fh.write('tabulate==0.9.0\n')
+
+    D._install_requirements_inner(requirements, constraints)
+
+    overrides_seen = [_override_value(argv) for argv in uv_argv if _override_value(argv)]
+    assert len(overrides_seen) >= 2, 'both the dry-run and the install must pass --override'
+    relative = os.path.relpath(env_overrides, str(tmp_path)).replace('\\', '/')
+    assert set(overrides_seen) == {relative}
+
+
+def test_both_install_readers_keep_the_shared_file_on_base(tmp_path, uv_argv, monkeypatch, restore_active_env):
+    # The mirror mistake, and the worse one: base losing the tree's own overrides would change
+    # what the engine runtime resolves, and nothing would fail.
+    monkeypatch.setattr(D, '_get_executable_dir', lambda: str(tmp_path))
+    shared = _nonempty(str(tmp_path / 'cache' / 'overrides-combined.txt'))
+    monkeypatch.setattr(D, '_get_overrides_path', lambda: shared)
+    D.activate_env(None)
+
+    requirements = _nonempty(str(tmp_path / 'r.txt'))
+    constraints = str(tmp_path / 'constraints.txt')
+    with open(constraints, 'w', encoding='utf-8') as fh:
+        fh.write('tabulate==0.9.0\n')
+
+    D._install_requirements_inner(requirements, constraints)
+
+    overrides_seen = [_override_value(argv) for argv in uv_argv if _override_value(argv)]
+    assert len(overrides_seen) >= 2
+    assert set(overrides_seen) == {'cache/overrides-combined.txt'}
+
+
+# --- the scoped install is a FOURTH place the override is needed ------------
+#
+# Found by the live run of 2C-FR step 7, not by any of the tests above, and the reason is worth
+# keeping: the design counted the three *readers* of `_override_args` and treated that as the set
+# of places the override belongs. `_install_target` read it nowhere, so it was never counted —
+# and without forced it never had to, because an environment's requirement file and its own
+# compiled resolution could not disagree. Forced is exactly the thing that makes them disagree.
+
+
+def test_the_scoped_install_passes_the_same_override_the_compile_did(tmp_path, uv_argv, monkeypatch):
+    """The live failure, reproduced: `-r` says one version, `-c` says the overridden one.
+
+    uv re-resolves the requirements against the constraints, and without the override it sees a
+    requirement it cannot satisfy — *"Because you require tabulate==0.9.0 and tabulate==0.10.0,
+    we can conclude that your requirements are unsatisfiable"*. The run fails outright rather
+    than installing the wrong thing, which is the loud half of an otherwise quiet class.
+    """
+    monkeypatch.setattr(D, '_get_executable_dir', lambda: str(tmp_path))
+    paths = V.env_paths(V.env_dir(str(tmp_path), 'p', 'v1'))
+    os.makedirs(paths.site_packages, exist_ok=True)
+
+    with open(paths.combined, 'w', encoding='utf-8') as fh:
+        fh.write('tabulate==0.10.0\n')  # what the node declared
+    with open(paths.constraints, 'w', encoding='utf-8') as fh:
+        fh.write('tabulate==0.9.0\n')  # what the override turned it into
+    overrides = _nonempty(os.path.join(paths.env_dir, 'overrides-combined.txt'))
+
+    D._install_target(paths.combined, paths.constraints, paths.site_packages, overrides)
+
+    install = [argv for argv in uv_argv if 'install' in argv][-1]
+    assert _override_value(install) is not None, 'the install must carry the override, not only the compile'
+    assert _override_value(install) == os.path.relpath(overrides, str(tmp_path)).replace('\\', '/')
+
+
+def test_the_scoped_install_without_an_environment_file_still_takes_base(tmp_path, uv_argv, monkeypatch):
+    # The same default as everywhere else: `None` is the base answer, not a fallback.
+    monkeypatch.setattr(D, '_get_executable_dir', lambda: str(tmp_path))
+    shared = _nonempty(str(tmp_path / 'cache' / 'overrides-combined.txt'))
+    monkeypatch.setattr(D, '_get_overrides_path', lambda: shared)
+    paths = V.env_paths(V.env_dir(str(tmp_path), 'p', 'v2'))
+    os.makedirs(paths.site_packages, exist_ok=True)
+    with open(paths.combined, 'w', encoding='utf-8') as fh:
+        fh.write('tabulate==0.10.0\n')
+    with open(paths.constraints, 'w', encoding='utf-8') as fh:
+        fh.write('tabulate==0.10.0\n')
+
+    D._install_target(paths.combined, paths.constraints, paths.site_packages)
+
+    install = [argv for argv in uv_argv if 'install' in argv][-1]
+    assert _override_value(install) == 'cache/overrides-combined.txt'
+
+
+def test_the_compile_and_the_install_get_the_SAME_override_file(tmp_path, uv_argv, monkeypatch):
+    """The wiring, not the two functions — which is what the earlier tests could not reach.
+
+    A version where only the compile got the environment's file shipped and ran: the compile
+    honoured the override, the install re-resolved without it, and uv refused the run. Every
+    test passed, because each one called a function directly with a path of its own. This one
+    drives both from the same caller and asserts they agree.
+    """
+    monkeypatch.setattr(D, '_get_executable_dir', lambda: str(tmp_path))
+    shared = _nonempty(str(tmp_path / 'cache' / 'overrides-combined.txt'))
+    monkeypatch.setattr(D, '_get_overrides_path', lambda: shared)
+    monkeypatch.setattr(D, 'bootstrap', lambda: None)
+
+    tree = _nonempty(str(tmp_path / 'overrides.txt'))
+    forced_dir = tmp_path / 'cache' / 'forced'
+    forced_dir.mkdir(parents=True, exist_ok=True)
+    digest = 'f' * 64
+    (forced_dir / f'{digest}.txt').write_text('tabulate==0.9.0\n', encoding='utf-8')
+    monkeypatch.setattr(D, '_forced_path', lambda d: str(forced_dir / f'{d}.txt'))
+
+    plan = V.plan_install(str(tmp_path), 'p', 'v1', [], create=True)
+    with open(plan.paths.combined, 'w', encoding='utf-8') as fh:
+        fh.write('tabulate==0.10.0\n')
+    with open(plan.paths.constraints, 'w', encoding='utf-8') as fh:
+        fh.write('tabulate==0.9.0\n')
+
+    D._scoped_compile_and_install(plan, [tree], digest)
+
+    used = [_override_value(argv) for argv in uv_argv if _override_value(argv)]
+    expected = os.path.relpath(os.path.join(plan.paths.env_dir, 'overrides-combined.txt'), str(tmp_path)).replace(
+        '\\', '/'
+    )
+    assert len(used) >= 2, 'both the compile and the install must pass --override'
+    assert set(used) == {expected}, f'compile and install disagree: {set(used)}'
+    assert shared.replace('\\', '/') not in [os.path.join(str(tmp_path), u).replace('\\', '/') for u in used]

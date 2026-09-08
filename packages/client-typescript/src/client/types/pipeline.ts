@@ -59,6 +59,21 @@ export interface PipelineEnvironment {
 
 	/** Whether members run with their own isolated dependencies */
 	isolated: boolean;
+
+	/**
+	 * Forced Python requirements — free text, one requirement per line, applied over
+	 * whatever this environment's dependencies resolve to (package by package).
+	 *
+	 * Reaches `uv pip compile` as `--override`, so it **selects versions of packages the
+	 * environment already installs and never adds one**: a line naming a package nothing
+	 * requires installs nothing. Only PEP 508 requirement lines, comments and blank lines
+	 * are admissible — `-r`, `-c`, `-e`, index flags, paths and URLs are refused when the
+	 * run starts, not silently ignored.
+	 *
+	 * Only meaningful on an isolated container: without an environment there is nothing to
+	 * apply it to, and the run is refused rather than quietly dropping it.
+	 */
+	forced?: string;
 }
 
 /**

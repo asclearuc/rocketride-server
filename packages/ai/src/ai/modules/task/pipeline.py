@@ -7,6 +7,13 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, Any, Iterator, List, Optional, Tuple
 
+# The admissibility gate below is the security boundary of the forced-requirements field, and it
+# rests on a standard someone else maintains rather than on a regex we wrote. Declared in
+# ai/requirements.txt for this. The engine's own requirement-line handling stays hand-rolled --
+# it reads uv's compiled output and the tree's own override files, neither of which is text a
+# tenant typed (§4.7.1, OQ-19).
+from packaging.requirements import InvalidRequirement, Requirement
+
 # Only environment variables with this prefix are permitted to resolve in pipelines.
 # All other env vars are blocked to prevent exfiltration of secrets via ${VAR} expansion.
 ALLOWED_ENV_PREFIX = 'ROCKETRIDE_'
@@ -154,7 +161,82 @@ def _env_of(components: List[Dict[str, Any]]) -> Dict[str, str]:
     return env_of
 
 
-def _validate_containers(pipeline: Dict[str, Any], source: Optional[str]) -> None:
+def _forced_text(component: Dict[str, Any]) -> str:
+    """The container's forced-requirements text, or ``''`` when it has none."""
+    environment = _environment(component) or {}
+    forced = environment.get('forced')
+    return forced.strip() if isinstance(forced, str) else ''
+
+
+def _container_label(component: Dict[str, Any]) -> str:
+    """How to name a container in a refusal: its display name, falling back to its id."""
+    environment = _environment(component) or {}
+    return environment.get('name') or component.get('id') or '<unnamed>'
+
+
+def _validate_forced(component: Dict[str, Any], scoped: bool) -> None:
+    """Refuse a container whose forced requirements cannot be honoured as written.
+
+    Three refusals, and the first two are about the field having no environment to act on.
+    **Isolation is checked before scoping** even though either can be the reason: a container that
+    is not isolated is not an environment at all, and "tick the box" is an answer the user can act
+    on, while "this run is not scoped" would send them looking at a server switch. Under ``auto``
+    an un-isolated lone container produces *both* conditions, so the order decides which message
+    they read.
+
+    The third is admissibility, and it is the security boundary. ``-r`` would make a
+    tenant-supplied string read a path off the server; an index flag is worse than it looks,
+    because the compile already runs ``--index-strategy unsafe-best-match`` and ``--emit-index-url``
+    writes the index into ``constraints.txt`` where later installs read it -- that is dependency
+    confusion. Refusing here rather than at install time is what keeps either from reaching uv at
+    all.
+
+    Raises:
+        ValueError: Named, carrying the container and (for a bad line) the line itself, so the
+            canvas can show it. One more of the plain ``ValueError`` refusals this module already
+            raises -- an exception hierarchy would be a second mechanism for one audience.
+    """
+    text = _forced_text(component)
+    if not text:
+        return
+
+    label = _container_label(component)
+    if not is_isolated(component):
+        raise ValueError(
+            f'Container "{label}" has forced Python requirements but is not isolated; '
+            'they would not be applied. Enable isolated dependencies or clear the field'
+        )
+    if not scoped:
+        raise ValueError(
+            f'Container "{label}" has forced Python requirements but this run is not scoped, '
+            'so no virtual environment is created and they would not be applied. '
+            'Clear the field or enable virtual environments'
+        )
+
+    for raw in text.splitlines():
+        line = raw.split('#', 1)[0].strip()
+        if not line:
+            continue
+        try:
+            requirement = Requirement(line)
+        except InvalidRequirement as exc:
+            raise ValueError(
+                f'Container "{label}" has an inadmissible forced requirement: "{line}". '
+                'Only PEP 508 requirement lines, comments and blank lines are allowed '
+                '(no -r, -c, -e, index flags, paths or URLs)'
+            ) from exc
+        # The one shape PEP 508 accepts and this field must not: a direct reference names a
+        # distribution to fetch from an arbitrary URL, which is the "forced never adds" boundary
+        # in reverse.
+        if requirement.url is not None:
+            raise ValueError(
+                f'Container "{label}" has an inadmissible forced requirement: "{line}". '
+                'A direct URL reference is not allowed; forced requirements select versions '
+                'of packages the environment already installs'
+            )
+
+
+def _validate_containers(pipeline: Dict[str, Any], source: Optional[str], scoped: bool = False) -> None:
     """Reject documents whose containers cannot be executed as written.
 
     These are structural errors the editor should have prevented, so they fail the
@@ -168,6 +250,7 @@ def _validate_containers(pipeline: Dict[str, Any], source: Optional[str]) -> Non
     for component, _ in walk_components(components):
         if is_container(component):
             container_ids.add(component.get('id'))
+            _validate_forced(component, scoped)
         # An isolated group whose environment is not ``main`` sits inside another venv
         # (directly or through a plain group) — nested environments are not supported.
         if is_isolated(component) and env_of.get(component.get('id'), MAIN_ENV) != MAIN_ENV:
@@ -790,7 +873,7 @@ def _cut_pipeline(pipeline: Dict[str, Any], source: Optional[str]) -> PartitionR
     in the routing table. The input document is not modified. The body is a sequence of pure
     steps over a single deep copy — one ``_*`` helper above per step.
     """
-    _validate_containers(pipeline, source)
+    _validate_containers(pipeline, source, scoped=True)
 
     work = copy.deepcopy(pipeline)
 
@@ -887,7 +970,7 @@ def partition_pipeline(pipeline: Dict[str, Any], source: Optional[str] = None, s
     if not any(is_container(component) for component, _ in walk_components(components)):
         return pipeline
 
-    _validate_containers(pipeline, source)
+    _validate_containers(pipeline, source, scoped=False)
 
     partitioned = dict(pipeline)
     partitioned['components'] = _flatten_members(components)
