@@ -22,6 +22,7 @@ Those have neither the stdin monitor nor a pipe from the server, which is what
 
 import asyncio
 import ctypes
+import hashlib
 import os
 import signal
 import time
@@ -41,6 +42,17 @@ VENV_ENV_ID_ENV = 'ROCKETRIDE_VENV_ENV_ID'
 # scoping_enabled still decides, so a stale value cannot switch scoping on under =0. Mirrors
 # venv_env.VENV_ISOLATED_ENV -- keep in sync.
 VENV_ISOLATED_ENV = 'ROCKETRIDE_VENV_ISOLATED'
+# Digest of the container's forced-requirements text (config.environment.forced), empty when it
+# has none. The DIGEST travels, never the text: the text is unbounded multi-line input and the
+# Windows environment block is not, so both sides derive the file name from this instead.
+# Mirrors venv_env.VENV_FORCED_SHA_ENV -- keep in sync.
+VENV_FORCED_SHA_ENV = 'ROCKETRIDE_VENV_FORCED_SHA'
+
+# Where that file is written, relative to the engine executable directory. The engine's own
+# depends.engine_cache_dir() is the single source of truth for the 'cache' half and this module
+# cannot import it (engine sys.path only, like the constants above) -- keep in sync. NOT under
+# venvs/: the venv GC treats every directory there as a project, and purge empties env_dir.
+FORCED_SUBPATH = ('cache', 'forced')
 
 # ---------------------------------------------------------------------------
 # child event routing (pure; the Task acts on the result)
@@ -230,12 +242,91 @@ class VenvChild:
     last_event_at: float = field(default_factory=time.monotonic)
 
 
+# ---------------------------------------------------------------------------
+# forced requirements: normalise, digest, materialise (pure -> unit-testable)
+# ---------------------------------------------------------------------------
+
+
+def normalize_forced_text(text: Optional[str]) -> str:
+    r"""Canonicalise the container's forced text before it is digested.
+
+    Line endings folded to ``\n``, trailing whitespace stripped per line, one trailing
+    newline. Normalising *before* the digest is what keeps cosmetic events out of the
+    environment key: a browser textarea round-tripping ``\n`` into ``\r\n``, or an editor
+    trimming a line, changes no requirement and must not rebuild the overlay. Having argued
+    file mtime out of the key for exactly that reason, leaving line endings in would
+    reinstate the trap one layer up.
+
+    Returns ``''`` for absent or blank text, which is the "no forced requirements" value all
+    the way down: empty digest, no file, empty environment variable, nothing merged.
+    """
+    if not text or not text.strip():
+        return ''
+    lines = [line.rstrip() for line in text.replace('\r\n', '\n').replace('\r', '\n').split('\n')]
+    while lines and not lines[-1]:
+        lines.pop()
+    return '\n'.join(lines) + '\n' if lines else ''
+
+
+def forced_digest(normalized_text: str) -> str:
+    """sha256 of the normalised text, or ``''`` when there is none.
+
+    The whole digest, not a prefix: this value is both the environment variable and the file
+    name, and two spellings of one identity is how a parent writing one and a child opening
+    the other would agree with every word of the design and still never find the file.
+    """
+    if not normalized_text:
+        return ''
+    return hashlib.sha256(normalized_text.encode('utf-8')).hexdigest()
+
+
+def forced_file_path(exec_dir: str, digest: str) -> str:
+    """Where one document's forced text lives, derived from ``exec_dir`` and the digest alone.
+
+    ``exec_dir`` is ``dirname(sys.executable)``, and the child is literally ``sys.executable``
+    -- the same engine binary -- so its own ``_get_executable_dir()`` returns this directory
+    by construction rather than by convention. Nothing has to be told a path.
+    """
+    return os.path.join(exec_dir, *FORCED_SUBPATH, f'{digest}.txt')
+
+
+def write_forced_file(exec_dir: str, normalized_text: str, digest: str) -> Optional[str]:
+    """Materialise the forced text under the engine cache; return its path (``None`` if empty).
+
+    **Write-if-absent, and no lock.** The name is the content's digest, so an existing file is
+    by construction the right one and two parents writing it write identical bytes. The only
+    hazard left is a child reading a half-written file, which ``os.replace`` closes atomically
+    on both platforms. A lock would be worse than unnecessary: ``depends.FileLock`` is
+    unreachable from here (importing ``depends`` pulls in ``engLib``) and ``venv_env._EnvLock``
+    is private and **non-blocking**, so it would raise ``EnvBusy`` on an ordinary concurrent
+    install.
+
+    Never unlinks. An emptied field is an empty digest, which names nothing, so clearing the
+    box needs no delete -- and removing files is how one deployed version would clobber
+    another's.
+    """
+    if not digest:
+        return None
+    path = forced_file_path(exec_dir, digest)
+    # engine_cache_dir() is create=False by default and cache/forced/ has never existed, so a
+    # blind write fails on precisely the first run anyone tries the feature on.
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        return path
+    tmp = f'{path}.{os.getpid()}.tmp'
+    with open(tmp, 'w', encoding='utf-8', newline='\n') as fh:
+        fh.write(normalized_text)
+    os.replace(tmp, path)
+    return path
+
+
 def build_child_env(
     base_env: Dict[str, str],
     client_id: str,
     run_token: str,
     env_id: str,
     avoid_mocks: bool,
+    forced_sha: str = '',
 ) -> Dict[str, str]:
     """Build a venv child's subprocess environment, mirroring the main-engine spawn.
 
@@ -246,6 +337,9 @@ def build_child_env(
     The env id is **assigned, never conditionally set**: a child must carry exactly one, so an
     inherited value has to lose. Main's spawn is the mirror image -- it pops the variable,
     because main must carry none.
+
+    ``forced_sha`` is the digest of this container's forced-requirements text, already
+    materialised by :func:`write_forced_file`; the text itself never travels here.
     """
     env = dict(base_env)
     env['ROCKETRIDE_CLIENT_ID'] = client_id
@@ -255,6 +349,10 @@ def build_child_env(
     # and never otherwise -- so threading the computed value in would add an argument whose only
     # possible value is True. Main's stamp is conditional because main's document may have none.
     env[VENV_ISOLATED_ENV] = '1'
+    # Assigned unconditionally, like the env id and for the same reason: a child must carry
+    # exactly one answer, so an inherited value has to lose. Empty is the honest "this
+    # container has no forced requirements" -- the child then opens no file at all.
+    env[VENV_FORCED_SHA_ENV] = forced_sha or ''
     if avoid_mocks:
         env.pop('ROCKETRIDE_MOCK', None)
     return env

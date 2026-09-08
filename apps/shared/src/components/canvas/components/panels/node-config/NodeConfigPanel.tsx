@@ -61,6 +61,7 @@ import { useFlowPreferences } from '../../../context/FlowPreferencesContext';
 import { INodeType, IService, IServiceCatalog, IValidatePipelinePayload, PIPELINE_SCHEMA_VERSION } from '../../../types';
 import type { IEnvironment } from '../../../types';
 import { getComponentFromNode } from '../../../util/graph';
+import { buildEnvironmentWriteBack, forcedFieldEnabled, firstInadmissibleForcedLine, inadmissibleForcedMessage, FORCED_DISABLED_REASON } from '../../../util/envSettings';
 
 import { IAuthTokensRef, persistTokensFromFormData, mergeAuthTokensIntoFormData, persistOAuthTokensAndSave } from './authTokenHelpers';
 import { useOAuthCallbacks } from './useOAuthCallbacks';
@@ -130,6 +131,15 @@ const styles = {
 		alignItems: 'center',
 		gap: 8,
 		cursor: 'pointer',
+	} as CSSProperties,
+
+	// Forced-requirements textarea: monospace, because every line is a requirement
+	// specifier and a proportional font makes a mistyped `==` hard to see.
+	forcedTextarea: {
+		...commonStyles.inputField,
+		minHeight: 72,
+		resize: 'vertical',
+		fontFamily: 'var(--rr-font-mono, monospace)',
 	} as CSSProperties,
 
 	// Annotation content textarea (grows vertically only).
@@ -245,6 +255,7 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 	// opens with it filled in rather than blank.
 	const [envName, setEnvName] = useState<string>(((node.data.config?.environment as IEnvironment | undefined)?.name || node.data.name || '') as string);
 	const [envIsolated, setEnvIsolated] = useState<boolean>((node.data.config?.environment as IEnvironment | undefined)?.isolated !== false);
+	const [envForced, setEnvForced] = useState<string>(((node.data.config?.environment as IEnvironment | undefined)?.forced || '') as string);
 
 	// --- Secured field transforms -------------------------------------------
 	const securedFormData = getSecuredFormData(formValues);
@@ -280,6 +291,7 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 			const environment = config.environment as IEnvironment | undefined;
 			setEnvName(environment?.name || node.data.name || '');
 			setEnvIsolated(environment?.isolated !== false);
+			setEnvForced(environment?.forced || '');
 		}
 
 		// If OAuth tokens are in the URL, persist to node and save immediately
@@ -391,6 +403,17 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 				},
 			});
 		} else if (isVirtualEnv) {
+			// The container's Save has no server round trip — unlike a node with a schema, which
+			// goes through onSubmit and RJSF. So a bad forced line would otherwise surface only at
+			// Run, and a partition-time refusal never reaches the canvas: it fails before a task
+			// exists, so the node has no status to render it in and the message lands in the log
+			// alone. Catch the shapes people actually type, here, where they typed them. The
+			// server's gate still decides — this one only decides *when* they find out.
+			const bad = forcedFieldEnabled(envIsolated) ? firstInadmissibleForcedLine(envForced) : null;
+			if (bad) {
+				setValidationError(inadmissibleForcedMessage(bad));
+				return;
+			}
 			// One name, written to both places it is read from: `config.environment.name`
 			// is what the container and the partitioner use, `name` is the component name
 			// every generic listing shows. Letting them drift would put two different
@@ -399,7 +422,11 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 				name: envName || undefined,
 				config: {
 					...node.data.config,
-					environment: { name: envName, isolated: envIsolated },
+					environment: buildEnvironmentWriteBack(node.data.config?.environment as IEnvironment | undefined, {
+						name: envName,
+						isolated: envIsolated,
+						forced: envForced,
+					}),
 				},
 			});
 		} else {
@@ -407,10 +434,11 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 				name: name || undefined,
 			});
 		}
+		setValidationError(null);
 		setIsDirty(false);
 		onContentUpdated();
 		onClose();
-	}, [node.id, node.data.config, name, isAnnotation, isVirtualEnv, envName, envIsolated, annotationContent, bgColor, fgColor, updateNode, onContentUpdated, onClose]);
+	}, [node.id, node.data.config, name, isAnnotation, isVirtualEnv, envName, envIsolated, envForced, annotationContent, bgColor, fgColor, updateNode, onContentUpdated, onClose]);
 
 	// --- Save: full form with server validation ----------------------------
 	const onSubmit = useCallback(
@@ -588,6 +616,28 @@ export default function NodeConfigPanel({ node, onClose }: INodeConfigPanelProps
 								/>
 								Isolated dependencies
 							</label>
+						</div>
+						<div style={styles.field}>
+							<label style={styles.fieldLabel} htmlFor="rr-env-forced">
+								Forced Python requirements <span style={{ opacity: 0.6 }}>(advanced)</span>
+							</label>
+							<textarea
+								id="rr-env-forced"
+								style={{ ...styles.forcedTextarea, opacity: forcedFieldEnabled(envIsolated) ? 1 : 0.5 }}
+								value={envForced}
+								disabled={!forcedFieldEnabled(envIsolated)}
+								rows={4}
+								placeholder={'tabulate==0.9.0\nnumpy'}
+								onChange={(e) => {
+									setEnvForced(e.target.value);
+									setIsDirty(true);
+								}}
+							/>
+							<div style={styles.fieldHint}>
+								{forcedFieldEnabled(envIsolated)
+									? 'One requirement per line. Takes priority over whatever this environment resolves, package by package — it selects versions of packages already installed here and never adds one.'
+									: FORCED_DISABLED_REASON}
+							</div>
 						</div>
 					</>
 				)}

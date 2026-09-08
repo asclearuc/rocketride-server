@@ -939,3 +939,288 @@ def test_collect_stale_refuses_a_non_finite_threshold_up_front(tmp_path, bad):
     with pytest.raises((ValueError, OverflowError)):
         V.collect_stale(str(tmp_path), bad)
     assert os.path.isdir(paths.env_dir), 'a refused threshold must not have collected anything'
+
+
+# --- forced requirements: the key, the walked set, the merge (§4.7.1) -------
+
+
+def _overrides(tmp_path, name, body):
+    path = tmp_path / name
+    path.write_text(body, encoding='utf-8')
+    return str(path)
+
+
+def test_forced_digest_enters_the_key_and_an_edit_rebuilds(tmp_path):
+    """The whole point of answer 5: without a contribution, editing the field changes nothing.
+
+    The symptom that failure produces is the one worth naming -- a user moves a version, watches
+    the old one install, and has no way to tell the field was read at all.
+    """
+    exe = str(tmp_path)
+    req = _req(tmp_path, 'r.txt', 'tabulate==0.8.10\n')
+
+    plan = V.plan_install(exe, 'p', 'main', [req], forced_sha='sha-one')
+    V.mark_installed(plan)
+    open(plan.paths.constraints, 'w').close()
+
+    assert V.plan_install(exe, 'p', 'main', [req], forced_sha='sha-one').needs_rebuild is False
+    assert V.plan_install(exe, 'p', 'main', [req], forced_sha='sha-two').needs_rebuild is True
+
+
+def test_empty_forced_digest_leaves_the_key_byte_identical(tmp_path):
+    """Day one, when no document carries forced text: nothing may rebuild for this.
+
+    ``combine_hash`` leaving an empty digest alone is what buys that, and it is the half that
+    would be silently lost by folding the digest in unconditionally.
+    """
+    exe = str(tmp_path)
+    req = _req(tmp_path, 'r.txt', 'tabulate==0.8.10\n')
+    assert (
+        V.plan_install(exe, 'p', 'main', [req], forced_sha='').current_hash
+        == V.plan_install(exe, 'p', 'main', [req]).current_hash
+    )
+
+
+def test_clearing_forced_stops_applying_and_returns_to_the_bare_key(tmp_path):
+    # Clearing the box is an empty digest, which names no file -- the mirror of the defect
+    # answer 5 exists to prevent, where a stale file would keep being passed as --override.
+    exe = str(tmp_path)
+    req = _req(tmp_path, 'r.txt', 'tabulate==0.8.10\n')
+
+    plan = V.plan_install(exe, 'p', 'main', [req], forced_sha='sha-one')
+    V.mark_installed(plan)
+    open(plan.paths.constraints, 'w').close()
+
+    cleared = V.plan_install(exe, 'p', 'main', [req], forced_sha='')
+    assert cleared.needs_rebuild is True
+    assert cleared.current_hash == V.plan_install(exe, 'p', 'main', [req]).current_hash
+
+
+def test_editing_a_tree_override_file_invalidates_a_scoped_overlay(tmp_path):
+    """The shipped defect this increment repairs, and it fails on the pre-change code.
+
+    ``ensure_constraints`` had always hashed ``req_files + override_files`` for base while
+    ``plan_install`` hashed requirements alone, so editing ``ai/**/overrides.txt`` rebuilt base
+    and left every overlay stale. Forced makes that observable: one merged input cannot have two
+    invalidation rules.
+    """
+    exe = str(tmp_path)
+    req = _req(tmp_path, 'r.txt', 'tabulate==0.8.10\n')
+    ov = _overrides(tmp_path, 'overrides.txt', 'tabulate==0.9.0\n')
+
+    plan = V.plan_install(exe, 'p', 'main', [req], override_files=[ov])
+    V.mark_installed(plan)
+    open(plan.paths.constraints, 'w').close()
+    assert V.plan_install(exe, 'p', 'main', [req], override_files=[ov]).needs_rebuild is False
+
+    (tmp_path / 'overrides.txt').write_text('tabulate==0.10.0\n', encoding='utf-8')
+    assert V.plan_install(exe, 'p', 'main', [req], override_files=[ov]).needs_rebuild is True
+
+
+def test_override_files_are_hashed_but_never_written_into_combined(tmp_path):
+    # They are overrides, not requirements. Emitting one as a requirement is the two-line
+    # mistake that would let an override install something nothing asked for.
+    exe = str(tmp_path)
+    req = _req(tmp_path, 'r.txt', 'tabulate==0.8.10\n')
+    ov = _overrides(tmp_path, 'overrides.txt', 'six==1.16.0\n')
+
+    plan = V.plan_install(exe, 'p', 'main', [req], override_files=[ov])
+    combined = open(plan.paths.combined, encoding='utf-8').read()
+    assert 'tabulate==0.8.10' in combined
+    assert 'six' not in combined
+
+
+def test_forced_sha_is_consumed_once_and_frozen(monkeypatch):
+    # Same protection the env id has: node code must not be able to observe or rewrite which
+    # overrides this process was launched with.
+    V._reset_venv_env_cache()
+    monkeypatch.setenv(V.VENV_FORCED_SHA_ENV, 'abc123')
+    assert V.forced_sha_from_env() == 'abc123'
+    assert os.environ.get(V.VENV_FORCED_SHA_ENV) is None
+    monkeypatch.setenv(V.VENV_FORCED_SHA_ENV, 'rewritten')
+    assert V.forced_sha_from_env() == 'abc123'
+    V._reset_venv_env_cache()
+
+
+def test_forced_sha_absent_is_empty(monkeypatch):
+    V._reset_venv_env_cache()
+    monkeypatch.delenv(V.VENV_FORCED_SHA_ENV, raising=False)
+    assert V.forced_sha_from_env() == ''
+    V._reset_venv_env_cache()
+
+
+# --- the name-level merge ---------------------------------------------------
+
+
+def test_requirement_name_reads_the_shapes_that_occur_and_declines_the_rest():
+    assert V.requirement_name('tabulate==0.9.0\n') == 'tabulate'
+    assert V.requirement_name('torch[cuda]>=2.1,<3.0\n') == 'torch'
+    assert V.requirement_name('opencv_contrib_python ~= 4.10\n') == 'opencv-contrib-python'
+    assert V.requirement_name('torch==2.10.0+cu128 ; sys_platform != "darwin"\n') == 'torch'
+    assert V.requirement_name('numpy\n') == 'numpy'
+    # None means "not a line about a package" -- blank, comment, or a flag. The merge treats
+    # all three the same: never matched, never dropped.
+    assert V.requirement_name('\n') is None
+    assert V.requirement_name('# a comment\n') is None
+    assert V.requirement_name('-r other.txt\n') is None
+    assert V.requirement_name('--index-url https://example/simple\n') is None
+    assert V.requirement_name('./local/pkg.whl\n') is None
+
+
+def test_merge_replaces_every_tree_line_for_a_forced_name():
+    """One unmarked forced line displaces *both* marker-scoped tree lines (row 4).
+
+    Joining them instead is the failure that matters: two --override entries for one package are
+    conjunctive, so the user who typed one version would read an error naming two.
+    """
+    tree = [
+        'torch==2.10.0 ; sys_platform == "darwin"\n',
+        'torch==2.10.0+cu128 ; sys_platform != "darwin"\n',
+        'tabulate==0.8.10\n',
+    ]
+    merged = V.merge_override_lines(tree, ['torch\n'])
+    assert merged == ['tabulate==0.8.10\n', 'torch\n']
+
+
+def test_merge_keeps_names_forced_does_not_mention():
+    tree = ['tabulate==0.8.10\n', 'six==1.16.0\n']
+    merged = V.merge_override_lines(tree, ['tabulate==0.9.0\n'])
+    assert merged == ['six==1.16.0\n', 'tabulate==0.9.0\n']
+
+
+def test_merge_lets_a_forced_pair_displace_a_computed_pair():
+    # Row 5 of the requester's table: forced may legitimately supply two marker-scoped lines
+    # for one package, so the plural has to hold on the forced side too.
+    tree = [
+        'torch==2.10.0 ; sys_platform == "darwin"\n',
+        'torch==2.10.0+cu128 ; sys_platform != "darwin"\n',
+    ]
+    forced = [
+        'torch==2.12.0 ; sys_platform == "darwin"\n',
+        'torch==2.12.0+cu128 ; sys_platform != "darwin"\n',
+    ]
+    assert V.merge_override_lines(tree, forced) == forced
+
+
+def test_merge_matches_under_pep503_normalisation():
+    tree = ['opencv_contrib_python ~= 4.10\n']
+    merged = V.merge_override_lines(tree, ['opencv-contrib-python==4.11.0.86\n'])
+    assert merged == ['opencv-contrib-python==4.11.0.86\n']
+
+
+def test_merge_keeps_comments_and_flag_lines_from_the_tree():
+    tree = ['# Source: /x/overrides.txt\n', '-r /x/more.txt\n', 'tabulate==0.8.10\n']
+    merged = V.merge_override_lines(tree, ['tabulate==0.9.0\n'])
+    assert merged == ['# Source: /x/overrides.txt\n', '-r /x/more.txt\n', 'tabulate==0.9.0\n']
+
+
+def test_absolutise_include_rewrites_relative_and_forward_slashes(tmp_path):
+    # Two silent traps in one line: uv resolves an include relative to the file holding it, and
+    # a requirement file treats a backslash as an escape.
+    out = V.absolutise_include('-r inner.txt\n', str(tmp_path))
+    assert out.startswith('-r ') and out.endswith('/inner.txt\n')
+    assert '\\' not in out
+    assert V.absolutise_include('tabulate==0.9.0\n', str(tmp_path)) == 'tabulate==0.9.0\n'
+
+
+# --- forced requirements: the three warnings (2C-FR step 4) -----------------
+
+
+def test_an_inert_forced_line_warns(tmp_path):
+    """Override-only is the security boundary, and this is what it costs.
+
+    A forced line for a package nothing requires installs nothing, so a typo'd name would
+    otherwise be swallowed whole -- the user fills a field in and nothing at all happens.
+    """
+    req = _req(tmp_path, 'r.txt', 'tabulate==0.8.10\n')
+    warnings = V.forced_warnings(['tabulaet==0.9.0\n'], {'tabulate': '0.8.10'}, [req])
+    assert len(warnings) == 1
+    assert 'tabulaet' in warnings[0] and 'no effect' in warnings[0]
+
+
+def test_a_forced_line_that_matches_is_silent(tmp_path):
+    req = _req(tmp_path, 'r.txt', 'tabulate==0.8.10\n')
+    assert V.forced_warnings(['tabulate==0.9.0\n'], {'tabulate': '0.9.0'}, [req]) == []
+
+
+def test_inertness_is_judged_against_the_resolution_not_the_direct_requirements(tmp_path):
+    """A purely transitive package is overridden successfully -- measured, in §4.7.1.
+
+    `requests==2.32.3` alone resolves `idna`; an override of `idna==3.6` moves it. Checking the
+    shallower set would call that success "inert" and warn about the one case that worked.
+    """
+    req = _req(tmp_path, 'r.txt', 'requests==2.32.3\n')
+    resolved = {'requests': '2.32.3', 'idna': '3.6'}
+    assert V.forced_warnings(['idna==3.6\n'], resolved, [req]) == []
+
+
+def test_lost_extras_warn_and_the_message_says_how_to_keep_them(tmp_path):
+    # Measured in §4.7.1: `requests[socks]` resolves PySocks, and the same requirement under a
+    # bare forced `requests` does not. The user moves a version and loses a dependency they
+    # never mentioned.
+    req = _req(tmp_path, 'r.txt', 'requests[socks]==2.32.3\n')
+    warnings = V.forced_warnings(['requests==2.32.4\n'], {'requests': '2.32.4'}, [req])
+    assert len(warnings) == 1
+    assert 'socks' in warnings[0]
+    assert 'requests[socks]' in warnings[0], 'say what to type, not just what broke'
+
+
+def test_keeping_the_extras_in_the_forced_line_is_silent(tmp_path):
+    req = _req(tmp_path, 'r.txt', 'requests[socks]==2.32.3\n')
+    assert V.forced_warnings(['requests[socks]==2.32.4\n'], {'requests': '2.32.4'}, [req]) == []
+
+
+def test_extras_are_read_through_an_include(tmp_path):
+    # An extras declaration one `-r` away is as real as one written inline, and the compiled
+    # constraints file has flattened both away by the time it is written.
+    _req(tmp_path, 'inner.txt', 'requests[socks]==2.32.3\n')
+    outer = _req(tmp_path, 'r.txt', '-r inner.txt\n')
+    warnings = V.forced_warnings(['requests==2.32.4\n'], {'requests': '2.32.4'}, [outer])
+    assert len(warnings) == 1 and 'socks' in warnings[0]
+
+
+def test_a_forced_version_contradicting_a_declared_family_warns(tmp_path):
+    """Forced outranks the family machinery, and silently winning is the wrong kind of quiet.
+
+    A declared ``namespace_version`` is a value somebody wrote down on purpose, and every package
+    sharing that import namespace moves with it.
+    """
+    family = next((f for f in V.pkg_families.families() if f.namespace_version), None)
+    assert family is not None, 'this test needs a family that declares its namespace version'
+    member = V.pkg_families.normalize(family.members[0].dist)
+    other = '0.0.0-not-the-declared-one'
+
+    req = _req(tmp_path, 'r.txt', f'{member}=={family.namespace_version}\n')
+    warnings = V.forced_warnings([f'{member}=={other}\n'], {member: other}, [req])
+    assert any(family.namespace_version in w and 'contradicts' in w for w in warnings)
+
+
+def test_forcing_a_family_member_at_the_declared_version_is_silent(tmp_path):
+    family = next((f for f in V.pkg_families.families() if f.namespace_version), None)
+    assert family is not None
+    member = V.pkg_families.normalize(family.members[0].dist)
+    req = _req(tmp_path, 'r.txt', f'{member}=={family.namespace_version}\n')
+    warnings = V.forced_warnings([f'{member}=={family.namespace_version}\n'], {member: family.namespace_version}, [req])
+    assert warnings == []
+
+
+def test_an_unpinned_forced_line_does_not_claim_to_contradict_anything(tmp_path):
+    # `tabulate` with no `==` asks uv to resolve it; there is no version to disagree with.
+    family = next((f for f in V.pkg_families.families() if f.namespace_version), None)
+    member = V.pkg_families.normalize(family.members[0].dist)
+    req = _req(tmp_path, 'r.txt', f'{member}=={family.namespace_version}\n')
+    warnings = V.forced_warnings([f'{member}\n'], {member: family.namespace_version}, [req])
+    assert not any('contradicts' in w for w in warnings)
+
+
+def test_comments_and_blank_lines_produce_no_warnings(tmp_path):
+    req = _req(tmp_path, 'r.txt', 'tabulate==0.8.10\n')
+    assert V.forced_warnings(['# a note\n', '\n', '   \n'], {'tabulate': '0.8.10'}, [req]) == []
+
+
+def test_plan_install_carries_the_requirement_files_the_warnings_need(tmp_path):
+    # Carried on the plan rather than re-walked: the AST discovery is the expensive half, and a
+    # second walk to answer "what did this resolution come from" would be pure waste.
+    req = _req(tmp_path, 'r.txt', 'tabulate==0.8.10\n')
+    plan = V.plan_install(str(tmp_path), 'p', 'main', [req])
+    assert plan.req_files == (req,)

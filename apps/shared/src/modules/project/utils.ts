@@ -137,3 +137,70 @@ export function isTeamLiveEvent(event: unknown, projectId: string, teamId: strin
 	if (!Number.isFinite(body.eventTime) || !Number.isFinite(body.logSeq)) return false;
 	return body.project_id === projectId;
 }
+
+
+// =============================================================================
+// RUN REQUESTS THAT FAIL BEFORE A TASK EXISTS
+// =============================================================================
+
+/**
+ * A synthetic "failed to start" status for a run the server refused outright.
+ *
+ * **Why this is needed at all.** The canvas renders a startup failure out of the host's
+ * `statusMap`: `NodeStatus` shows "✕ Failed to start" with the message when a status is
+ * completed, has zero completions and carries an error. Every failure *inside* a run produces
+ * such a status naturally, because a task exists to record it. A run the server refuses at
+ * creation produces none — the server logs "Task creation failed, cleaned up" and the client's
+ * `use()` call rejects — so the node kept showing its previous idle line and the only trace was
+ * in the log. Measured on a virtual-environment container with a mistyped requirement: the
+ * *later* install failure of the same feature rendered on the node correctly, while the earlier
+ * refusal rendered nowhere. That asymmetry is the bug; the twelve partitioner refusals all have
+ * it, not only that one (`OQ-11` in the venv design notes).
+ *
+ * **Synthetic, and deliberately shaped to be overwritten.** No task ever existed, so nothing
+ * upstream will ever update or clear this entry. Hosts must drop it when the next run for that
+ * source is armed, or a stale refusal outlives the mistake it describes. It carries
+ * `state: COMPLETED` and `completed: true` because that is what the renderer reads, and it fills
+ * only the fields the renderer touches — inventing plausible metrics would put numbers on screen
+ * that never came from a run.
+ *
+ * @param source - The source component id the run was armed on; the `statusMap` key.
+ * @param message - The server's own refusal, verbatim. It already names the cause.
+ * @param now - Injectable clock, so the elapsed line is testable.
+ */
+export function startupFailureStatus(source: string, message: string, now: number = Date.now() / 1000): ITaskStatus {
+	return {
+		name: source,
+		project_id: '',
+		source,
+		completed: true,
+		// 5 = TASK_STATE.COMPLETED. Spelled as a literal rather than imported because this
+		// module is the parsing seam between hosts and deliberately depends on no enum.
+		state: 5,
+		startTime: now,
+		endTime: now,
+		debuggerAttached: false,
+		status: message,
+		warnings: [],
+		errors: [message],
+		currentObject: '',
+		currentSize: 0,
+		notes: [],
+		totalSize: 0,
+		totalCount: 0,
+		completedSize: 0,
+		completedCount: 0,
+		failedSize: 0,
+		failedCount: 0,
+		wordsSize: 0,
+		wordsCount: 0,
+		rateSize: 0,
+		rateCount: 0,
+		serviceUp: false,
+		exitCode: 1,
+		exitMessage: message,
+		pipeflow: { total: 0, active: 0, completed: 0, failed: 0 } as unknown as ITaskStatus['pipeflow'],
+		metrics: {} as unknown as ITaskStatus['metrics'],
+		tokens: {} as unknown as ITaskStatus['tokens'],
+	};
+}

@@ -483,19 +483,157 @@ def _constraints_args(constraints_path: str, exe_dir: str) -> list[str]:
 
 
 def _get_overrides_path() -> str:
-    """Path of the combined overrides file in the engine cache."""
+    """Path of the combined overrides file in the engine cache (the **base** path's)."""
     return os.path.join(engine_cache_dir(), 'overrides-combined.txt')
 
 
-def _override_args(exe_dir: str) -> list[str]:
-    """Return uv ``--override`` args if the combined overrides file is non-empty, else ``[]``.
+def _override_args(exe_dir: str, overrides_path: Optional[str] = None) -> list[str]:
+    """Return uv ``--override`` args if the overrides file is non-empty, else ``[]``.
 
     Relative to exe_dir (the subprocess cwd) — uv splits the value on whitespace.
+
+    ``overrides_path`` is **which environment is being served**, and every caller has to
+    answer it because none of them belongs to one path alone: ``_compile_constraints_at``
+    is reached both from ``ensure_constraints`` (base) and from ``ensure_env_scoped``
+    (an overlay), and the install helpers serve the runtime ``depends()`` call into base as
+    well as the overlay. Defaulting to the shared cache file is therefore the *base*
+    answer, not a fallback -- handing base an environment's file would drop the tree's own
+    ``ai/**/overrides.txt`` out of the compile that governs the engine runtime, and nothing
+    would fail (§4.7.1).
     """
-    overrides_path = _get_overrides_path()
+    if overrides_path is None:
+        overrides_path = _get_overrides_path()
     if os.path.exists(overrides_path) and os.path.getsize(overrides_path) > 0:
         return ['--override', os.path.relpath(overrides_path, exe_dir)]
     return []
+
+
+def _active_overrides_path() -> str:
+    """The override file the **currently active** environment should be compiled against.
+
+    The install path needs this rather than a parameter: ``depends()`` is called by node
+    code at runtime, which has no environment to pass and no way to learn one. The active
+    context does know -- an overlay uses its own merged file, base keeps the shared cache
+    one, and there is no third case.
+    """
+    ctx = active_env()
+    if ctx.is_overlay:
+        return os.path.join(ctx.paths.env_dir, 'overrides-combined.txt')
+    return _get_overrides_path()
+
+
+# ---------------------------------------------------------------------------
+# forced requirements (§4.7.1): the parent's file, and the per-environment merge
+# ---------------------------------------------------------------------------
+
+# Where the parent writes one document's forced text, named by the digest of that text.
+# The engine cache rather than the overlay, for three reasons that are not cosmetic: the
+# parent cannot resolve env_dir at all (venv_env is importable only with rocketlib on
+# sys.path, which is the engine's arrangement and not ai:test's), the venv GC treats every
+# directory under venvs/ as a project, and purge empties env_dir. Mirrored as the literal
+# 'cache/forced' in ai/modules/task/venv_spawn.py -- keep in sync with engine_cache_dir().
+_FORCED_SUBDIR = 'forced'
+
+
+class ForcedRequirementsMissing(RuntimeError):
+    """The run announced a forced-requirements digest and the file it names is not there.
+
+    Refusing rather than compiling without the overrides: the versions installed would be
+    the ones the document did *not* ask for, silently, and this process cannot re-create a
+    text it never received -- only the digest crosses. With the file in the engine cache no
+    routine operation produces this; an operator clearing the cache between the parent's
+    write and this read does.
+    """
+
+
+def _forced_path(digest: str) -> str:
+    """Path of one document's forced-requirements file, derived from its digest alone."""
+    return os.path.join(engine_cache_dir(), _FORCED_SUBDIR, f'{digest}.txt')
+
+
+def _read_forced_lines(forced_sha: str) -> list[str]:
+    """The forced lines this run announced, or ``[]`` when it announced none.
+
+    Raises:
+        ForcedRequirementsMissing: A non-empty digest whose file is absent.
+    """
+    if not forced_sha:
+        # Any other document's file in that directory is not this run's business: it is
+        # neither read nor removed. Sweeping is how one deployed version would delete
+        # another's, and the digest naming is what makes this a non-case rather than a rule.
+        return []
+    path = _forced_path(forced_sha)
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            return fh.read().splitlines(keepends=True)
+    except OSError as exc:
+        raise ForcedRequirementsMissing(
+            f'forced requirements file is missing: {path} — the run is repeatable, launch the pipeline again'
+        ) from exc
+
+
+def _report_forced_warnings(plan, forced_sha: str) -> None:
+    """Emit what the forced requirements did that the author probably did not intend.
+
+    **After the compile, and only when one happened**, which is complete rather than a
+    compromise: every input the three warnings read is in the environment key. The forced text
+    enters by digest and the requirement files by the walk, so any edit that could change a
+    warning also rebuilds -- an overlay whose hash matched is one whose warnings were emitted on
+    the run that built it. That reasoning does *not* transfer to `_shadowing_check`, which is
+    deliberately outside every gate because it depends on this process's imports rather than on
+    the key.
+
+    Warnings, never failures: an inert line is inert because override-only is the security
+    boundary, and refusing there would make a typo fatal.
+
+    The channel is ``updateProgress`` -> ``monitorStatus``, the same path that already reports
+    ``Downloading torch (2.7GiB)``. It is a *progress* channel, so these scroll past; no durable
+    per-container diagnostic surface exists yet and building one is out of scope here. That is
+    the accepted weakness of leaning on a warning at all (§4.7.1).
+    """
+    if not forced_sha:
+        return
+    try:
+        forced_lines = _read_forced_lines(forced_sha)
+    except ForcedRequirementsMissing:
+        # The install path raises this for real; re-raising from the reporting helper would
+        # turn one cause into two call sites for the same message.
+        return
+    warnings = venv_env.forced_warnings(forced_lines, _read_resolution(plan.paths.constraints), list(plan.req_files))
+    for warning in warnings:
+        error(f'Forced requirements: {warning}')
+        updateProgress(f'Warning: {warning}')
+
+
+def _write_env_overrides(env_dir: str, override_files: list[str], forced_sha: str) -> str:
+    """Write one environment's merged override file and return its path.
+
+    Regenerated unconditionally and overwritten freely -- no digest in the name, no
+    write-if-absent. It is derived, it is small, and unlike the forced file it never crosses
+    a process boundary: ``_compile_and_install`` holds ``FileLock(plan.paths.lock_file)``
+    across the compile and both installs, so every ``_override_args()`` reader sees a file
+    regenerated a few lines earlier by the only writer that can be running. Caching it would
+    go stale across an engine upgrade, where the tree's override files move and the forced
+    text does not.
+    """
+    tree_lines: list[str] = []
+    for path in override_files:
+        source_dir = os.path.dirname(os.path.abspath(path))
+        tree_lines.append(f'# Source: {path}\n')
+        with open(path, 'r', encoding='utf-8') as fh:
+            # Same include rewriting write_combined does, and for the same two reasons: this
+            # file lives in a different directory than its sources, and a backslash is an
+            # escape in a requirement file. No override file carries a flag line today, which
+            # is exactly what would make dropping this silent.
+            tree_lines.extend(venv_env.absolutise_include(line, source_dir) for line in fh)
+    forced_lines = _read_forced_lines(forced_sha)
+    if forced_lines:
+        forced_lines = ['\n# Forced requirements (config.environment.forced)\n'] + forced_lines
+    merged = venv_env.merge_override_lines(tree_lines, forced_lines)
+    out_path = os.path.join(env_dir, 'overrides-combined.txt')
+    with open(out_path, 'w', encoding='utf-8') as out:
+        out.writelines(merged)
+    return out_path
 
 
 def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -889,8 +1027,12 @@ class CompileFailed(RuntimeError):
         self.detail = detail
 
 
-def _run_uv_compile(combined_path: str, constraints_path: str) -> None:
-    """One ``uv pip compile`` pass, ``combined_path`` -> ``constraints_path``."""
+def _run_uv_compile(combined_path: str, constraints_path: str, overrides_path: Optional[str] = None) -> None:
+    """One ``uv pip compile`` pass, ``combined_path`` -> ``constraints_path``.
+
+    ``overrides_path`` names which environment's overrides apply; ``None`` is the base
+    path's shared cache file (see :func:`_override_args`).
+    """
     if not _uv_available():
         raise RuntimeError('uv executable not found')
 
@@ -911,7 +1053,7 @@ def _run_uv_compile(combined_path: str, constraints_path: str) -> None:
         '--no-build-isolation',  # Don't create temp venvs (engine.exe can't create venvs)
         '--emit-index-url',  # Preserve --extra-index-url etc. so install/dry-run can find packages (e.g. torch+cu128)
     ]
-    args.extend(_override_args(exe_dir))
+    args.extend(_override_args(exe_dir, overrides_path))
     debug(f'Compile: {args}')
     result = subprocess.run(
         args,
@@ -1776,7 +1918,7 @@ def _install_dry_run(requirements_path: str, constraints_path: str, excludes_pat
     args.extend(['--excludes', os.path.relpath(excludes_path, exe_dir)])
 
     args.extend(_constraints_args(constraints_path, exe_dir))
-    args.extend(_override_args(exe_dir))
+    args.extend(_override_args(exe_dir, _active_overrides_path()))
     args.extend(_target_args())
 
     debug(f'Dry-run: {args}')
@@ -1903,7 +2045,7 @@ def _install_requirements_inner(requirements_path: str, constraints_path: str):
             excludes_path=os.path.relpath(_write_excludes_file(_family_exclusions(family_work)), exe_dir),
         )
         uv_args.extend(_constraints_args(constraints_path, exe_dir))
-        uv_args.extend(_override_args(exe_dir))
+        uv_args.extend(_override_args(exe_dir, _active_overrides_path()))
 
         # Run uv and stream output (heartbeat is already running from the caller)
         debug(f'Install: {uv_args}')
@@ -2083,19 +2225,22 @@ def _apply_overlay_path(site: str) -> None:
     importlib.invalidate_caches()
 
 
-def _compile_constraints_at(combined_path: str, constraints_path: str) -> None:
+def _compile_constraints_at(combined_path: str, constraints_path: str, overrides_path: Optional[str] = None) -> None:
     """Compile ``combined_path`` -> ``constraints_path``, then align any family present.
 
-    The single compile path for both the global union and one environment's scoped set.
+    The single compile path for both the global union and one environment's scoped set --
+    which is why ``overrides_path`` has to be answered here rather than defaulted deeper:
+    ``ensure_constraints`` reaches this for base and ``ensure_env_scoped`` for an overlay,
+    and the two need different override files.
     Compile-then-align rather than a single pass: which families the environment contains is
     only knowable *from* a resolution, so detection reads the compile output and the
     alignment goes back in as requirements for a second pass.
     """
-    _run_uv_compile(combined_path, constraints_path)
-    _align_families(combined_path, constraints_path)
+    _run_uv_compile(combined_path, constraints_path, overrides_path)
+    _align_families(combined_path, constraints_path, overrides_path)
 
 
-def _align_families(combined_path: str, constraints_path: str) -> None:
+def _align_families(combined_path: str, constraints_path: str, overrides_path: Optional[str] = None) -> None:
     """Hold every derived family's namespace at one version, and prove it still resolves.
 
     Appends ``<member>==V`` for the members the environment will hold, under a marked block
@@ -2144,7 +2289,7 @@ def _align_families(combined_path: str, constraints_path: str) -> None:
             fh.write(block)
 
     try:
-        _run_uv_compile(combined_path, constraints_path)
+        _run_uv_compile(combined_path, constraints_path, overrides_path)
     except CompileFailed as failure:
         raise _alignment_failure(aligned, resolved, annotations, failure) from None
 
@@ -2209,11 +2354,55 @@ def _log_alignment_moves(aligned, resolved, annotations) -> None:
                 )
 
 
-def _install_target(requirements_path: str, constraints_path: str, target_site: str) -> Optional[RestartRequired]:
+def _scoped_compile_and_install(plan, override_files: list[str], forced_sha: str) -> Optional[RestartRequired]:
+    """One environment's compile and install, under one lock hold.
+
+    Returns the restart-required condition instead of raising it: ``mark_installed`` lives on
+    ``run_scoped_install``'s side, and recording has to happen before the refusal or the restart
+    the message asks for repeats the whole build.
+
+    **Module-level rather than a closure inside** :func:`ensure_env_scoped`, and that is a
+    testing decision with a scar behind it. The merged override file has to reach *both* the
+    compile and the install, and a version that reached only one of them shipped: the compile
+    honoured the override, the install re-resolved without it, and uv refused the run with
+    *"your requirements are unsatisfiable"*. Nothing in the suite noticed, because every test
+    called the two functions directly with a path of its own — the wiring between them was the
+    one thing no test could reach. As a closure it still would not be.
+
+    Returns:
+        A :class:`RestartRequired` when the environment is correct but this process cannot use
+        it, else ``None``.
+    """
+    with FileLock(plan.paths.lock_file):  # one lock per overlay, not the global one
+        bootstrap()
+        # Under the lock, and regenerated every time: the merge is derived, and every
+        # _override_args() reader below is inside this same hold. The refusal for a missing
+        # forced file also belongs here rather than in the drift check -- the check must stay a
+        # pure function of the environment variable, since it is what decides whether this lock
+        # is taken at all.
+        overrides_path = _write_env_overrides(plan.paths.env_dir, override_files, forced_sha)
+        _compile_constraints_at(plan.paths.combined, plan.paths.constraints, overrides_path)
+        _report_forced_warnings(plan, forced_sha)
+        return _install_target(plan.paths.combined, plan.paths.constraints, plan.paths.site_packages, overrides_path)
+
+
+def _install_target(
+    requirements_path: str, constraints_path: str, target_site: str, overrides_path: Optional[str] = None
+) -> Optional[RestartRequired]:
     """Install ``requirements_path`` into the overlay ``target_site`` (uv ``--target``).
 
     Returns a :class:`RestartRequired` rather than raising it, so the caller can record the
     environment before refusing the run.
+
+    **``overrides_path`` is not optional in practice, and leaving it off is not a missing flag
+    but a contradiction.** This install is handed the environment's requirement file with ``-r``
+    and its compiled resolution with ``-c``, and an override exists precisely to make those two
+    disagree: the requirements say what a node declared, the constraints say what the override
+    turned it into. Without the same ``--override`` the compile ran with, uv re-resolves the
+    requirements against the constraints, sees ``tabulate==0.10.0`` required and ``==0.9.0``
+    constrained, and reports *"your requirements are unsatisfiable"* — a run that fails outright
+    rather than installing the wrong thing. Nothing revealed this before forced existed, because
+    without it the requirement file and its own resolution never disagreed.
     """
     with open(requirements_path, 'r', encoding='utf-8') as f:
         has_deps = any(line.strip() and not line.strip().startswith('#') for line in f)
@@ -2235,6 +2424,7 @@ def _install_target(requirements_path: str, constraints_path: str, target_site: 
         excludes_path=excludes_rel,
     )
     argv.extend(_constraints_args(constraints_path, exe_dir))
+    argv.extend(_override_args(exe_dir, overrides_path))
 
     _start_heartbeat()
     try:
@@ -2308,13 +2498,7 @@ def ensure_env_scoped(
         return ast_deps.discover_for_providers(provs, exe_dir, exe_dir, local_root).requirement_files
 
     def _compile_and_install(plan):
-        # Returns the restart-required condition instead of raising it: mark_installed lives
-        # on run_scoped_install's side, and recording has to happen before the refusal or the
-        # restart repeats the whole build.
-        with FileLock(plan.paths.lock_file):  # one lock per overlay, not the global one
-            bootstrap()
-            _compile_constraints_at(plan.paths.combined, plan.paths.constraints)
-            return _install_target(plan.paths.combined, plan.paths.constraints, plan.paths.site_packages)
+        return _scoped_compile_and_install(plan, override_files, forced_sha)
 
     def _overlay(paths):
         # The one door that does both halves of a switch: where installs go, and where
@@ -2330,6 +2514,14 @@ def ensure_env_scoped(
     # os.environ, and that side effect must not hide in a planning function. Unconditional --
     # run_scoped_install early-returns under =0, but the consume must still happen.
     env_id = venv_env.resolve_env_id(env_id)
+    # Same door, same reason: the resolver pops os.environ, so it runs here rather than
+    # inside plan_install. The digest is all that crosses -- both sides derive the file name
+    # from it, so nothing is ever told a path.
+    forced_sha = venv_env.forced_sha_from_env()
+    # Discovered here because the globs live in this module; venv_env cannot reach them
+    # without importing depends, which would pull engLib into a stdlib-only module. They
+    # join the per-env hash (the shipped defect §4.7.1 records) and the merge below.
+    override_files = _find_override_files()
     # OR, not replace: the parameter side is always False today (the sole caller is C++ passing
     # three positional arguments), so the variable is in practice the only live input. The OR keeps
     # the signature honest for a future non-C++ caller rather than guarding a real second source.
@@ -2344,6 +2536,8 @@ def ensure_env_scoped(
         compile_and_install=_compile_and_install,
         has_isolated_group=has_isolated_group,
         on_overlay=_overlay,
+        override_files=override_files,
+        forced_sha=forced_sha,
     )
 
     # Outside the drift gate, which is the point: an overlay whose hash matched was never

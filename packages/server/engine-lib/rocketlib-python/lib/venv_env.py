@@ -190,15 +190,41 @@ def isolated_from_env(env: Optional[dict] = None) -> bool:
     return _ISOLATED_CACHE
 
 
+# Mirrored in ai/modules/task/venv_spawn.py -- keep in sync.
+VENV_FORCED_SHA_ENV = 'ROCKETRIDE_VENV_FORCED_SHA'
+
+_FORCED_SHA_CACHE = _UNREAD
+
+
+def forced_sha_from_env(env: Optional[dict] = None) -> str:
+    """Digest of this environment's forced-requirements text, or ``''`` when it has none.
+
+    The **digest** crosses the process boundary, never the text: the text is unbounded
+    multi-line input and the Windows environment block is not. Both sides derive the file
+    name from this value, so nothing has to be told a path -- the same arrangement the
+    environment id already has (§4.7.1).
+
+    Consumed on first read -- frozen, then popped -- like the environment id, so node code
+    cannot observe or rewrite which overrides this process was launched with.
+    """
+    global _FORCED_SHA_CACHE
+    if env is not None:
+        return (env.get(VENV_FORCED_SHA_ENV) or '').strip()
+    if _FORCED_SHA_CACHE is _UNREAD:
+        _FORCED_SHA_CACHE = (os.environ.pop(VENV_FORCED_SHA_ENV, '') or '').strip()
+    return _FORCED_SHA_CACHE
+
+
 def _reset_venv_env_cache() -> None:
     """Drop the process-init caches so the next call reads the environment again.
 
     Tests only -- production resolves once by design.
     """
-    global _MODE_CACHE, _ENV_ID_CACHE, _ISOLATED_CACHE
+    global _MODE_CACHE, _ENV_ID_CACHE, _ISOLATED_CACHE, _FORCED_SHA_CACHE
     _MODE_CACHE = None
     _ENV_ID_CACHE = _UNREAD
     _ISOLATED_CACHE = _UNREAD
+    _FORCED_SHA_CACHE = _UNREAD
 
 
 # ---------------------------------------------------------------------------
@@ -431,17 +457,182 @@ def _includes_of(path: str) -> list[str]:
     return out
 
 
+def absolutise_include(line: str, source_dir: str) -> str:
+    r"""Rewrite a ``-r`` include to an absolute, forward-slashed path; pass anything else through.
+
+    Two traps in one line, both silent. ``uv`` resolves an include relative to the file
+    holding it, and a combined or merged file lives in a different directory than its
+    sources — a relative include would be looked for beside the *output* and the compile
+    would fail there instead of at the node. And a requirement file treats ``\`` as an
+    escape character, so ``-r C:\x\y.txt`` reaches uv as ``C:xy.txt`` (verified against the
+    shipped uv); forward slashes are accepted on every platform.
+
+    Shared by every writer that moves override or requirement lines out of their own
+    directory, so a second one cannot forget half of it.
+    """
+    target = _include_target(line)
+    if target is None:
+        return line
+    resolved = os.path.abspath(os.path.join(source_dir, target))
+    return f'-r {resolved.replace(os.sep, "/")}\n'
+
+
+# A requirement name is the leading PEP 503-shaped identifier. Deliberately not `packaging`:
+# this reads the tree's own overrides.txt files, needs the name and nothing else, and this
+# module is stdlib-only on purpose. The partitioner's admissibility gate -- the one over text
+# a tenant typed -- is the one that gets a real parser (§4.7.1, OQ-19). Both live here rather
+# than in depends because they are pure text over requirement lines, like write_combined, and
+# because depends cannot be imported without engLib -- which would leave the most delicate
+# logic in this increment untestable in isolation.
+_REQUIREMENT_NAME = re.compile(r'^([A-Za-z0-9][A-Za-z0-9._-]*)')
+
+
+def requirement_name(line: str) -> Optional[str]:
+    """The normalised distribution name a requirement line is about, or ``None``.
+
+    ``None`` covers three different things on purpose -- blank, comment, and a line that is
+    not about a package (a flag, a path, a URL) -- because the *merge* treats them
+    identically: it never matches them and never drops them. Nothing here decides
+    admissibility, which is why the ambiguity is safe here and would not be in the gate.
+    """
+    text = line.split('#', 1)[0].strip()
+    if not text or text.startswith('-'):
+        return None
+    match = _REQUIREMENT_NAME.match(text)
+    return pkg_families.normalize(match.group(1)) if match else None
+
+
+def merge_override_lines(tree_lines: list[str], forced_lines: list[str]) -> list[str]:
+    """Merge tree override lines with forced ones, replacing **by normalised name**.
+
+    The unit is the name on both sides, and both sides may hold several lines for it: one
+    unmarked forced ``torch`` displaces two marker-scoped tree lines rather than joining
+    them, and a forced *pair* displaces a computed pair. Names forced does not mention keep
+    whatever the tree said.
+
+    Concatenation is not an option and that is measured, not argued: two ``--override``
+    entries for one package are **conjunctive**, so ``tabulate==0.9.0`` beside
+    ``tabulate==0.10.0`` resolves to *"your requirements are unsatisfiable"* -- a user who
+    typed one version reading an error naming two. The replacement therefore has to happen
+    before uv sees anything.
+    """
+    forced_names = {name for name in map(requirement_name, forced_lines) if name}
+    kept = [line for line in tree_lines if requirement_name(line) not in forced_names]
+    return kept + list(forced_lines)
+
+
+_EXTRAS = re.compile(r'\[([^\]]*)\]')
+_PINNED = re.compile(r'==\s*([^\s;,\]]+)')
+
+
+def _extras_of(line: str) -> set:
+    """The normalised extras a requirement line asks for, e.g. ``requests[socks]`` -> {'socks'}."""
+    match = _EXTRAS.search(line.split('#', 1)[0])
+    if not match:
+        return set()
+    return {part.strip().lower() for part in match.group(1).split(',') if part.strip()}
+
+
+def _pinned_version(line: str) -> Optional[str]:
+    """The exact version a line pins with ``==``, or ``None`` for anything looser."""
+    match = _PINNED.search(line.split('#', 1)[0])
+    return match.group(1) if match else None
+
+
+def _declared_extras(req_files: list[str]) -> dict:
+    """``{normalised name: extras}`` over the environment's own requirement lines.
+
+    The *direct* declarations, which is why this reads the requirement files rather than the
+    compiled constraints: uv writes the resolution without the extras that produced it, so by
+    then the very thing being checked for is gone. Includes are followed -- an extras
+    declaration one ``-r`` away is just as real as one written inline.
+    """
+    declared: dict = {}
+    for path in resolve_includes(req_files):
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+        for line in lines:
+            name = requirement_name(line)
+            extras = _extras_of(line)
+            if name and extras:
+                declared.setdefault(name, set()).update(extras)
+    return declared
+
+
+def forced_warnings(forced_lines: list[str], resolved: dict, req_files: list[str]) -> list[str]:
+    """What the forced requirements did that the author probably did not intend.
+
+    Three outcomes, each promised by an answer in §4.7.1 and none of them an error:
+
+    * **An inert line** (answer 2). Override-only means a forced line for a package nothing
+      requires installs nothing -- which is the security boundary, and its cost is that a
+      typo'd name is silently ignored. Checked against the compiled *resolution*, not against
+      the direct requirements: a package pulled in transitively is overridden successfully, and
+      checking the shallower set would call that "inert" and warn about the one case that worked.
+    * **Lost extras** (answer 3). A forced ``torch`` displaces a computed ``torch[cuda]`` and
+      the extras go with it, because merging them back would mean re-emitting requirements
+      ourselves. The user moves a version and a dependency they never mentioned stops being
+      installed.
+    * **A contradicted family declaration** (answer 4). Where a forced version disagrees with a
+      family's declared ``namespace_version``, forced wins -- but silently winning over a value
+      someone wrote down on purpose is the wrong kind of quiet.
+
+    Parsing here is loose on purpose and safe because of where it sits: every line has already
+    been through the partitioner's ``packaging`` gate, so this is reading known-valid PEP 508
+    rather than deciding whether it is valid (§4.7.1, OQ-19).
+    """
+    by_name: dict = {}
+    for raw in forced_lines:
+        name = requirement_name(raw)
+        if name:
+            by_name.setdefault(name, []).append(raw.strip())
+    if not by_name:
+        return []
+
+    warnings = []
+
+    for name in sorted(by_name):
+        if name not in resolved:
+            warnings.append(
+                f'Forced requirement "{name}" matches nothing this environment installs, so it '
+                'has no effect. Forced requirements select versions of packages already being '
+                'installed; they never add one.'
+            )
+
+    declared = _declared_extras(req_files)
+    for name in sorted(by_name):
+        lost = declared.get(name, set()) - set().union(*(_extras_of(line) for line in by_name[name]))
+        if lost:
+            warnings.append(
+                f'Forced requirement "{name}" drops the extras this environment asked for '
+                f'({", ".join(sorted(lost))}), because an override replaces the whole line. '
+                f'Write them into the forced line to keep them: {name}[{",".join(sorted(lost))}]'
+            )
+
+    for family in pkg_families.families():
+        if not family.namespace_version:
+            continue
+        for member in family.members:
+            name = pkg_families.normalize(member.dist)
+            for line in by_name.get(name, []):
+                version = _pinned_version(line)
+                if version and version != family.namespace_version:
+                    warnings.append(
+                        f'Forced requirement "{line}" contradicts the declared {family.name} '
+                        f'namespace version {family.namespace_version}. Forced wins, and every '
+                        f'package sharing the {family.import_name} namespace is affected.'
+                    )
+
+    return warnings
+
+
 def write_combined(req_files: list[str], combined_path: str) -> None:
     r"""Concatenate ``req_files`` into ``combined_path`` (mirrors depends helper).
 
-    ``-r`` includes are rewritten to absolute paths. ``uv`` resolves them relative to the
-    file holding the line, and this file holds the bytes of requirement files from
-    elsewhere in the tree — a relative include would be looked for next to
-    ``combined_path`` and the compile would fail there instead of at the node.
-
-    The rewritten path uses forward slashes even on Windows: a requirement file treats
-    ``\`` as an escape character, so ``-r C:\x\y.txt`` reaches uv as ``C:xy.txt``
-    (verified against the shipped uv). Forward slashes are accepted on every platform.
+    ``-r`` includes are rewritten by :func:`absolutise_include`, which carries the reason.
     """
     with open(combined_path, 'w', encoding='utf-8') as out:
         for path in req_files:
@@ -449,11 +640,7 @@ def write_combined(req_files: list[str], combined_path: str) -> None:
             source_dir = os.path.dirname(os.path.abspath(path))
             with open(path, 'r', encoding='utf-8') as inp:
                 for line in inp:
-                    target = _include_target(line)
-                    if target is not None:
-                        resolved = os.path.abspath(os.path.join(source_dir, target))
-                        line = f'-r {resolved.replace(os.sep, "/")}\n'
-                    out.write(line)
+                    out.write(absolutise_include(line, source_dir))
             out.write('\n')
 
 
@@ -464,6 +651,11 @@ class InstallPlan:
     paths: EnvPaths
     current_hash: str
     needs_rebuild: bool
+    # The environment's requirement files, carried so the caller does not have to walk the AST
+    # a second time to say what the resolution was built from. The forced-requirements warnings
+    # are the only reader today; they need the *direct* declarations, which the compiled
+    # constraints file has already flattened away.
+    req_files: tuple[str, ...] = ()
 
 
 def plan_install(
@@ -472,6 +664,9 @@ def plan_install(
     env_id: Optional[str],
     req_files: list[str],
     create: bool = True,
+    *,
+    override_files: Optional[list[str]] = None,
+    forced_sha: str = '',
 ) -> InstallPlan:
     """Plan a scoped install: resolve the overlay, compute drift, write the combined file.
 
@@ -483,6 +678,13 @@ def plan_install(
         env_id: ``main`` or a group id.
         req_files: The environment's requirement-file set (from ``ast_deps``).
         create: Create the overlay directory tree when ``True``.
+        override_files: The tree's ``overrides.txt`` set. Passed in rather than discovered:
+            the globs live in ``depends``, importing which would pull ``engLib`` into this
+            stdlib-only module. They join the **hash** only, never ``combined.txt`` -- they
+            are overrides, not requirements.
+        forced_sha: Digest of the environment's forced-requirements text (``''`` when it
+            has none). Passed in, not read from ``os.environ``: the resolvers pop, and that
+            side effect must not hide in a planning function.
 
     Returns:
         An :class:`InstallPlan`. ``needs_rebuild`` is ``True`` when the stored hash
@@ -494,21 +696,33 @@ def plan_install(
         os.makedirs(paths.site_packages, exist_ok=True)
 
     # Hash over the includes too: a `-r`-referenced file shapes the resolution and must
-    # therefore be able to invalidate it.
-    current = requirements_hash(resolve_includes(req_files)) if req_files else ''
+    # therefore be able to invalidate it. The override files are walked the same way and for
+    # the same reason -- they shape the resolution as much as the requirements do, and until
+    # this they were absent from the per-env hash while `ensure_constraints` had always folded
+    # them into base's. Editing `ai/**/overrides.txt` therefore rebuilt base and left every
+    # overlay stale, which forced makes observable: one merged input cannot have two
+    # invalidation rules.
+    walked = list(req_files) + list(override_files or [])
+    current = requirements_hash(resolve_includes(walked)) if walked else ''
     # And over the declarations of the families this environment holds, which live in
     # lib/pkg_families/*.py where the file walk above never looks. Read from the environment's
     # *previous* resolution, the only thing that knows which families it contains before the
     # compile that would tell us again. An environment holding none keeps its bytes unchanged.
     if current:
         current = pkg_families.combine_hash(current, pkg_families.hash_contribution(paths.constraints))
+        # The forced text enters by *content digest*, never as a walked file: the walk is
+        # path:size:mtime_ns, so a file would make the key sensitive to when it was written
+        # rather than to what it says, and an unconditional rewrite would rebuild every overlay
+        # every run. combine_hash leaves the hash untouched for an empty digest, which is what
+        # keeps every environment shipping today from rebuilding once for nothing.
+        current = pkg_families.combine_hash(current, forced_sha)
     stored = _read_text(paths.hash_file)
     needs = (current != stored) or not os.path.exists(paths.constraints)
 
     if needs and create and req_files:
         write_combined(req_files, paths.combined)
 
-    return InstallPlan(paths=paths, current_hash=current, needs_rebuild=needs)
+    return InstallPlan(paths=paths, current_hash=current, needs_rebuild=needs, req_files=tuple(req_files))
 
 
 def mark_installed(plan: InstallPlan) -> None:
@@ -598,6 +812,8 @@ def run_scoped_install(
     mode: Optional[str] = None,
     has_isolated_group: bool = False,
     on_overlay=None,
+    override_files: Optional[list[str]] = None,
+    forced_sha: str = '',
 ) -> Optional[str]:
     """Orchestrate a scoped per-environment install; return the overlay site-packages.
 
@@ -614,6 +830,10 @@ def run_scoped_install(
     the operator watches the fix appear not to take. The exception is constructed by the
     caller and merely re-raised here, so this module stays free of engine error types.
 
+    ``override_files`` and ``forced_sha`` are passed straight through to
+    :func:`plan_install`, which documents why each arrives as a value rather than being
+    discovered or read here.
+
     Installs only when the requirement set drifted. Returns ``None`` when scoping does
     not apply, leaving the caller on the base runtime.
     """
@@ -626,7 +846,14 @@ def run_scoped_install(
         # Nothing to scope (source-only endpoint, or all-native nodes): must not try to
         # compile an absent combined file — leave the base runtime in place.
         return None
-    plan = plan_install(exe_dir, project_id, env_id, req_files)
+    plan = plan_install(
+        exe_dir,
+        project_id,
+        env_id,
+        req_files,
+        override_files=override_files,
+        forced_sha=forced_sha,
+    )
     if plan.needs_rebuild:
         deferred = compile_and_install(plan)
         mark_installed(plan)

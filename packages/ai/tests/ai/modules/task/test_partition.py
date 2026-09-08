@@ -215,3 +215,128 @@ def test_connecting_to_a_container_is_rejected():
 
     with pytest.raises(ValueError, match='produces no data'):
         partition_pipeline(pipeline)
+
+
+# ---------------------------------------------------------------------------
+# Forced Python requirements: the partitioner's refusals (§4.7.1, 2C-FR step 3)
+# ---------------------------------------------------------------------------
+
+
+def _forced_env(text, isolated=True, name='ocr'):
+    return {'name': name, 'isolated': isolated, 'forced': text}
+
+
+def _forced_pipeline(text, isolated=True):
+    return {
+        'components': [
+            _node('src', config={'mode': 'Source'}),
+            _container('venv', members=[_node('a')], environment=_forced_env(text, isolated)),
+        ]
+    }
+
+
+def test_forced_on_an_un_isolated_container_is_refused_by_name():
+    """The one-click trap: a working container, isolation un-ticked to debug in one process.
+
+    Refusing is the backstop for hand-authored documents and for an older editor; the panel
+    greys the field out. Silently ignoring the text would be the exact defect the field exists
+    to avoid -- something the user filled in that changes nothing and says nothing.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        partition_pipeline(_forced_pipeline('tabulate==0.9.0\n', isolated=False), 'src', scoped=True)
+    message = str(excinfo.value)
+    assert 'ocr' in message, 'name the container, so the canvas can point at it'
+    assert 'isolated' in message
+
+
+def test_forced_under_an_unscoped_run_is_refused_rather_than_flattened_away():
+    # `scoped` is the fact to test, not the mode behind it: it is already False under the off
+    # switch AND under auto when nothing is isolated, so reading the mode would be one branch
+    # narrower than the truth.
+    with pytest.raises(ValueError) as excinfo:
+        partition_pipeline(_forced_pipeline('tabulate==0.9.0\n'), 'src', scoped=False)
+    message = str(excinfo.value)
+    assert 'ocr' in message
+    assert 'not scoped' in message
+
+
+def test_isolation_is_reported_before_scoping_because_it_is_the_actionable_one():
+    # Under `auto` an un-isolated lone container produces both conditions at once. "Tick the box"
+    # is something the author can act on; "this run is not scoped" sends them to a server switch.
+    with pytest.raises(ValueError) as excinfo:
+        partition_pipeline(_forced_pipeline('tabulate==0.9.0\n', isolated=False), 'src', scoped=False)
+    assert 'isolated' in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    'line',
+    [
+        '-r other.txt',
+        '-c constraints.txt',
+        '-e .',
+        '--index-url https://evil.example/simple',
+        '--extra-index-url https://evil.example/simple',
+        './local/pkg-1.0-py3-none-any.whl',
+        'C:/tmp/pkg.whl',
+        'tabulate==',
+    ],
+)
+def test_inadmissible_forced_lines_are_refused_with_the_line_in_the_message(line):
+    """The security boundary. ``-r`` is a file-read primitive over a tenant-supplied string.
+
+    An index flag is worse than it looks: the compile runs ``--index-strategy
+    unsafe-best-match``, so uv takes the best version from *every* index, and
+    ``--emit-index-url`` writes the index into ``constraints.txt`` where later installs read it.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        partition_pipeline(_forced_pipeline(line + '\n'), 'src', scoped=True)
+    message = str(excinfo.value)
+    assert line in message, 'carry the offending line, not just the container'
+    assert 'ocr' in message
+
+
+def test_a_direct_url_reference_is_refused_even_though_pep_508_accepts_it():
+    # The one shape a real PEP 508 parser accepts and this field must not: `pkg @ url` names a
+    # distribution to fetch from anywhere, which is "forced never adds" in reverse.
+    with pytest.raises(ValueError) as excinfo:
+        partition_pipeline(_forced_pipeline('pkg @ https://example.com/x.tar.gz\n'), 'src', scoped=True)
+    assert 'URL' in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    'text',
+    [
+        'numpy\n',
+        'tabulate==0.9.0\n',
+        'torch[cuda]>=2.1,<3.0\n',
+        'torch==2.10.0+cu128 ; sys_platform != "darwin"\n',
+        'opencv_contrib_python ~= 4.10\n',
+        '# just a comment\n\n  \n',
+        'tabulate==0.9.0  # trailing comment\n',
+        'torch==2.10.0 ; sys_platform == "darwin"\ntorch==2.10.0+cu128 ; sys_platform != "darwin"\n',
+    ],
+)
+def test_admissible_forced_text_passes(text):
+    # Every row of §4.7.1's table has to survive the gate, the marker-scoped pair included --
+    # a gate that refused row 5 would refuse the shape the requester asked for by name.
+    result = partition_pipeline(_forced_pipeline(text), 'src', scoped=True)
+    assert result is not None
+
+
+def test_a_container_without_forced_text_is_untouched():
+    # Nothing carries forced text until someone types it, so the gate must be invisible today.
+    plain = {
+        'components': [
+            _node('src', config={'mode': 'Source'}),
+            _container('venv', members=[_node('a')], environment={'name': 'ocr', 'isolated': True}),
+        ]
+    }
+    assert partition_pipeline(plain, 'src', scoped=True) is not None
+    assert partition_pipeline(plain, 'src', scoped=False) is not None
+
+
+def test_blank_forced_text_is_not_forced_text():
+    # An emptied box round-trips through the document as '' or whitespace, and must not refuse a
+    # run that has nothing to apply.
+    for blank in ('', '   ', '\n\n'):
+        assert partition_pipeline(_forced_pipeline(blank, isolated=False), 'src', scoped=False) is not None
