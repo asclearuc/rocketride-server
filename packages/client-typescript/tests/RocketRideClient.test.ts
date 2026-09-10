@@ -2291,7 +2291,11 @@ Integration tests may fail. Please ensure:
 3. Server accepts connections from test client
     `);
 	}
-}, 10000);
+	// No bounded timeout of its own: this hook only prints a hint, and a limit here
+	// protects nothing — jest-jasmine2 stamps a failed root hook onto every spec in
+	// the file, so one slow handshake used to fail the whole suite, synchronous specs
+	// included. It inherits testTimeout from jest.config.js like everything else.
+});
 
 type LifecycleSentRequest = {
 	socket: LifecycleBrowserWebSocket;
