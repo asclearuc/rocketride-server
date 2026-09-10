@@ -307,6 +307,52 @@ def setup_parser() -> argparse.ArgumentParser:
         '--workspace', help='Workspace root the pack would be rooted at (default: current directory)'
     )
 
+    # ── venv ─────────────────────────────────────────────────────────────
+    # These act on the SERVER you connect to, not on the local machine. An overlay is a
+    # rebuildable cache -- the requirements live in the pipeline document -- so reclaiming
+    # one costs the next run's install time and no data.
+    venv_parser = subparsers.add_parser('venv', help='Virtual environment overlay operations (on the SERVER)')
+    venv_subparsers = venv_parser.add_subparsers(dest='venv_subcommand', help='Venv commands', metavar='COMMAND')
+
+    venv_list_parser = venv_subparsers.add_parser(
+        'list', help='List environment overlays (no projectId = every overlay on the server, not just yours)'
+    )
+    _add_connection_args(venv_list_parser)
+    venv_list_parser.add_argument('projectId', nargs='?', default='', help='Limit the listing to one project')
+    venv_list_parser.add_argument(
+        '--sizes',
+        action='store_true',
+        help='Also report installed size — SLOW: walks every populated site-packages recursively',
+    )
+
+    venv_purge_parser = venv_subparsers.add_parser(
+        'purge', help="Empty one environment's site-packages, keeping its compiled inputs"
+    )
+    _add_connection_args(venv_purge_parser)
+    venv_purge_parser.add_argument('projectId', help='Project the environment belongs to')
+    venv_purge_parser.add_argument('envId', help='Environment id (a container id, or "main")')
+
+    venv_delete_parser = venv_subparsers.add_parser('delete', help='Remove one environment overlay entirely')
+    _add_connection_args(venv_delete_parser)
+    venv_delete_parser.add_argument('projectId', help='Project the environment belongs to')
+    venv_delete_parser.add_argument('envId', help='Environment id (a container id, or "main")')
+
+    venv_delete_project_parser = venv_subparsers.add_parser(
+        'delete-project', help="Remove a project's whole overlay subtree"
+    )
+    _add_connection_args(venv_delete_project_parser)
+    venv_delete_project_parser.add_argument('projectId', help='Project whose overlays are removed')
+
+    venv_gc_parser = venv_subparsers.add_parser(
+        'gc', help='Reclaim overlays nothing has activated for a while (age is the only signal)'
+    )
+    _add_connection_args(venv_gc_parser)
+    venv_gc_parser.add_argument('projectId', help='Project whose overlays are examined')
+    venv_gc_parser.add_argument('--max-age-days', type=float, dest='max_age_days', help='Idle threshold in days')
+    venv_gc_parser.add_argument(
+        '--dry-run', action='store_true', dest='dry_run', help='Report what would be collected, collect nothing'
+    )
+
     # ── deploy ───────────────────────────────────────────────────────────
     deploy_parser = subparsers.add_parser('deploy', help='Deploy lifecycle operations (deployment target)')
     deploy_subparsers = deploy_parser.add_subparsers(
@@ -424,6 +470,7 @@ async def _dispatch(args) -> int:
     from .commands.store import run_store
     from .commands.tasks import run_list, run_start, run_stop, run_upload
     from .commands.validate import run_validate
+    from .commands.venv import run_venv
 
     if args.command == 'init':
         return await run_init(args)
@@ -449,6 +496,14 @@ async def _dispatch(args) -> int:
             print('Error: App subcommand is required (create, deploy, verify)', file=sys.stderr)
             return 1
         return await run_app(args)
+    if args.command == 'venv':
+        if not getattr(args, 'venv_subcommand', None):
+            print(
+                'Error: Venv subcommand is required (list, purge, delete, delete-project, gc)',
+                file=sys.stderr,
+            )
+            return 1
+        return await run_venv(args)
     if args.command == 'deploy':
         if not getattr(args, 'deploy_subcommand', None):
             print(

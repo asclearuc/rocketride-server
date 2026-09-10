@@ -64,6 +64,7 @@ import { registerStoreCommands } from './commands/store';
 import { registerValidateCommands } from './commands/validate';
 import { registerAppCommands } from './commands/app';
 import { registerDeployCommands } from './commands/deploy';
+import { registerVenvCommands } from './commands/venv';
 import { disconnectAll } from './common';
 
 // The workspace .env must be in process.env before the command groups
@@ -113,6 +114,7 @@ function createProgram(): Command {
 	registerStoreCommands(program);
 	registerAppCommands(program);
 	registerDeployCommands(program);
+	registerVenvCommands(program);
 	return program;
 }
 
