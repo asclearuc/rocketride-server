@@ -732,12 +732,16 @@ def test_the_models_barrel_needs_nothing_beyond_the_baseline_at_import_time():
                         nxt = A._module_to_file(mod, roots)
                         if nxt:
                             queue.append(nxt)
-                    elif top and top not in A._NON_REQUIREMENT_TOPS:
+                    elif top and top not in A._NON_REQUIREMENT_TOPS and top not in sys.stdlib_module_names:
                         third.add(top)
 
-    # numpy ships in the tree baseline every environment now carries; wave is stdlib; rocketride is
-    # the SDK shipped beside the engine. Anything else would be a package nobody installed.
-    assert third <= {'numpy', 'wave', 'rocketride'}, f'barrel needs {third} at import time'
+    # Stdlib is filtered by `sys.stdlib_module_names` rather than named one at a time, which is
+    # the correction develop's `import weakref` forced: the allowlist used to carry `wave` by
+    # hand, so every stdlib import anyone added anywhere under the barrel failed this test until
+    # somebody extended the list. That taught the wrong lesson — the assertion is about a
+    # *third-party* package nobody installed, and stdlib is never that. numpy ships in the tree
+    # baseline every environment now carries; rocketride is the SDK beside the engine.
+    assert third <= {'numpy', 'rocketride'}, f'barrel needs {third} at import time'
 
 
 @_needs_tree
