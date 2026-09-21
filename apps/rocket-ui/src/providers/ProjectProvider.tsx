@@ -50,7 +50,7 @@ import type { DeployArtifact } from 'shell';
 import { useDeployments } from '../hooks/useDeployments';
 import { PrefsProvider } from 'shell';
 import type { IVenvOps, TaskEventMessage, TaskEventSession, TaskStatus, TaskTimeline, TraceLevel, ViewState } from 'shared/modules/project';
-import { saveProject, deleteProject, displayName as projectDisplayName } from '../utils/projectStore';
+import { saveProject, displayName as projectDisplayName } from '../utils/projectStore';
 import { createProjectVfs } from '../utils/projectVfs';
 import { downloadJson } from '../utils/downloadFile';
 import DeploymentProvider from './DeploymentProvider';
