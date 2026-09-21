@@ -51,6 +51,11 @@
 	"prefix": "funnel",
 	//
 	//	Optional:
+	//		The icon shown for this node in the UI.
+	//
+	"icon": "funnel.svg",
+	//
+	//	Optional:
 	//		Every bridgeable engine lane, each passed through unchanged -- the set in
 	//		`nodes/venv/base/lanes.py`, less three.
 	//

@@ -47,6 +47,11 @@
 	"prefix": "text_to_json",
 	//
 	//	Optional:
+	//		The icon shown for this node in the UI.
+	//
+	"icon": "text-to-json.svg",
+	//
+	//	Optional:
 	//		Consumes text, produces text.
 	//
 	"lanes": {

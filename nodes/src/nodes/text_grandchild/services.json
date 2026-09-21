@@ -17,9 +17,10 @@
 	"classType": ["text"],
 	//
 	// Required:
-	//		No special capabilities.
+	//		internal: a test fixture, kept out of the service list clients receive
+	//		(the canvas palette). The engine still runs it.
 	//
-	"capabilities": [],
+	"capabilities": ["internal"],
 	//
 	// Optional:
 	//		Description of this driver.
@@ -45,6 +46,11 @@
 	//		The prefix map when added/removed when converting URLs <=> paths.
 	//
 	"prefix": "text_grandchild",
+	//
+	//	Optional:
+	//		The icon shown for this node in the UI.
+	//
+	"icon": "text-grandchild.svg",
 	//
 	//	Optional:
 	//		Consumes text, produces text (the spawned PID).

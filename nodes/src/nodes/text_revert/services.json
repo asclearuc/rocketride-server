@@ -47,6 +47,11 @@
 	"prefix": "text_revert",
 	//
 	//	Optional:
+	//		The icon shown for this node in the UI.
+	//
+	"icon": "text-revert.svg",
+	//
+	//	Optional:
 	//		Consumes text, produces text.
 	//
 	"lanes": {
