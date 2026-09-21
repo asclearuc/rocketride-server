@@ -213,6 +213,18 @@ store serves only public bindings whose deployment is `ready`.
 See [Run Logs](/clients/typescript/logs) for the continuum model and the DVR
 session.
 
+### Virtual environments (`client.venv`)
+
+See [Virtual Environments](/clients/typescript/venv) for the model.
+
+| Method | Signature | Returns | Description |
+| --- | --- | --- | --- |
+| `venv.list` | `list(options?: VenvListOptions): Promise<VenvOverlay[]>` | `Promise<VenvOverlay[]>` | Overlays on the server; `options.projectId` filters, `options.sizes` adds byte counts |
+| `venv.purge` | `purge(projectId: string, envId: string, scope?: VenvScope): Promise<boolean>` | `Promise<boolean>` | Empty one environment's `site-packages`, keeping its compiled requirement files |
+| `venv.deleteEnv` | `deleteEnv(projectId: string, envId: string, scope?: VenvScope): Promise<boolean>` | `Promise<boolean>` | Remove one environment's overlay directory outright |
+| `venv.deleteProject` | `deleteProject(projectId: string, scope?: VenvScope): Promise<number>` | `Promise<number>` | Remove the whole `venvs/<projectId>/` subtree; returns how many went |
+| `venv.gc` | `gc(projectId: string, options?: VenvGcOptions): Promise<VenvGcReport>` | `Promise<VenvGcReport>` | Reclaim that project's overlays nothing has used lately; returns a report |
+
 ### Additional client surface
 
 Further public methods, present in both SDKs, in brief:

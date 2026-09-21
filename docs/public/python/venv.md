@@ -33,13 +33,9 @@ about, which is the whole point of asking. Pass `project_id` when you mean
 
 ## Methods
 
-| Method | Description |
-| --- | --- |
-| `venv.list(project_id=None, *, sizes=False)` | Overlays on the server; `project_id` filters, `sizes` adds byte counts |
-| `venv.purge(project_id, env_id)` | Empty one environment's `site-packages`, keeping its compiled requirement files |
-| `venv.delete_env(project_id, env_id)` | Remove one environment's overlay directory outright |
-| `venv.delete_project(project_id)` | Remove the whole `venvs/<project_id>/` subtree; returns how many went |
-| `venv.gc(project_id, *, max_age_days=None, dry_run=False)` | Reclaim that project's overlays nothing has used lately; returns a report |
+Five calls — `list`, `purge`, `delete_env`, `delete_project` and `gc`. Signatures,
+return types and a line on each are in the
+[API reference](/clients/python/reference#virtual-environments-clientvenv).
 
 `env_id` is the **container node's id** in the pipeline document. Pass both ids
 raw — the server resolves them literal-first and shortens them itself, exactly

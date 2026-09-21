@@ -67,6 +67,7 @@ SHARED_PAGES = [
     'reference',
     'examples',
     'analytics',
+    'venv',
 ]
 # Declared single-language extras (surface that exists in one SDK only).
 TS_ONLY_PAGES = {'database-sequelize', 'database-drizzle'}

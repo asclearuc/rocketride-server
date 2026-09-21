@@ -44,13 +44,9 @@ when you mean "this pipeline's".
 
 ## **Methods**
 
-| Method | Description |
-| --- | --- |
-| `venv.list(options?)` | Overlays on the server; `options.projectId` filters, `options.sizes` adds byte counts |
-| `venv.purge(projectId, envId)` | Empty one environment's `site-packages`, keeping its compiled requirement files |
-| `venv.deleteEnv(projectId, envId)` | Remove one environment's overlay directory outright |
-| `venv.deleteProject(projectId)` | Remove the whole `venvs/<projectId>/` subtree; returns how many went |
-| `venv.gc(projectId, options?)` | Reclaim that project's overlays nothing has used lately; returns a report |
+Five calls — `list`, `purge`, `deleteEnv`, `deleteProject` and `gc`. Signatures,
+return types and a line on each are in the
+[API reference](/clients/typescript/reference#virtual-environments-clientvenv).
 
 `envId` is the **container node's id** in the pipeline document. Pass both ids
 raw — the server resolves them literal-first and shortens them itself, exactly

@@ -191,6 +191,18 @@ fixes and deploys a NEW version. `@me`/`@team` bindings need no approval.
 
 See [Run Logs](/clients/python/logs) for the continuum model and the DVR session.
 
+### Virtual environments (`client.venv`)
+
+See [Virtual Environments](/clients/python/venv) for the model.
+
+| Method | Signature | Returns | Description |
+| --- | --- | --- | --- |
+| `venv.list` | `async def list(self, project_id: Optional[str] = None, *, sizes: bool = False, team_id: str = '') -> List[VenvOverlay]` | `List[VenvOverlay]` | Overlays on the server; `project_id` filters, `sizes` adds byte counts |
+| `venv.purge` | `async def purge(self, project_id: str, env_id: str, *, team_id: str = '') -> bool` | `bool` | Empty one environment's `site-packages`, keeping its compiled requirement files |
+| `venv.delete_env` | `async def delete_env(self, project_id: str, env_id: str, *, team_id: str = '') -> bool` | `bool` | Remove one environment's overlay directory outright |
+| `venv.delete_project` | `async def delete_project(self, project_id: str, *, team_id: str = '') -> int` | `int` | Remove the whole `venvs/<project_id>/` subtree; returns how many went |
+| `venv.gc` | `async def gc(self, project_id: str, *, max_age_days: Optional[float] = None, dry_run: bool = False, team_id: str = '') -> VenvGcReport` | `VenvGcReport` | Reclaim that project's overlays nothing has used lately; returns a report |
+
 ## DataPipe
 
 Returned by `await client.pipe(...)`. One streaming upload: **open → write (one or

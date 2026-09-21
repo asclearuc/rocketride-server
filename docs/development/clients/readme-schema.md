@@ -53,7 +53,8 @@ pinned to journey order with `sidebar_position`:
 
 `index` (0) · `configuration` (1) · `connection` (2) · `pipelines` (3) ·
 `deploy` (4) · `data` (5) · `storage` (6) · `chat` (7) · `logs` (8) ·
-`errors` (9) · `reference` (10) · `examples` (11) · `analytics` (12)
+`errors` (9) · `reference` (10) · `examples` (11) · `analytics` (12) ·
+`venv` (15, after the single-language extras below)
 
 Single-language extras are allowed for surface that exists in one SDK
 (currently `database-sequelize` (13) and `database-drizzle` (14) for

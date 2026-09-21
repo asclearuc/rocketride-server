@@ -1,9 +1,11 @@
-# Funnel
+# funnel
 
 Collects several producers on the same lane into one, so their output can leave a virtual
 environment.
 
-## Why it exists
+## What it does
+
+### Why it exists
 
 A virtual environment's boundary carries **at most one producer per lane**. That is not a
 policy — a `write*` call carries no producer identity, so the bridge has nothing to route
@@ -28,7 +30,7 @@ A funnel takes both, and becomes the single producer the boundary requires:
 └────────────────────────────────┘
 ```
 
-## What it does, and what it does not
+### What it does, and what it does not
 
 It **passes writes through** in arrival order. It does not transform, combine, or reorder
 them, and it holds nothing back.
@@ -43,7 +45,28 @@ does, give each producer its own environment instead.
 **No parallel execution is gained or lost.** Nodes inside an environment run on one engine
 thread either way; the funnel changes what is expressible, not what is concurrent.
 
-## Media lanes
+## Lanes
+
+| Lane in | Lane out | Description |
+|---------|----------|-------------|
+| `tags` | `tags` | Passed through unchanged |
+| `text` | `text` | Passed through unchanged |
+| `table` | `table` | Passed through unchanged |
+| `json` | `json` | Passed through unchanged |
+| `audio` | `audio` | Passed through unchanged |
+| `video` | `video` | Passed through unchanged |
+| `image` | `image` | Passed through unchanged |
+| `questions` | `questions` | Passed through unchanged |
+| `answers` | `answers` | Passed through unchanged |
+| `documents` | `documents` | Passed through unchanged |
+
+That is the bridgeable set in `nodes/venv/base/lanes.py`, less three. `words` is excluded by
+the bridge itself: it has no landing method anywhere in `rocketlib`. `classifications` and
+`classificationContext` are excluded because **no node in the catalog declares either as a
+lane** — a funnel offering them would draw two ports on the canvas that nothing can connect
+to. Add them here the moment a node does.
+
+### Media lanes
 
 `audio`, `video` and `image` arrive as streams — `BEGIN`, `WRITE` frames, `END` — and the
 call carries no stream id. Two producers whose streams overlap would splice into one
@@ -55,17 +78,6 @@ keeps the failure loud instead of trading a rejected pipeline for a corrupt payl
 
 Producers that emit a whole stream inside one callback — the usual shape — never overlap,
 and pass through untouched.
-
-## Lanes
-
-`tags`, `text`, `table`, `json`, `audio`, `video`, `image`, `questions`, `answers`,
-`documents` — each passed through unchanged.
-
-That is the bridgeable set in `nodes/venv/base/lanes.py`, less three. `words` is excluded by
-the bridge itself: it has no landing method anywhere in `rocketlib`. `classifications` and
-`classificationContext` are excluded because **no node in the catalog declares either as a
-lane** — a funnel offering them would draw two ports on the canvas that nothing can connect
-to. Add them here the moment a node does.
 
 ## Configuration
 
